@@ -9,13 +9,16 @@ test('candidate workflow policy pins only observed repository workflow identitie
   assert.equal(workflows.schema_version, 1);
   assert.equal(workflows.repository, 'lawxcompany-stack/Plataforma-LawX');
   assert.equal(workflows.base_branch, 'preview');
-  assert.deepEqual(workflows.workflows.map(({ id }) => id), [290018021, 364357772, 360465212]);
-  for (const workflow of workflows.workflows) {
-    assert.equal(workflow.event, 'pull_request');
-    assert.equal(workflow.artifact_required, true);
-    assert.equal(workflow.artifact_name_suffix, '-{run_id}-{attempt}');
-    assert.equal(workflow.artifact_json_path, 'evidence.json');
-  }
+  assert.deepEqual(workflows.workflows, [{
+    id: 290018021,
+    path: '.github/workflows/ci.yml',
+    event: 'pull_request',
+    suite: 'ci',
+    artifact_required: true,
+    artifact_name_template: 'acceptance-final-{run_id}-{attempt}',
+    artifact_json_path: 'billing-acceptance.json',
+    expected_categories: ['quality', 'regression', 'build', 'remote-sql', 'remote-concurrency', 'financial-e2e'],
+  }]);
 });
 
 test('source pin policy fails closed until a protected path has a reviewed immutable blob hash', () => {

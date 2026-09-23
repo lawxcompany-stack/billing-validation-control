@@ -9,26 +9,16 @@
       "event": "pull_request",
       "suite": "ci",
       "artifact_required": true,
-      "artifact_name_suffix": "-{run_id}-{attempt}",
-      "artifact_json_path": "evidence.json"
-    },
-    {
-      "id": 364357772,
-      "path": ".github/workflows/billing-3ds-validation.yml",
-      "event": "pull_request",
-      "suite": "billing-3ds",
-      "artifact_required": true,
-      "artifact_name_suffix": "-{run_id}-{attempt}",
-      "artifact_json_path": "evidence.json"
-    },
-    {
-      "id": 360465212,
-      "path": ".github/workflows/billing-validation-preflight.yml",
-      "event": "pull_request",
-      "suite": "billing-preflight",
-      "artifact_required": true,
-      "artifact_name_suffix": "-{run_id}-{attempt}",
-      "artifact_json_path": "evidence.json"
+      "artifact_name_template": "acceptance-final-{run_id}-{attempt}",
+      "artifact_json_path": "billing-acceptance.json",
+      "expected_categories": [
+        "quality",
+        "regression",
+        "build",
+        "remote-sql",
+        "remote-concurrency",
+        "financial-e2e"
+      ]
     }
   ]
 }

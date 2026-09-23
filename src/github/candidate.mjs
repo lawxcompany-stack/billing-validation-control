@@ -5,6 +5,8 @@ const CANDIDATE_REPOSITORY = 'lawxcompany-stack/Plataforma-LawX';
 const DEFAULT_BASE_BRANCH = 'preview';
 const FULL_SHA = /^[0-9a-f]{40}$/iu;
 const MAX_CHANGED_FILES = 300;
+const MAX_PULL_ASSOCIATION_PAGES = 5;
+const PULL_PAGE_SIZE = 100;
 const DEFAULT_SOURCE_PINS = require('../../policy/source-pins.json');
 
 export class CandidateRefusal extends Error {
@@ -69,13 +71,30 @@ async function readChangedFiles(api, pullNumber) {
   return files;
 }
 
+async function readAssociatedPulls(api, candidateSha) {
+  const pulls = [];
+  const seenNumbers = new Set();
+  for (let page = 1; page <= MAX_PULL_ASSOCIATION_PAGES; page += 1) {
+    const response = await getJson(api,
+      `/repos/${CANDIDATE_REPOSITORY}/commits/${candidateSha}/pulls?per_page=${PULL_PAGE_SIZE}&page=${page}`);
+    if (!Array.isArray(response)) refuse('candidate_pr_list_invalid');
+    for (const pull of response) {
+      if (!pull || typeof pull !== 'object' || !Number.isSafeInteger(pull.number) || pull.number < 1 ||
+          seenNumbers.has(pull.number)) refuse('candidate_pr_list_invalid');
+      seenNumbers.add(pull.number);
+    }
+    pulls.push(...response);
+    if (response.length < PULL_PAGE_SIZE) return pulls;
+  }
+  refuse('candidate_pr_list_too_large');
+}
+
 export async function resolveCandidate({ api, candidateSha, sourcePins = DEFAULT_SOURCE_PINS, baseBranch = DEFAULT_BASE_BRANCH }) {
   if (!api || typeof api.get !== 'function' || !FULL_SHA.test(candidateSha ?? '') ||
       baseBranch !== DEFAULT_BASE_BRANCH) refuse('candidate_input_invalid');
   validatePins(sourcePins);
   const normalizedSha = candidateSha.toLowerCase();
-  const pulls = await getJson(api,
-    `/repos/${CANDIDATE_REPOSITORY}/commits/${normalizedSha}/pulls?per_page=100`);
+  const pulls = await readAssociatedPulls(api, normalizedSha);
   if (!Array.isArray(pulls) || pulls.length === 0) refuse('candidate_pr_not_found');
 
   const associated = pulls.filter((pull) => pull && typeof pull === 'object');
@@ -104,6 +123,14 @@ export async function resolveCandidate({ api, candidateSha, sourcePins = DEFAULT
   for (const file of fileRecords) {
     if (!safePath(file?.filename) || !['added', 'modified', 'removed', 'renamed', 'copied', 'changed'].includes(file.status)) {
       refuse('candidate_file_list_invalid');
+    }
+    if ((file.status === 'renamed' && !safePath(file.previous_filename)) ||
+        (file.previous_filename !== undefined && !safePath(file.previous_filename))) {
+      refuse('candidate_file_list_invalid');
+    }
+    if (file.status === 'renamed' && isProtected(file.previous_filename, sourcePins) &&
+        !isProtected(file.filename, sourcePins)) {
+      refuse('candidate_protected_source_rename');
     }
     if (changedFiles.includes(file.filename)) refuse('candidate_file_list_invalid');
     changedFiles.push(file.filename);

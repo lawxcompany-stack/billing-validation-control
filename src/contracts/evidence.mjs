@@ -6,18 +6,15 @@ export const EVIDENCE_ARCHIVE_LIMITS = Object.freeze({
   totalUncompressedBytes: 4 * 1024 * 1024,
   evidenceJsonBytes: 1024 * 1024,
   fileCount: 32,
-  checkCount: 100,
 });
 
 const ZIP_EOCD = 0x06054b50;
 const ZIP_CENTRAL = 0x02014b50;
 const ZIP_LOCAL = 0x04034b50;
 const ZIP64_EXTRA = 0x0001;
-const ALLOWED_TOP_LEVEL_KEYS = new Set([
-  'schema_version', 'candidate_sha', 'workflow_id', 'run_id', 'run_attempt', 'suite', 'checks',
-]);
-const ALLOWED_CHECK_KEYS = new Set(['id', 'conclusion', 'code']);
-const CONCLUSIONS = new Set(['success', 'failure', 'cancelled', 'skipped', 'neutral']);
+const ALLOWED_TOP_LEVEL_KEYS = new Set(['version', 'identity', 'ok', 'status', 'categories', 'failures']);
+const ALLOWED_IDENTITY_KEYS = new Set(['candidateSha', 'runId', 'runAttempt']);
+const MAX_CATEGORY_COUNT = 32;
 
 export class EvidenceRefusal extends Error {
   constructor(code) {
@@ -203,7 +200,7 @@ function decodeEntry(archive, entry) {
   return contents;
 }
 
-function parseDocument(contents) {
+function parseDocument(contents, expected) {
   let document;
   try {
     document = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(contents));
@@ -212,38 +209,34 @@ function parseDocument(contents) {
   }
   if (document === null || typeof document !== 'object' || Array.isArray(document) ||
       Object.keys(document).some((key) => !ALLOWED_TOP_LEVEL_KEYS.has(key)) ||
-      Object.keys(document).length !== ALLOWED_TOP_LEVEL_KEYS.size || document.schema_version !== 1 ||
-      typeof document.candidate_sha !== 'string' || !/^[0-9a-f]{40}$/u.test(document.candidate_sha) ||
-      !Number.isSafeInteger(document.workflow_id) || document.workflow_id < 1 ||
-      typeof document.run_id !== 'string' || !/^[1-9][0-9]{0,19}$/u.test(document.run_id) ||
-      !Number.isSafeInteger(document.run_attempt) || document.run_attempt < 1 || document.run_attempt > 20 ||
-      typeof document.suite !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,39}$/u.test(document.suite) ||
-      !Array.isArray(document.checks) || document.checks.length === 0 ||
-      document.checks.length > EVIDENCE_ARCHIVE_LIMITS.checkCount) {
+      Object.keys(document).length !== ALLOWED_TOP_LEVEL_KEYS.size || document.version !== 1 ||
+      document.identity === null || typeof document.identity !== 'object' || Array.isArray(document.identity) ||
+      Object.keys(document.identity).some((key) => !ALLOWED_IDENTITY_KEYS.has(key)) ||
+      Object.keys(document.identity).length !== ALLOWED_IDENTITY_KEYS.size ||
+      typeof document.identity.candidateSha !== 'string' || !/^[0-9a-f]{40}$/u.test(document.identity.candidateSha) ||
+      typeof document.identity.runId !== 'string' || !/^[1-9][0-9]{0,19}$/u.test(document.identity.runId) ||
+      typeof document.identity.runAttempt !== 'string' || !/^[1-9][0-9]{0,1}$/u.test(document.identity.runAttempt) ||
+      Number(document.identity.runAttempt) > 20 || document.ok !== true || document.status !== 'passed' ||
+      !Array.isArray(document.categories) || document.categories.length === 0 ||
+      document.categories.length > MAX_CATEGORY_COUNT ||
+      !document.categories.every((category) => typeof category === 'string' && /^[a-z0-9][a-z0-9_-]{0,39}$/u.test(category)) ||
+      new Set(document.categories).size !== document.categories.length ||
+      !Array.isArray(document.failures) || document.failures.length !== 0 ||
+      !Array.isArray(expected?.categories) || expected.categories.length === 0 ||
+      document.categories.length !== expected.categories.length ||
+      document.categories.some((category, index) => category !== expected.categories[index])) {
     refuse('evidence_schema_invalid');
   }
-
-  const seen = new Set();
-  const checks = document.checks.map((check) => {
-    if (check === null || typeof check !== 'object' || Array.isArray(check) ||
-        Object.keys(check).some((key) => !ALLOWED_CHECK_KEYS.has(key)) ||
-        Object.keys(check).length !== ALLOWED_CHECK_KEYS.size ||
-        typeof check.id !== 'string' || !/^[a-z0-9][a-z0-9_.-]{0,79}$/u.test(check.id) ||
-        seen.has(check.id) || !CONCLUSIONS.has(check.conclusion) ||
-        typeof check.code !== 'string' || !/^[a-z0-9][a-z0-9_.-]{0,79}$/u.test(check.code)) {
-      refuse('evidence_schema_invalid');
-    }
-    seen.add(check.id);
-    return Object.freeze({ id: check.id, conclusion: check.conclusion, code: check.code });
-  });
+  if (document.identity.candidateSha !== expected.candidateSha || document.identity.runId !== String(expected.runId) ||
+      Number(document.identity.runAttempt) !== expected.attempt) refuse('evidence_identity_mismatch');
   return Object.freeze({
-    schemaVersion: document.schema_version,
-    candidateSha: document.candidate_sha,
-    workflowId: document.workflow_id,
-    runId: document.run_id,
-    attempt: document.run_attempt,
-    suite: document.suite,
-    checks: Object.freeze(checks),
+    schemaVersion: document.version,
+    candidateSha: document.identity.candidateSha,
+    runId: document.identity.runId,
+    attempt: Number(document.identity.runAttempt),
+    ok: true,
+    status: 'passed',
+    categories: Object.freeze([...document.categories]),
   });
 }
 
@@ -255,14 +248,9 @@ export function parseEvidenceArchive(archive, { digest, expected } = {}) {
     refuse('artifact_digest_mismatch');
   }
   const entries = parseDirectory(archive);
-  if (entries.length !== 1 || entries[0].name !== 'evidence.json') {
+  if (entries.length !== 1 || entries[0].name !== 'billing-acceptance.json') {
     refuse('artifact_member_not_allowlisted');
   }
-  const evidence = parseDocument(decodeEntry(archive, entries[0]));
-  const identity = expected ?? {};
-  if (evidence.candidateSha !== identity.candidateSha || evidence.workflowId !== identity.workflowId ||
-      evidence.runId !== String(identity.runId) || evidence.attempt !== identity.attempt || evidence.suite !== identity.suite) {
-    refuse('evidence_identity_mismatch');
-  }
+  const evidence = parseDocument(decodeEntry(archive, entries[0]), expected);
   return evidence;
 }

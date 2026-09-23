@@ -5,8 +5,12 @@ import { parseEvidenceArchive, EVIDENCE_ARCHIVE_LIMITS } from '../contracts/evid
 const require = createRequire(import.meta.url);
 const CANDIDATE_WORKFLOW_POLICY = require('../../policy/candidate-workflows.json');
 const MAX_RUN_PAGES = 5;
+const MAX_EXACT_RUNS = 50;
 const MAX_ATTEMPTS = 20;
 const MAX_ARTIFACT_PAGES = 5;
+const ACCEPTANCE_CATEGORIES = Object.freeze([
+  'quality', 'regression', 'build', 'remote-sql', 'remote-concurrency', 'financial-e2e',
+]);
 
 export class CiEvidenceRefusal extends Error {
   constructor(code) {
@@ -59,18 +63,43 @@ async function listWorkflowRuns(api, candidate, workflow) {
   refuse('ci_run_list_too_large');
 }
 
-function selectLatestRun(runs, candidate, workflow, baseBranch) {
+async function readAttemptRecord(api, candidate, run, attempt) {
+  const response = await getJson(api,
+    `/repos/${candidate.repository}/actions/runs/${run.id}/attempts/${attempt}`);
+  const record = unwrapAttempt(response);
+  if (!record || record.run_attempt !== attempt) refuse('ci_attempt_metadata_invalid');
+  if ((record.id !== undefined && record.id !== run.id) ||
+      (record.workflow_id !== undefined && record.workflow_id !== run.workflow_id) ||
+      (record.head_sha !== undefined && (typeof record.head_sha !== 'string' ||
+        record.head_sha.toLowerCase() !== candidate.candidateSha))) {
+    refuse('ci_attempt_identity_mismatch');
+  }
+  return record;
+}
+
+async function selectLatestRun(api, runs, candidate, workflow, baseBranch) {
   const exactRuns = runs.filter((run) => exactRunBinding(run, candidate, workflow, baseBranch));
   if (exactRuns.length === 0) refuse('ci_run_not_found');
-  const timestamped = exactRuns.map((run) => ({ run, timestamp: validTimestamp(run.created_at) }));
-  if (timestamped.some(({ timestamp }) => timestamp === null)) refuse('ci_run_metadata_invalid');
+  if (exactRuns.length > MAX_EXACT_RUNS) refuse('ci_run_list_too_large');
+  const seenRunIds = new Set();
+  const timestamped = [];
+  for (const run of exactRuns) {
+    if (!Number.isSafeInteger(run.id) || run.id < 1 || seenRunIds.has(run.id)) refuse('ci_run_ambiguous');
+    seenRunIds.add(run.id);
+    if (!Number.isSafeInteger(run.run_attempt) || run.run_attempt < 1 || run.run_attempt > MAX_ATTEMPTS) {
+      refuse('ci_run_metadata_invalid');
+    }
+    if (run.status !== 'completed') refuse('ci_run_not_successful');
+    const latestAttempt = await readAttemptRecord(api, candidate, run, run.run_attempt);
+    const timestamp = validTimestamp(latestAttempt.run_started_at ?? latestAttempt.started_at);
+    if (timestamp === null || latestAttempt.status !== 'completed' || typeof latestAttempt.conclusion !== 'string' ||
+        latestAttempt.conclusion !== run.conclusion) refuse('ci_attempt_metadata_invalid');
+    timestamped.push({ run, latestAttempt, timestamp });
+  }
   timestamped.sort((left, right) => right.timestamp - left.timestamp);
   if (timestamped.length > 1 && timestamped[0].timestamp === timestamped[1].timestamp) refuse('ci_run_ambiguous');
-  const latest = timestamped[0].run;
-  if (!Number.isSafeInteger(latest.id) || latest.id < 1 || latest.status !== 'completed' || latest.conclusion !== 'success' ||
-      !Number.isSafeInteger(latest.run_attempt) || latest.run_attempt < 1 || latest.run_attempt > MAX_ATTEMPTS) {
-    refuse('ci_run_not_successful');
-  }
+  const latest = timestamped[0];
+  if (latest.run.conclusion !== 'success' || latest.latestAttempt.conclusion !== 'success') refuse('ci_run_not_successful');
   return latest;
 }
 
@@ -79,21 +108,16 @@ function unwrapAttempt(response) {
   return response.workflow_run ?? response;
 }
 
-async function resolveAttemptWindows(api, candidate, run) {
+async function resolveAttemptWindows(api, candidate, run, latestAttempt) {
   const windows = [];
   for (let attempt = 1; attempt <= run.run_attempt; attempt += 1) {
-    const response = await getJson(api,
-      `/repos/${candidate.repository}/actions/runs/${run.id}/attempts/${attempt}`);
-    const record = unwrapAttempt(response);
+    const record = attempt === run.run_attempt
+      ? latestAttempt
+      : await readAttemptRecord(api, candidate, run, attempt);
     const start = validTimestamp(record?.run_started_at ?? record?.started_at);
     const end = validTimestamp(record?.completed_at ?? record?.updated_at);
     if (!record || record.run_attempt !== attempt || start === null || end === null || end < start ||
-        record.status !== 'completed') refuse('ci_attempt_metadata_invalid');
-    if (record.id !== undefined && record.id !== run.id) refuse('ci_attempt_identity_mismatch');
-    if (record.workflow_id !== undefined && record.workflow_id !== run.workflow_id) refuse('ci_attempt_identity_mismatch');
-    if (record.head_sha !== undefined && record.head_sha.toLowerCase() !== candidate.candidateSha) {
-      refuse('ci_attempt_identity_mismatch');
-    }
+        record.status !== 'completed' || typeof record.conclusion !== 'string') refuse('ci_attempt_metadata_invalid');
     windows.push({ attempt, start, end, conclusion: record.conclusion });
   }
   for (let index = 1; index < windows.length; index += 1) {
@@ -116,11 +140,11 @@ async function listArtifacts(api, candidate, run) {
   refuse('artifact_list_too_large');
 }
 
-function selectArtifact(artifacts, run, suffixTemplate) {
-  const suffix = suffixTemplate
+function selectArtifact(artifacts, run, nameTemplate) {
+  const expectedName = nameTemplate
     .replace('{run_id}', String(run.id))
     .replace('{attempt}', String(run.run_attempt));
-  const matches = artifacts.filter((artifact) => typeof artifact?.name === 'string' && artifact.name.endsWith(suffix));
+  const matches = artifacts.filter((artifact) => artifact?.name === expectedName);
   if (matches.length === 0) refuse('artifact_missing');
   if (matches.length !== 1) refuse('artifact_duplicate');
   return matches[0];
@@ -164,14 +188,16 @@ async function readBoundedStream(stream, maxBytes) {
 async function collectWorkflow(api, candidate, workflow, baseBranch) {
   if (!Number.isSafeInteger(workflow.id) || workflow.id < 1 || typeof workflow.path !== 'string' ||
       workflow.event !== 'pull_request' || typeof workflow.suite !== 'string' ||
-      workflow.artifact_json_path !== 'evidence.json' ||
-      workflow.artifact_required !== true || workflow.artifact_name_suffix !== '-{run_id}-{attempt}') {
+      workflow.path !== '.github/workflows/ci.yml' || workflow.id !== 290018021 || workflow.suite !== 'ci' ||
+      workflow.artifact_json_path !== 'billing-acceptance.json' || workflow.artifact_required !== true ||
+      workflow.artifact_name_template !== 'acceptance-final-{run_id}-{attempt}' ||
+      JSON.stringify(workflow.expected_categories) !== JSON.stringify(ACCEPTANCE_CATEGORIES)) {
     refuse('workflow_policy_invalid');
   }
   const runs = await listWorkflowRuns(api, candidate, workflow);
-  const run = selectLatestRun(runs, candidate, workflow, baseBranch);
-  const windows = await resolveAttemptWindows(api, candidate, run);
-  const artifact = selectArtifact(await listArtifacts(api, candidate, run), run, workflow.artifact_name_suffix);
+  const { run, latestAttempt } = await selectLatestRun(api, runs, candidate, workflow, baseBranch);
+  const windows = await resolveAttemptWindows(api, candidate, run, latestAttempt);
+  const artifact = selectArtifact(await listArtifacts(api, candidate, run), run, workflow.artifact_name_template);
   assertArtifactBinding(artifact, candidate, run, windows);
   if (!api || typeof api.downloadArtifact !== 'function') refuse('artifact_download_unavailable');
   let stream;
@@ -190,10 +216,9 @@ async function collectWorkflow(api, candidate, workflow, baseBranch) {
       digest: artifact.digest,
       expected: {
         candidateSha: candidate.candidateSha,
-        workflowId: workflow.id,
         runId: String(run.id),
         attempt: run.run_attempt,
-        suite: workflow.suite,
+        categories: workflow.expected_categories,
       },
     });
   } catch (error) {
@@ -226,17 +251,10 @@ export async function collectCiEvidence(options = {}) {
   }
   const policy = CANDIDATE_WORKFLOW_POLICY;
   if (policy?.schema_version !== 1 || policy.repository !== candidate.repository ||
-      policy.base_branch !== 'preview' || !Array.isArray(policy.workflows) || policy.workflows.length === 0) {
+      policy.base_branch !== 'preview' || !Array.isArray(policy.workflows) || policy.workflows.length !== 1 ||
+      policy.workflows[0]?.id !== 290018021) {
     refuse('workflow_policy_invalid');
   }
-  const results = [];
-  const seenIds = new Set();
-  const seenSuites = new Set();
-  for (const workflow of policy.workflows) {
-    if (seenIds.has(workflow?.id) || seenSuites.has(workflow?.suite)) refuse('workflow_policy_invalid');
-    seenIds.add(workflow?.id);
-    seenSuites.add(workflow?.suite);
-    results.push(await collectWorkflow(api, candidate, workflow, policy.base_branch));
-  }
-  return Object.freeze(results);
+  const result = await collectWorkflow(api, candidate, policy.workflows[0], policy.base_branch);
+  return Object.freeze([result]);
 }

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { collectCiEvidence } from '../../src/github/ci-evidence.mjs';
-import { evidenceDocument, makeZip } from './zip-fixture.mjs';
+import { ACCEPTANCE_CATEGORIES, acceptanceDocument, makeZip } from './zip-fixture.mjs';
 
 const repo = 'lawxcompany-stack/Plataforma-LawX';
 const sha = 'afd8955bf0b1332aa1c6c220a8267e2a7e6c0f13';
@@ -19,7 +19,7 @@ const candidate = {
 const started = '2026-09-23T02:22:55Z';
 const completed = '2026-09-23T02:28:00Z';
 
-function run(overrides = {}, selectedWorkflow = workflow, index = workflows.indexOf(selectedWorkflow)) {
+function run(overrides = {}, selectedWorkflow = workflow, index = 0) {
   return {
     id: 35810119625 + index,
     workflow_id: selectedWorkflow.id,
@@ -37,61 +37,79 @@ function run(overrides = {}, selectedWorkflow = workflow, index = workflows.inde
   };
 }
 
-function artifact(overrides = {}, selectedWorkflow = workflow, runId = 35810119625, index = workflows.indexOf(selectedWorkflow)) {
-  const document = evidenceDocument({
-    workflow_id: selectedWorkflow.id,
-    run_id: String(runId),
-    suite: selectedWorkflow.suite,
+function artifact(overrides = {}, selectedRun = run(), selectedWorkflow = workflow, index = 0) {
+  const document = acceptanceDocument({
+    identity: {
+      candidateSha: sha,
+      runId: String(selectedRun.id),
+      runAttempt: String(selectedRun.run_attempt),
+    },
   });
-  const bytes = makeZip([{ name: 'evidence.json', contents: JSON.stringify(document), method: 8 }]);
+  const bytes = makeZip([{ name: 'billing-acceptance.json', contents: JSON.stringify(document), method: 8 }]);
   return {
-    id: 881 + index * 10,
-    name: `billing-${selectedWorkflow.suite}-${runId}-1`,
+    id: 881 + index,
+    name: `acceptance-final-${selectedRun.id}-${selectedRun.run_attempt}`,
     expired: false,
     digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}`,
     size_in_bytes: bytes.length,
     created_at: '2026-09-23T02:26:00Z',
-    workflow_run: { id: runId, repository_id: 771, head_sha: sha },
+    workflow_run: { id: selectedRun.id, repository_id: 771, head_sha: sha },
     bytes,
     ...overrides,
   };
 }
 
-function apiFixture({ targetWorkflowId = workflow.id, selectedRun, attempts, artifacts: customArtifacts, extraRuns = [] } = {}) {
+function defaultAttempts(selectedRun) {
+  const attempts = {};
+  const lastStart = Date.parse(selectedRun.run_started_at ?? selectedRun.created_at);
+  for (let attemptNumber = 1; attemptNumber <= selectedRun.run_attempt; attemptNumber += 1) {
+    const startTime = lastStart - (selectedRun.run_attempt - attemptNumber) * 10 * 60 * 1000;
+    attempts[attemptNumber] = {
+      id: selectedRun.id,
+      workflow_id: selectedRun.workflow_id,
+      head_sha: selectedRun.head_sha,
+      run_attempt: attemptNumber,
+      status: selectedRun.status,
+      conclusion: attemptNumber === selectedRun.run_attempt ? selectedRun.conclusion : 'failure',
+      started_at: new Date(startTime).toISOString(),
+      ...(selectedRun.status === 'completed'
+        ? { completed_at: new Date(startTime + 5 * 60 * 1000).toISOString() }
+        : {}),
+    };
+  }
+  return attempts;
+}
+
+function apiFixture({ selectedRun, attemptsByRun = {}, artifactsByRun = {}, extraRuns = [] } = {}) {
   const calls = [];
-  const runRecords = new Map();
+  const initialRun = selectedRun ?? run();
+  const runRecords = new Map([[workflow.id, [initialRun, ...extraRuns]]]);
   const attemptRecordsByRun = new Map();
-  const artifactsByRun = new Map();
+  const artifactRecordsByRun = new Map();
   const artifactsById = new Map();
 
-  workflows.forEach((entry, index) => {
-    const currentRun = entry.id === targetWorkflowId ? (selectedRun ?? run({}, entry, index)) : run({}, entry, index);
-    runRecords.set(entry.id, [currentRun, ...(entry.id === targetWorkflowId ? extraRuns : [])]);
-    attemptRecordsByRun.set(currentRun.id, entry.id === targetWorkflowId && attempts ? attempts : {
-      1: { run_attempt: 1, status: 'completed', conclusion: 'success', started_at: started, completed_at: completed },
-    });
-    const currentArtifacts = entry.id === targetWorkflowId && customArtifacts !== undefined
-      ? customArtifacts
-      : [artifact({}, entry, currentRun.id, index)];
-    artifactsByRun.set(currentRun.id, currentArtifacts);
-    for (const item of currentArtifacts) artifactsById.set(item.id, item);
-  });
+  for (const runRecord of [initialRun, ...extraRuns]) {
+    attemptRecordsByRun.set(runRecord.id, attemptsByRun[runRecord.id] ?? defaultAttempts(runRecord));
+    const records = artifactsByRun[runRecord.id] ?? [artifact({}, runRecord, workflow, Number(runRecord.id - 35810119625))];
+    artifactRecordsByRun.set(runRecord.id, records);
+    for (const item of records) artifactsById.set(item.id, item);
+  }
 
   return {
     calls,
     async get(path) {
       calls.push(path);
-      const workflowMatch = path.match(new RegExp(`^/repos/${repo}/actions/workflows/(\\d+)/runs\\?per_page=100&page=1$`));
+      const workflowMatch = path.match(new RegExp(`^/repos/${repo}/actions/workflows/(\\d+)/runs\\?per_page=100&page=(\\d+)$`));
       if (workflowMatch) {
         const id = Number(workflowMatch[1]);
-        const records = runRecords.get(id);
-        return records ? { workflow_runs: records, total_count: records.length } : { workflow_runs: [], total_count: 0 };
+        const records = Number(workflowMatch[2]) === 1 ? runRecords.get(id) : [];
+        return { workflow_runs: records ?? [], total_count: records?.length ?? 0 };
       }
       const attemptMatch = path.match(new RegExp(`^/repos/${repo}/actions/runs/(\\d+)/attempts/(\\d+)$`));
       if (attemptMatch) return attemptRecordsByRun.get(Number(attemptMatch[1]))?.[attemptMatch[2]] ?? null;
       const artifactMatch = path.match(new RegExp(`^/repos/${repo}/actions/runs/(\\d+)/artifacts\\?per_page=100&page=1$`));
       if (artifactMatch) {
-        const records = artifactsByRun.get(Number(artifactMatch[1])) ?? [];
+        const records = artifactRecordsByRun.get(Number(artifactMatch[1])) ?? [];
         return { artifacts: records, total_count: records.length };
       }
       throw new Error(`Unexpected API route in fixture: ${path}`);
@@ -105,15 +123,16 @@ function apiFixture({ targetWorkflowId = workflow.id, selectedRun, attempts, art
   };
 }
 
-test('binds every statically approved workflow, exact PR SHA, attempt window, artifact, and digest', async () => {
+test('binds exact workflow, PR SHA, latest attempt, uniquely named final artifact, and digest', async () => {
   const api = apiFixture();
   const evidence = await collectCiEvidence({ api, candidate });
 
-  assert.deepEqual(evidence.map(({ workflowId }) => workflowId), workflows.map(({ id }) => id));
+  assert.deepEqual(evidence.map(({ workflowId }) => workflowId), [290018021]);
   assert.equal(evidence[0].runId, '35810119625');
   assert.equal(evidence[0].attempt, 1);
   assert.equal(evidence[0].artifactId, 881);
-  assert.equal(evidence[0].diagnostics.checks[0].id, 'billing-contract');
+  assert.deepEqual(evidence[0].diagnostics.categories, ACCEPTANCE_CATEGORIES);
+  assert.equal(evidence[0].diagnostics.ok, true);
   assert.ok(api.calls.some((call) => call.endsWith('/attempts/1')));
 });
 
@@ -151,21 +170,100 @@ test('rejects failed, cancelled, or in-progress latest CI runs', async () => {
   }
 });
 
-test('does not reuse an older successful run when the latest run failed', async () => {
-  const latest = run({ id: 35810119626, conclusion: 'failure', created_at: '2026-09-23T03:00:00Z' });
-  const earlier = run({ id: 35810119624, created_at: '2026-09-23T02:00:00Z' });
-  const api = apiFixture({ selectedRun: latest, extraRuns: [earlier] });
-  await assert.rejects(collectCiEvidence({ api, candidate }), { code: 'ci_run_not_successful' });
+test('selects the run with the latest exact attempt activity, not the latest original created_at', async () => {
+  const newerCreatedRun = run({ id: 35810119626, created_at: '2026-09-23T03:00:00Z' });
+  const olderRunRerun = run({ id: 35810119625, run_attempt: 2, created_at: '2026-09-23T02:00:00Z' });
+  const attemptsByRun = {
+    [newerCreatedRun.id]: {
+      1: {
+        id: newerCreatedRun.id, workflow_id: workflow.id, head_sha: sha, run_attempt: 1,
+        status: 'completed', conclusion: 'success', started_at: '2026-09-23T03:05:00Z', completed_at: '2026-09-23T03:10:00Z',
+      },
+    },
+    [olderRunRerun.id]: {
+      1: {
+        id: olderRunRerun.id, workflow_id: workflow.id, head_sha: sha, run_attempt: 1,
+        status: 'completed', conclusion: 'failure', started_at: '2026-09-23T02:01:00Z', completed_at: '2026-09-23T02:06:00Z',
+      },
+      2: {
+        id: olderRunRerun.id, workflow_id: workflow.id, head_sha: sha, run_attempt: 2,
+        status: 'completed', conclusion: 'success', started_at: '2026-09-23T04:00:00Z', completed_at: '2026-09-23T04:05:00Z',
+      },
+    },
+  };
+  const artifactsByRun = {
+    [newerCreatedRun.id]: [artifact({ created_at: '2026-09-23T03:07:00Z' }, newerCreatedRun, workflow, 1)],
+    [olderRunRerun.id]: [artifact({ created_at: '2026-09-23T04:02:00Z' }, olderRunRerun, workflow, 2)],
+  };
+  const api = apiFixture({
+    selectedRun: newerCreatedRun,
+    extraRuns: [olderRunRerun],
+    attemptsByRun,
+    artifactsByRun,
+  });
+
+  const evidence = await collectCiEvidence({ api, candidate });
+  assert.equal(evidence[0].runId, String(olderRunRerun.id));
+  assert.equal(evidence[0].attempt, 2);
+  assert.ok(api.calls.includes(`/repos/${repo}/actions/runs/${olderRunRerun.id}/attempts/2`));
 });
 
-test('rejects missing or duplicate attempt-bound artifacts', async () => {
+test('does not reuse an earlier successful attempt when the latest exact attempt failed', async () => {
+  const selected = run({ run_attempt: 2, conclusion: 'failure' });
+  const attempts = {
+    1: { run_attempt: 1, status: 'completed', conclusion: 'success', started_at: started, completed_at: completed },
+    2: { run_attempt: 2, status: 'completed', conclusion: 'failure', started_at: '2026-09-23T03:00:00Z', completed_at: '2026-09-23T03:10:00Z' },
+  };
+  await assert.rejects(collectCiEvidence({ api: apiFixture({ selectedRun: selected, attemptsByRun: { [selected.id]: attempts } }), candidate }), {
+    code: 'ci_run_not_successful',
+  });
+});
+
+test('rejects equal latest attempt activity timestamps as ambiguous', async () => {
+  const selectedRun = run();
+  const secondRun = run({ id: 35810119626, created_at: '2026-09-23T03:00:00Z' });
+  const currentRecord = (id) => ({
+    1: { id, workflow_id: workflow.id, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success',
+      started_at: '2026-09-23T04:00:00Z', completed_at: '2026-09-23T04:05:00Z' },
+  });
+  await assert.rejects(collectCiEvidence({
+    api: apiFixture({ selectedRun, extraRuns: [secondRun], attemptsByRun: {
+      [selectedRun.id]: currentRecord(selectedRun.id),
+      [secondRun.id]: currentRecord(secondRun.id),
+    } }),
+    candidate,
+  }), { code: 'ci_run_ambiguous' });
+});
+
+test('rejects missing or duplicate exact acceptance artifacts', async () => {
   const selected = run();
-  for (const artifacts of [[], [artifact({}, workflow, selected.id), artifact({ id: 882 }, workflow, selected.id)]]) {
-    await assert.rejects(collectCiEvidence({ api: apiFixture({ artifacts }), candidate }));
+  for (const artifacts of [[], [artifact({}, selected), artifact({ id: 882 }, selected, workflow, 1)]]) {
+    await assert.rejects(collectCiEvidence({ api: apiFixture({ selectedRun: selected, artifactsByRun: { [selected.id]: artifacts } }), candidate }));
   }
 });
 
-test('rejects artifact run/repository/SHA mismatch and artifact created outside exact attempt window', async () => {
+test('selects only the exact acceptance-final artifact among artifacts sharing the run-attempt suffix', async () => {
+  const selected = run();
+  const exact = artifact({}, selected);
+  const siblings = ['acceptance-quality', 'acceptance-regression', 'acceptance-build', 'acceptance-remote', 'acceptance-financial', 'billing-financial-private']
+    .map((prefix, index) => artifact({ id: 900 + index, name: `${prefix}-${selected.id}-1` }, selected, workflow, index + 1));
+  const evidence = await collectCiEvidence({
+    api: apiFixture({ selectedRun: selected, artifactsByRun: { [selected.id]: [...siblings, exact] } }),
+    candidate,
+  });
+  assert.equal(evidence[0].artifactId, exact.id);
+});
+
+test('rejects an artifact whose name only shares the run-attempt suffix', async () => {
+  const selected = run();
+  const wrongName = artifact({ name: `acceptance-quality-${selected.id}-1` }, selected);
+  await assert.rejects(collectCiEvidence({ api: apiFixture({
+    selectedRun: selected,
+    artifactsByRun: { [selected.id]: [wrongName] },
+  }), candidate }), { code: 'artifact_missing' });
+});
+
+test('rejects artifact run/repository/SHA mismatch and artifact created outside the exact attempt window', async () => {
   const selected = run();
   const variants = [
     { workflow_run: { id: 1, repository_id: 771, head_sha: sha } },
@@ -176,24 +274,21 @@ test('rejects artifact run/repository/SHA mismatch and artifact created outside 
   ];
   for (const overrides of variants) {
     await assert.rejects(collectCiEvidence({
-      api: apiFixture({ artifacts: [artifact(overrides, workflow, selected.id)] }),
+      api: apiFixture({ selectedRun: selected, artifactsByRun: { [selected.id]: [artifact(overrides, selected)] } }),
       candidate,
     }));
   }
 });
 
-test('rejects an artifact whose name claims the current attempt but timestamp binds to an earlier rerun', async () => {
+test('rejects an artifact whose exact name claims the current attempt but timestamp binds to an earlier rerun', async () => {
   const selected = run({ run_attempt: 2 });
   const records = {
     1: { run_attempt: 1, status: 'completed', conclusion: 'success', started_at: started, completed_at: completed },
     2: { run_attempt: 2, status: 'completed', conclusion: 'success', started_at: '2026-09-23T03:00:00Z', completed_at: '2026-09-23T03:10:00Z' },
   };
-  const wrongAttemptArtifact = artifact({
-    name: `billing-ci-${selected.id}-2`,
-    created_at: '2026-09-23T02:26:00Z',
-  }, workflow, selected.id);
+  const wrongAttemptArtifact = artifact({ created_at: '2026-09-23T02:26:00Z' }, selected);
   await assert.rejects(collectCiEvidence({
-    api: apiFixture({ selectedRun: selected, attempts: records, artifacts: [wrongAttemptArtifact] }),
+    api: apiFixture({ selectedRun: selected, attemptsByRun: { [selected.id]: records }, artifactsByRun: { [selected.id]: [wrongAttemptArtifact] } }),
     candidate,
   }), { code: 'artifact_attempt_mismatch' });
 });
@@ -202,7 +297,7 @@ test('rejects digest mismatch and expired artifacts', async () => {
   const selected = run();
   for (const overrides of [{ digest: `sha256:${'0'.repeat(64)}` }, { expired: true }]) {
     await assert.rejects(collectCiEvidence({
-      api: apiFixture({ artifacts: [artifact(overrides, workflow, selected.id)] }),
+      api: apiFixture({ selectedRun: selected, artifactsByRun: { [selected.id]: [artifact(overrides, selected)] } }),
       candidate,
     }));
   }
@@ -214,10 +309,9 @@ test('rejects overlapping or missing attempt windows as ambiguous', async () => 
     1: { run_attempt: 1, status: 'completed', conclusion: 'success', started_at: started, completed_at: '2026-09-23T03:01:00Z' },
     2: { run_attempt: 2, status: 'completed', conclusion: 'success', started_at: '2026-09-23T03:00:00Z', completed_at: '2026-09-23T03:10:00Z' },
   };
-  const api = apiFixture({
+  await assert.rejects(collectCiEvidence({ api: apiFixture({
     selectedRun: selected,
-    attempts,
-    artifacts: [artifact({ name: `billing-ci-${selected.id}-2`, created_at: '2026-09-23T03:05:00Z' }, workflow, selected.id)],
-  });
-  await assert.rejects(collectCiEvidence({ api, candidate }), { code: 'artifact_attempt_ambiguous' });
+    attemptsByRun: { [selected.id]: attempts },
+    artifactsByRun: { [selected.id]: [artifact({ created_at: '2026-09-23T03:05:00Z' }, selected)] },
+  }), candidate }), { code: 'artifact_attempt_ambiguous' });
 });

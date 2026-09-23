@@ -22,13 +22,15 @@ function makePull(overrides = {}) {
   };
 }
 
-function apiFor({ pulls = [makePull()], files = [], tree = [] } = {}) {
+function apiFor({ pulls = [makePull()], pullPages, files = [], tree = [] } = {}) {
   const calls = [];
   return {
     calls,
     async get(path) {
       calls.push(path);
-      if (path === `/repos/${repo}/commits/${sha}/pulls?per_page=100`) return pulls;
+      const pullPage = path.match(new RegExp(`^/repos/${repo}/commits/${sha}/pulls\\?per_page=100&page=(\\d+)$`));
+      if (pullPage) return pullPages?.[Number(pullPage[1]) - 1] ?? (Number(pullPage[1]) === 1 ? pulls : []);
+      if (path === `/repos/${repo}/commits/${sha}/pulls?per_page=100`) return pullPages?.[0] ?? pulls;
       if (path === `/repos/${repo}/pulls/42/files?per_page=100&page=1`) return files;
       if (path === `/repos/${repo}/git/commits/${sha}`) return { sha, tree: { sha: treeSha } };
       if (path === `/repos/${repo}/git/trees/${treeSha}?recursive=1`) return { sha: treeSha, truncated: false, tree };
@@ -83,6 +85,33 @@ test('refuses PRs targeting a base other than preview or with ambiguous current 
   }
 });
 
+test('paginates commit-associated PRs and detects ambiguity on a later page', async () => {
+  const firstPage = [makePull(), ...Array.from({ length: 99 }, (_, index) => makePull({
+    number: 100 + index,
+    state: 'closed',
+  }))];
+  const secondPage = [makePull({ number: 43 })];
+  const api = apiFor({ pullPages: [firstPage, secondPage] });
+
+  await assert.rejects(resolveCandidate({ api, candidateSha: sha, sourcePins: pins }), {
+    code: 'candidate_pr_ambiguous',
+  });
+  assert.ok(api.calls.includes(`/repos/${repo}/commits/${sha}/pulls?per_page=100&page=2`));
+});
+
+test('fails closed when commit-associated PR pages exceed the hard cap', async () => {
+  const pages = Array.from({ length: 5 }, (_, page) => Array.from({ length: 100 }, (_, index) => makePull({
+    number: 100 + page * 100 + index,
+    state: 'closed',
+  })));
+  const api = apiFor({ pullPages: pages });
+
+  await assert.rejects(resolveCandidate({ api, candidateSha: sha, sourcePins: pins }), {
+    code: 'candidate_pr_list_too_large',
+  });
+  assert.ok(api.calls.includes(`/repos/${repo}/commits/${sha}/pulls?per_page=100&page=5`));
+});
+
 test('blocks changed workflow or billing harness paths unless exact reviewed blob SHA is pinned', async () => {
   const files = [{ filename: '.github/workflows/ci.yml', status: 'modified' }];
   const tree = [{ path: '.github/workflows/ci.yml', type: 'blob', sha: 'c'.repeat(40) }];
@@ -97,6 +126,30 @@ test('blocks changed workflow or billing harness paths unless exact reviewed blo
   };
   const approvedCandidate = await resolveCandidate({ api: apiFor({ files, tree }), candidateSha: sha, sourcePins: allowed });
   assert.equal(approvedCandidate.sourceBlobShas['.github/workflows/ci.yml'], 'c'.repeat(40));
+});
+
+test('refuses a rename that moves a protected workflow path outside protected prefixes', async () => {
+  const api = apiFor({
+    files: [{
+      filename: 'docs/ci.yml',
+      previous_filename: '.github/workflows/ci.yml',
+      status: 'renamed',
+    }],
+    tree: [{ path: 'docs/ci.yml', type: 'blob', sha: 'f'.repeat(40) }],
+  });
+  await assert.rejects(resolveCandidate({ api, candidateSha: sha, sourcePins: pins }), {
+    code: 'candidate_protected_source_rename',
+  });
+});
+
+test('rejects unsafe previous filenames on GitHub rename records', async () => {
+  const api = apiFor({
+    files: [{ filename: 'docs/ci.yml', previous_filename: '../ci.yml', status: 'renamed' }],
+    tree: [{ path: 'docs/ci.yml', type: 'blob', sha: 'f'.repeat(40) }],
+  });
+  await assert.rejects(resolveCandidate({ api, candidateSha: sha, sourcePins: pins }), {
+    code: 'candidate_file_list_invalid',
+  });
 });
 
 test('uses the trusted default pin policy when the caller does not supply a test policy', async () => {
