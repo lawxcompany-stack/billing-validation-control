@@ -12,11 +12,23 @@ const ZIP_EOCD = 0x06054b50;
 const ZIP_CENTRAL = 0x02014b50;
 const ZIP_LOCAL = 0x04034b50;
 const ZIP64_EXTRA = 0x0001;
-const ALLOWED_FINAL_MANIFEST_KEYS = new Set([
+const REQUIRED_FINAL_MANIFEST_KEYS = [
   'version', 'kind', 'status', 'candidate', 'database', 'deployment', 'stripe', 'webhook',
-  'artifacts', 'replayRuns', 'generatedAt', 'replayVerification', 'financialReport', 'manifestDigest',
+  'artifacts', 'replayRuns', 'generatedAt', 'replayVerification', 'financialReport',
+  'replayIndexSha256', 'manifestDigest',
+];
+const ALLOWED_FINAL_MANIFEST_KEYS = new Set(REQUIRED_FINAL_MANIFEST_KEYS);
+const FINAL_ARTIFACT_KINDS = Object.freeze([
+  'lint', 'typecheck', 'coverage', 'build', 'sql', 'browser', 'stripe', 'webhook', 'worker',
 ]);
-const REQUIRED_FINAL_MANIFEST_KEYS = ['version', 'kind', 'status', 'candidate', 'manifestDigest'];
+const SIMPLE_ARTIFACT_REPORTS = Object.freeze({
+  lint: 'quality', typecheck: 'quality', coverage: 'regression', build: 'build', sql: 'billing-remote',
+});
+const DATABASE_PROJECT_REF = /^[a-z0-9]{20}$/u;
+const DATABASE_BRANCH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
+const DEPLOYMENT_ID = /^dpl_[A-Za-z0-9]+$/u;
+const DEPLOYMENT_HOSTNAME = /^[a-z0-9-]+\.vercel\.app$/u;
+const STRIPE_ACCOUNT_ID = /^acct_[A-Za-z0-9_]+$/u;
 const FULL_SHA = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 
@@ -24,6 +36,108 @@ function canonicalJson(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+}
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonemptyString(value) {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function isCount(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function hasStrings(value, keys) {
+  return isObject(value) && keys.every((key) => isNonemptyString(value[key]));
+}
+
+function validProducerProvenance(value, includeReplayIdentity = false) {
+  return hasStrings(value, ['runId', 'runAttempt', 'repository', 'source']) &&
+    value.source === 'github-actions' && value.synthetic === false &&
+    (!includeReplayIdentity || hasStrings(value, ['fixtureRunId', 'manifestPath']));
+}
+
+function validMigrationArtifacts(artifacts) {
+  return Array.isArray(artifacts) && artifacts.length >= 5 && artifacts.every((item) =>
+    hasStrings(item, ['path', 'sha256']) && SHA256.test(item.sha256) && isCount(item.bytes));
+}
+
+function validBootstrap(bootstrap) {
+  return hasStrings(bootstrap, [
+    'binding', 'receiptSha256', 'projectRef', 'schemaDigest', 'completedAt', 'jobReportSha256',
+  ]) && ['receiptSha256', 'schemaDigest', 'jobReportSha256'].every((key) => SHA256.test(bootstrap[key])) &&
+    isCount(bootstrap.appliedVersionCount) &&
+    (bootstrap.schemaFingerprintVersion === undefined || bootstrap.schemaFingerprintVersion === 1);
+}
+
+function validDeploymentOrigin(value) {
+  if (!isNonemptyString(value)) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.origin === value && DEPLOYMENT_HOSTNAME.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function validArtifactEvidence(kind, evidence) {
+  if (!isObject(evidence)) return false;
+  if (Object.hasOwn(SIMPLE_ARTIFACT_REPORTS, kind)) {
+    return hasStrings(evidence, ['job', 'reportKind']) && evidence.reportKind === SIMPLE_ARTIFACT_REPORTS[kind] &&
+      isCount(evidence.bytes);
+  }
+  return isCount(evidence.receiptCount) && evidence.receiptCount > 0 &&
+    Array.isArray(evidence.sources) && evidence.sources.length === 2 &&
+    evidence.sources.every((source, index) => source?.sequence === index + 1 && isCount(source.receiptCount) &&
+      source.receiptCount > 0 && typeof source.sha256 === 'string' && SHA256.test(source.sha256) &&
+      typeof source.manifestSha256 === 'string' && SHA256.test(source.manifestSha256));
+}
+
+function validFinalProducerShape(document) {
+  const { candidate, database, deployment, stripe, webhook, artifacts, replayRuns } = document;
+  if (!isObject(database) || !hasStrings(database, ['projectRef', 'branchId', 'migrationDigest', 'migrationDigestScope']) ||
+      !DATABASE_PROJECT_REF.test(database.projectRef) || !DATABASE_BRANCH_ID.test(database.branchId) ||
+      !SHA256.test(database.migrationDigest) || !validBootstrap(database.bootstrap) ||
+      !validMigrationArtifacts(database.migrationArtifacts) ||
+      (database.branchName !== undefined && !isNonemptyString(database.branchName)) ||
+      (database.observedSchemaDigest !== undefined && !SHA256.test(database.observedSchemaDigest)) ||
+      (database.schemaFingerprintVersion !== undefined && database.schemaFingerprintVersion !== 1)) return false;
+
+  if (!hasStrings(deployment, ['id', 'origin', 'sha', 'treeHash']) || !DEPLOYMENT_ID.test(deployment.id) ||
+      !validDeploymentOrigin(deployment.origin) ||
+      !FULL_SHA.test(deployment.sha) || !FULL_SHA.test(deployment.treeHash) ||
+      deployment.sha !== candidate.sha || deployment.treeHash !== candidate.treeHash) return false;
+  if (!hasStrings(stripe, ['accountId']) || !STRIPE_ACCOUNT_ID.test(stripe.accountId) || stripe.livemode !== false) return false;
+  if (!hasStrings(webhook, ['endpoint']) || webhook.endpoint !== `${deployment.origin}/api/stripe/webhook` ||
+      webhook.livemode !== false ||
+      (webhook.id !== undefined && !isNonemptyString(webhook.id)) ||
+      (webhook.window !== undefined && !isObject(webhook.window))) return false;
+
+  if (!Array.isArray(artifacts) || artifacts.length !== FINAL_ARTIFACT_KINDS.length ||
+      new Set(artifacts.map((item) => item?.kind)).size !== FINAL_ARTIFACT_KINDS.length ||
+      !FINAL_ARTIFACT_KINDS.every((kind) => artifacts.some((item) => item?.kind === kind)) ||
+      !artifacts.every((item) => isObject(item) && item.candidateSha === candidate.sha &&
+        item.treeHash === candidate.treeHash && typeof item.sha256 === 'string' && SHA256.test(item.sha256) &&
+        isNonemptyString(item.collectedAt) && validProducerProvenance(item.provenance) &&
+        validArtifactEvidence(item.kind, item.evidence))) return false;
+
+  if (!Array.isArray(replayRuns) || replayRuns.length !== 2 ||
+      !replayRuns.every((run, index) => isObject(run) && run.sequence === index + 1 && run.status === 'passed' &&
+        isNonemptyString(run.startedAt) && isNonemptyString(run.finishedAt) && isCount(run.scenarioCount) &&
+        typeof run.scenarioDigest === 'string' && SHA256.test(run.scenarioDigest) &&
+        typeof run.cleanupDigest === 'string' && SHA256.test(run.cleanupDigest) &&
+        typeof run.manifestSha256 === 'string' && SHA256.test(run.manifestSha256) &&
+        isCount(run.manifestBytes) && typeof run.receiptDigest === 'string' && SHA256.test(run.receiptDigest) &&
+        validProducerProvenance(run.provenance, true))) return false;
+
+  return isNonemptyString(document.generatedAt) && Number.isFinite(Date.parse(document.generatedAt)) &&
+    isObject(document.replayVerification) && hasStrings(document.replayVerification, ['scope', 'businessOutcomeEquivalence']) &&
+    hasStrings(document.financialReport, ['job', 'sha256', 'githubOutputSha256']) &&
+    SHA256.test(document.financialReport.sha256) && SHA256.test(document.financialReport.githubOutputSha256) &&
+    isCount(document.financialReport.bytes) && SHA256.test(document.replayIndexSha256);
 }
 
 export class EvidenceRefusal extends Error {
@@ -225,7 +339,9 @@ function parseDocument(contents, expected) {
       Object.keys(document.candidate).length !== 2 ||
       !Object.hasOwn(document.candidate, 'sha') || !Object.hasOwn(document.candidate, 'treeHash') ||
       typeof document.candidate.sha !== 'string' || !FULL_SHA.test(document.candidate.sha) ||
-      typeof document.candidate.treeHash !== 'string' || !FULL_SHA.test(document.candidate.treeHash)) {
+      typeof document.candidate.treeHash !== 'string' || !FULL_SHA.test(document.candidate.treeHash) ||
+      typeof document.replayIndexSha256 !== 'string' || !SHA256.test(document.replayIndexSha256) ||
+      !validFinalProducerShape(document)) {
     refuse('evidence_schema_invalid');
   }
 

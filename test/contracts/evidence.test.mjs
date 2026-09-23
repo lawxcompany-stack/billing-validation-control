@@ -17,6 +17,31 @@ function digest(bytes) {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 }
 
+function canonicalProducerJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalProducerJson).join(',')}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalProducerJson(value[key])}`).join(',')}}`;
+}
+
+function resealProducerDocument(document) {
+  delete document.manifestDigest;
+  document.manifestDigest = createHash('sha256').update(canonicalProducerJson(document), 'utf8').digest('hex');
+  return document;
+}
+
+function archiveForMutation(mutate) {
+  const document = structuredClone(finalAcceptanceDocument());
+  mutate(document);
+  return archiveFor([jsonEntry(resealProducerDocument(document))]);
+}
+
+function assertRejectedManifest(archive, code = 'evidence_schema_invalid') {
+  assert.throws(() => parseEvidenceArchive(archive, {
+    digest: digest(archive),
+    expected: expectedAcceptanceIdentity(),
+  }), { code });
+}
+
 function jsonEntry(document = finalAcceptanceDocument(), name = 'billing-acceptance.json') {
   return { name, contents: JSON.stringify(document), method: 8 };
 }
@@ -31,7 +56,7 @@ function reverseObjectKeys(value) {
 
 test('parses the sealed final producer manifest into a minimal projection', () => {
   const document = finalAcceptanceDocument();
-  assert.equal(document.manifestDigest, 'e64ee59970062f4926ec8d1bd9db4a091ad1aa0fab37b0ac43b7d75ff1343f4a');
+  assert.equal(document.manifestDigest, '0f5b289cbac372a887bc694a80444ee55701c0923c1783d60f9fcd20caf6aa49');
   const archive = archiveFor([jsonEntry(document)]);
   const parsed = parseEvidenceArchive(archive, {
     digest: digest(archive),
@@ -46,9 +71,92 @@ test('parses the sealed final producer manifest into a minimal projection', () =
     status: 'passed',
     manifestDigest: document.manifestDigest,
   });
-  for (const field of ['database', 'deployment', 'stripe', 'webhook', 'artifacts', 'replayRuns', 'financialReport']) {
+  assert.match(document.replayIndexSha256, /^[0-9a-f]{64}$/u);
+  for (const field of [
+    'database', 'deployment', 'stripe', 'webhook', 'artifacts', 'replayRuns',
+    'replayVerification', 'financialReport', 'replayIndexSha256',
+  ]) {
     assert.equal(Object.hasOwn(parsed, field), false, `projection must not expose ${field}`);
   }
+});
+
+test('requires every producer root field even when a missing-field manifest is resealed', () => {
+  for (const field of [
+    'database', 'deployment', 'stripe', 'webhook', 'artifacts', 'replayRuns',
+    'generatedAt', 'replayVerification', 'financialReport', 'replayIndexSha256',
+  ]) {
+    assertRejectedManifest(archiveForMutation((document) => { delete document[field]; }));
+  }
+});
+
+test('rejects malformed producer root containers and cardinalities after resealing', () => {
+  const malformed = [
+    (document) => { document.database = []; },
+    (document) => { document.deployment = null; },
+    (document) => { document.stripe = 'test'; },
+    (document) => { document.webhook = []; },
+    (document) => { document.artifacts = {}; },
+    (document) => { document.artifacts.pop(); },
+    (document) => { document.replayRuns = {}; },
+    (document) => { document.replayRuns.pop(); },
+    (document) => { document.generatedAt = 123; },
+    (document) => { document.replayVerification = []; },
+    (document) => { document.financialReport = false; },
+    (document) => { document.replayIndexSha256 = 'A'.repeat(64); },
+    (document) => { document.replayIndexSha256 = '5'.repeat(63); },
+  ];
+  for (const mutate of malformed) assertRejectedManifest(archiveForMutation(mutate));
+});
+
+test('rejects missing producer-critical nested structures after resealing', () => {
+  const incomplete = [
+    (document) => { delete document.database.bootstrap; },
+    (document) => { delete document.database.migrationArtifacts; },
+    (document) => { document.database.bootstrap = []; },
+    (document) => { document.database.migrationArtifacts = {}; },
+    (document) => { document.deployment.treeHash = undefined; },
+    (document) => { delete document.stripe.accountId; },
+    (document) => { delete document.webhook.endpoint; },
+    (document) => { delete document.artifacts[0].provenance; },
+    (document) => { delete document.artifacts[0].evidence; },
+    (document) => { document.artifacts[0].evidence = []; },
+    (document) => { delete document.replayRuns[0].provenance; },
+    (document) => { delete document.replayRuns[0].scenarioDigest; },
+    (document) => { delete document.replayVerification.scope; },
+    (document) => { delete document.financialReport.githubOutputSha256; },
+  ];
+  for (const mutate of incomplete) assertRejectedManifest(archiveForMutation(mutate));
+});
+
+test('rejects resealed manifests with producer environment identities outside app constraints', () => {
+  const malformed = [
+    (document) => { document.database.projectRef = 'Abcdefghijklmnopqrst'; },
+    (document) => { document.database.projectRef = 'abcdefghijklmnopqrs'; },
+    (document) => { document.database.projectRef = 'abcdefghijklmnopqr!t'; },
+    (document) => { document.database.branchId = 'ab'; },
+    (document) => { document.database.branchId = '_billing-validation'; },
+    (document) => { document.database.branchId = 'billing/validation'; },
+    (document) => { document.database.branchId = 'billing-validation\n'; },
+    (document) => { document.database.branchId = 'a'.repeat(129); },
+    (document) => { document.deployment.id = 'deploy_candidate123'; },
+    (document) => { document.deployment.id = 'dpl_candidate-123'; },
+    (document) => { document.deployment.id = 'dpl_candidate123\n'; },
+    (document) => { document.deployment.origin = 'http://billing-candidate.vercel.app'; },
+    (document) => { document.deployment.origin = 'https://billing-candidate.vercel.app/'; },
+    (document) => { document.deployment.origin = 'https://billing-candidate.vercel.app/path'; },
+    (document) => { document.deployment.origin = 'https://billing-candidate.vercel.app?query=1'; },
+    (document) => { document.deployment.origin = 'https://billing-candidate.vercel.app:8443'; },
+    (document) => { document.deployment.origin = 'https://preview.billing-candidate.vercel.app'; },
+    (document) => { document.deployment.sha = 'c'.repeat(40); },
+    (document) => { document.deployment.treeHash = 'd'.repeat(40); },
+    (document) => { document.stripe.accountId = 'acct_test-lawx'; },
+    (document) => { document.stripe.accountId = 'acct_testlawx\n'; },
+    (document) => { document.stripe.livemode = true; },
+    (document) => { document.webhook.livemode = true; },
+    (document) => { document.webhook.endpoint = 'https://other.vercel.app/api/stripe/webhook'; },
+  ];
+
+  for (const mutate of malformed) assertRejectedManifest(archiveForMutation(mutate));
 });
 
 test('verifies producer canonical JSON independent of object key insertion order', () => {

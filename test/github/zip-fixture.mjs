@@ -104,6 +104,7 @@ function canonicalJson(value) {
 
 export function finalAcceptanceDocument(overrides = {}) {
   const candidateSha = 'afd8955bf0b1332aa1c6c220a8267e2a7e6c0f13';
+  const reportKinds = { lint: 'quality', typecheck: 'quality', coverage: 'regression', build: 'build', sql: 'billing-remote' };
   const provenance = {
     source: 'github-actions',
     synthetic: false,
@@ -120,7 +121,7 @@ export function finalAcceptanceDocument(overrides = {}) {
       collectedAt: '2026-09-23T02:20:00.000Z',
       provenance: { ...provenance },
       evidence: index < 5
-        ? { job: `${kind}-job`, reportKind: kind === 'sql' ? 'billing-remote' : kind, bytes: 128 }
+        ? { job: `${kind}-job`, reportKind: reportKinds[kind], bytes: 128 }
         : {
           receiptCount: 2,
           sources: [1, 2].map((sequence) => ({
@@ -138,6 +139,13 @@ export function finalAcceptanceDocument(overrides = {}) {
       branchId: 'billing-validation-2026',
       migrationDigest: 'a'.repeat(64),
       migrationDigestScope: 'reviewed-assets',
+      migrationArtifacts: [
+        { path: 'supabase/baselines/main.sql', bytes: 128, sha256: '6'.repeat(64) },
+        { path: 'supabase/baselines/manifest.json', bytes: 96, sha256: '7'.repeat(64) },
+        { path: 'supabase/baselines/data.sql', bytes: 64, sha256: '8'.repeat(64) },
+        { path: 'supabase/baselines/acl.json', bytes: 48, sha256: '9'.repeat(64) },
+        { path: 'supabase/baselines/allowlist.json', bytes: 32, sha256: 'a'.repeat(64) },
+      ],
       bootstrap: {
         binding: 'baseline-seed-acl-and-migration-versions',
         receiptSha256: 'b'.repeat(64),
@@ -181,9 +189,18 @@ export function finalAcceptanceDocument(overrides = {}) {
     financialReport: {
       job: 'financial-e2e', sha256: '3'.repeat(64), bytes: 256, githubOutputSha256: '4'.repeat(64),
     },
+    replayIndexSha256: '5'.repeat(64),
     ...overrides,
   };
-  if (overrides.candidate) manifest.candidate = { sha: candidateSha, treeHash: FINAL_ACCEPTANCE_TREE_HASH, ...overrides.candidate };
+  if (overrides.candidate) {
+    manifest.candidate = { sha: candidateSha, treeHash: FINAL_ACCEPTANCE_TREE_HASH, ...overrides.candidate };
+    manifest.deployment.sha = manifest.candidate.sha;
+    manifest.deployment.treeHash = manifest.candidate.treeHash;
+    for (const artifact of manifest.artifacts) {
+      artifact.candidateSha = manifest.candidate.sha;
+      artifact.treeHash = manifest.candidate.treeHash;
+    }
+  }
   const unsigned = { ...manifest };
   delete unsigned.manifestDigest;
   manifest.manifestDigest = Object.hasOwn(overrides, 'manifestDigest')
