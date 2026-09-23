@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { collectCiEvidence } from '../../src/github/ci-evidence.mjs';
-import { ACCEPTANCE_CATEGORIES, acceptanceDocument, makeZip } from './zip-fixture.mjs';
+import { finalAcceptanceDocument, FINAL_ACCEPTANCE_TREE_HASH, makeZip } from './zip-fixture.mjs';
 
 const repo = 'lawxcompany-stack/Plataforma-LawX';
 const sha = 'afd8955bf0b1332aa1c6c220a8267e2a7e6c0f13';
@@ -15,6 +15,7 @@ const candidate = {
   pullNumber: 42,
   candidateSha: sha,
   baseSha: '1'.repeat(40),
+  treeSha: FINAL_ACCEPTANCE_TREE_HASH,
 };
 const started = '2026-09-23T02:22:55Z';
 const completed = '2026-09-23T02:28:00Z';
@@ -38,12 +39,8 @@ function run(overrides = {}, selectedWorkflow = workflow, index = 0) {
 }
 
 function artifact(overrides = {}, selectedRun = run(), selectedWorkflow = workflow, index = 0) {
-  const document = acceptanceDocument({
-    identity: {
-      candidateSha: sha,
-      runId: String(selectedRun.id),
-      runAttempt: String(selectedRun.run_attempt),
-    },
+  const document = finalAcceptanceDocument({
+    candidate: { sha, treeHash: candidate.treeSha },
   });
   const bytes = makeZip([{ name: 'billing-acceptance.json', contents: JSON.stringify(document), method: 8 }]);
   return {
@@ -131,9 +128,22 @@ test('binds exact workflow, PR SHA, latest attempt, uniquely named final artifac
   assert.equal(evidence[0].runId, '35810119625');
   assert.equal(evidence[0].attempt, 1);
   assert.equal(evidence[0].artifactId, 881);
-  assert.deepEqual(evidence[0].diagnostics.categories, ACCEPTANCE_CATEGORIES);
-  assert.equal(evidence[0].diagnostics.ok, true);
+  assert.equal(evidence[0].diagnostics.candidateSha, sha);
+  assert.equal(evidence[0].diagnostics.candidateTree, candidate.treeSha);
+  assert.equal(evidence[0].diagnostics.status, 'passed');
+  assert.equal(Object.hasOwn(evidence[0].diagnostics, 'stripe'), false);
   assert.ok(api.calls.some((call) => call.endsWith('/attempts/1')));
+});
+
+test('requires a resolved full candidate tree identity before querying CI', async () => {
+  for (const treeSha of [undefined, 'bad-tree']) {
+    const candidateWithoutTree = { ...candidate, treeSha };
+    const api = apiFixture();
+    await assert.rejects(collectCiEvidence({ api, candidate: candidateWithoutTree }), {
+      code: 'candidate_identity_invalid',
+    });
+    assert.deepEqual(api.calls, []);
+  }
 });
 
 test('refuses caller-supplied workflow policies before any GitHub API access', async () => {

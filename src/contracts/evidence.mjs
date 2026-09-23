@@ -12,9 +12,19 @@ const ZIP_EOCD = 0x06054b50;
 const ZIP_CENTRAL = 0x02014b50;
 const ZIP_LOCAL = 0x04034b50;
 const ZIP64_EXTRA = 0x0001;
-const ALLOWED_TOP_LEVEL_KEYS = new Set(['version', 'identity', 'ok', 'status', 'categories', 'failures']);
-const ALLOWED_IDENTITY_KEYS = new Set(['candidateSha', 'runId', 'runAttempt']);
-const MAX_CATEGORY_COUNT = 32;
+const ALLOWED_FINAL_MANIFEST_KEYS = new Set([
+  'version', 'kind', 'status', 'candidate', 'database', 'deployment', 'stripe', 'webhook',
+  'artifacts', 'replayRuns', 'generatedAt', 'replayVerification', 'financialReport', 'manifestDigest',
+]);
+const REQUIRED_FINAL_MANIFEST_KEYS = ['version', 'kind', 'status', 'candidate', 'manifestDigest'];
+const FULL_SHA = /^[0-9a-f]{40}$/u;
+const SHA256 = /^[0-9a-f]{64}$/u;
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+}
 
 export class EvidenceRefusal extends Error {
   constructor(code) {
@@ -208,35 +218,38 @@ function parseDocument(contents, expected) {
     refuse('evidence_schema_invalid');
   }
   if (document === null || typeof document !== 'object' || Array.isArray(document) ||
-      Object.keys(document).some((key) => !ALLOWED_TOP_LEVEL_KEYS.has(key)) ||
-      Object.keys(document).length !== ALLOWED_TOP_LEVEL_KEYS.size || document.version !== 1 ||
-      document.identity === null || typeof document.identity !== 'object' || Array.isArray(document.identity) ||
-      Object.keys(document.identity).some((key) => !ALLOWED_IDENTITY_KEYS.has(key)) ||
-      Object.keys(document.identity).length !== ALLOWED_IDENTITY_KEYS.size ||
-      typeof document.identity.candidateSha !== 'string' || !/^[0-9a-f]{40}$/u.test(document.identity.candidateSha) ||
-      typeof document.identity.runId !== 'string' || !/^[1-9][0-9]{0,19}$/u.test(document.identity.runId) ||
-      typeof document.identity.runAttempt !== 'string' || !/^[1-9][0-9]{0,1}$/u.test(document.identity.runAttempt) ||
-      Number(document.identity.runAttempt) > 20 || document.ok !== true || document.status !== 'passed' ||
-      !Array.isArray(document.categories) || document.categories.length === 0 ||
-      document.categories.length > MAX_CATEGORY_COUNT ||
-      !document.categories.every((category) => typeof category === 'string' && /^[a-z0-9][a-z0-9_-]{0,39}$/u.test(category)) ||
-      new Set(document.categories).size !== document.categories.length ||
-      !Array.isArray(document.failures) || document.failures.length !== 0 ||
-      !Array.isArray(expected?.categories) || expected.categories.length === 0 ||
-      document.categories.length !== expected.categories.length ||
-      document.categories.some((category, index) => category !== expected.categories[index])) {
+      Object.keys(document).some((key) => !ALLOWED_FINAL_MANIFEST_KEYS.has(key)) ||
+      REQUIRED_FINAL_MANIFEST_KEYS.some((key) => !Object.hasOwn(document, key)) ||
+      document.version !== 1 || document.kind !== 'billing-final-acceptance' || document.status !== 'passed' ||
+      document.candidate === null || typeof document.candidate !== 'object' || Array.isArray(document.candidate) ||
+      Object.keys(document.candidate).length !== 2 ||
+      !Object.hasOwn(document.candidate, 'sha') || !Object.hasOwn(document.candidate, 'treeHash') ||
+      typeof document.candidate.sha !== 'string' || !FULL_SHA.test(document.candidate.sha) ||
+      typeof document.candidate.treeHash !== 'string' || !FULL_SHA.test(document.candidate.treeHash)) {
     refuse('evidence_schema_invalid');
   }
-  if (document.identity.candidateSha !== expected.candidateSha || document.identity.runId !== String(expected.runId) ||
-      Number(document.identity.runAttempt) !== expected.attempt) refuse('evidence_identity_mismatch');
+
+  if (typeof document.manifestDigest !== 'string' || !SHA256.test(document.manifestDigest)) {
+    refuse('evidence_manifest_digest_invalid');
+  }
+  const { manifestDigest, ...unsigned } = document;
+  const calculatedDigest = createHash('sha256').update(canonicalJson(unsigned), 'utf8').digest('hex');
+  if (manifestDigest !== calculatedDigest) refuse('evidence_manifest_digest_invalid');
+
+  if (!expected || typeof expected.candidateSha !== 'string' || !FULL_SHA.test(expected.candidateSha) ||
+      typeof expected.candidateTree !== 'string' || !FULL_SHA.test(expected.candidateTree)) {
+    refuse('evidence_identity_invalid');
+  }
+  if (document.candidate.sha !== expected.candidateSha || document.candidate.treeHash !== expected.candidateTree) {
+    refuse('evidence_identity_mismatch');
+  }
   return Object.freeze({
     schemaVersion: document.version,
-    candidateSha: document.identity.candidateSha,
-    runId: document.identity.runId,
-    attempt: Number(document.identity.runAttempt),
-    ok: true,
-    status: 'passed',
-    categories: Object.freeze([...document.categories]),
+    kind: document.kind,
+    candidateSha: document.candidate.sha,
+    candidateTree: document.candidate.treeHash,
+    status: document.status,
+    manifestDigest,
   });
 }
 

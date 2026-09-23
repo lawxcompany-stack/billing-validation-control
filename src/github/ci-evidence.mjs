@@ -128,7 +128,7 @@ async function resolveAttemptWindows(api, candidate, run, latestAttempt) {
   return windows;
 }
 
-async function listArtifacts(api, candidate, run) {
+export async function listArtifacts(api, candidate, run) {
   const artifacts = [];
   for (let page = 1; page <= MAX_ARTIFACT_PAGES; page += 1) {
     const response = await getJson(api,
@@ -216,9 +216,7 @@ async function collectWorkflow(api, candidate, workflow, baseBranch) {
       digest: artifact.digest,
       expected: {
         candidateSha: candidate.candidateSha,
-        runId: String(run.id),
-        attempt: run.run_attempt,
-        categories: workflow.expected_categories,
+        candidateTree: candidate.treeSha,
       },
     });
   } catch (error) {
@@ -246,7 +244,8 @@ export async function collectCiEvidence(options = {}) {
   if (!candidate || candidate.repository !== 'lawxcompany-stack/Plataforma-LawX' ||
       !Number.isSafeInteger(candidate.repositoryId) || !Number.isSafeInteger(candidate.pullNumber) ||
       typeof candidate.candidateSha !== 'string' || !/^[0-9a-f]{40}$/u.test(candidate.candidateSha) ||
-      typeof candidate.baseSha !== 'string' || !/^[0-9a-f]{40}$/u.test(candidate.baseSha) || !api) {
+      typeof candidate.baseSha !== 'string' || !/^[0-9a-f]{40}$/u.test(candidate.baseSha) ||
+      typeof candidate.treeSha !== 'string' || !/^[0-9a-f]{40}$/u.test(candidate.treeSha) || !api) {
     refuse('candidate_identity_invalid');
   }
   const policy = CANDIDATE_WORKFLOW_POLICY;

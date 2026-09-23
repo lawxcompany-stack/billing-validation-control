@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { deflateRawSync } from 'node:zlib';
 
 const crcTable = Array.from({ length: 256 }, (_, index) => {
@@ -27,9 +28,14 @@ export function makeZip(entries, {
     const contents = Buffer.isBuffer(entry.contents) ? entry.contents : Buffer.from(entry.contents ?? '');
     const method = entry.method ?? 0;
     const compressed = method === 8 ? deflateRawSync(contents) : contents;
-    const encryptedPayload = entry.encrypted ? Buffer.concat([Buffer.alloc(12), compressed]) : compressed;
     const crc = crc32(contents);
-    const flags = 0x0800 | (entry.encrypted ? 0x0001 : 0);
+    const encryptedHeader = Buffer.alloc(12);
+    encryptedHeader.writeUInt32LE(0x12345678, 0);
+    encryptedHeader.writeUInt32LE(0x90abcdef, 4);
+    encryptedHeader[11] = crc >>> 24;
+    const encryptedPayload = entry.encrypted ? Buffer.concat([encryptedHeader, compressed]) : compressed;
+    const localFlags = 0x0800 | (entry.encrypted ? 0x0001 : 0);
+    const centralFlags = 0x0800 | (entry.encrypted ? 0x0001 : 0);
     const mode = entry.mode ?? 0o100644;
     const zip64Extra = entry.zip64Extra
       ? Buffer.from([0x01, 0x00, 0x10, 0x00, ...u64(contents.length), ...u64(compressed.length)])
@@ -37,7 +43,7 @@ export function makeZip(entries, {
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0);
     local.writeUInt16LE(entry.zip64Extra ? 45 : 20, 4);
-    local.writeUInt16LE(flags, 6);
+    local.writeUInt16LE(localFlags, 6);
     local.writeUInt16LE(method, 8);
     local.writeUInt32LE(crc, 14);
     local.writeUInt32LE(entry.zip64Extra ? 0xffffffff : encryptedPayload.length, 18);
@@ -50,7 +56,7 @@ export function makeZip(entries, {
     central.writeUInt32LE(0x02014b50, 0);
     central.writeUInt16LE((3 << 8) | (entry.zip64Extra ? 45 : 20), 4);
     central.writeUInt16LE(entry.zip64Extra ? 45 : 20, 6);
-    central.writeUInt16LE(flags, 8);
+    central.writeUInt16LE(centralFlags, 8);
     central.writeUInt16LE(method, 10);
     central.writeUInt32LE(crc, 16);
     central.writeUInt32LE(entry.zip64Extra ? 0xffffffff : encryptedPayload.length, 20);
@@ -88,6 +94,104 @@ export const ACCEPTANCE_CATEGORIES = Object.freeze([
   'quality', 'regression', 'build', 'remote-sql', 'remote-concurrency', 'financial-e2e',
 ]);
 
+export const FINAL_ACCEPTANCE_TREE_HASH = 'b'.repeat(40);
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+}
+
+export function finalAcceptanceDocument(overrides = {}) {
+  const candidateSha = 'afd8955bf0b1332aa1c6c220a8267e2a7e6c0f13';
+  const provenance = {
+    source: 'github-actions',
+    synthetic: false,
+    runId: '35810119625',
+    runAttempt: '1',
+    repository: 'lawxcompany-stack/Plataforma-LawX',
+  };
+  const artifacts = ['lint', 'typecheck', 'coverage', 'build', 'sql', 'browser', 'stripe', 'webhook', 'worker']
+    .map((kind, index) => ({
+      kind,
+      candidateSha,
+      treeHash: FINAL_ACCEPTANCE_TREE_HASH,
+      sha256: String(index + 1).repeat(64),
+      collectedAt: '2026-09-23T02:20:00.000Z',
+      provenance: { ...provenance },
+      evidence: index < 5
+        ? { job: `${kind}-job`, reportKind: kind === 'sql' ? 'billing-remote' : kind, bytes: 128 }
+        : {
+          receiptCount: 2,
+          sources: [1, 2].map((sequence) => ({
+            sequence, receiptCount: 1, sha256: 'a'.repeat(64), manifestSha256: 'b'.repeat(64),
+          })),
+        },
+    }));
+  const manifest = {
+    version: 1,
+    kind: 'billing-final-acceptance',
+    status: 'passed',
+    candidate: { sha: candidateSha, treeHash: FINAL_ACCEPTANCE_TREE_HASH },
+    database: {
+      projectRef: 'abcdefghijklmnopqrst',
+      branchId: 'billing-validation-2026',
+      migrationDigest: 'a'.repeat(64),
+      migrationDigestScope: 'reviewed-assets',
+      bootstrap: {
+        binding: 'baseline-seed-acl-and-migration-versions',
+        receiptSha256: 'b'.repeat(64),
+        projectRef: 'abcdefghijklmnopqrst',
+        schemaDigest: 'c'.repeat(64),
+        completedAt: '2026-09-23T01:59:00.000Z',
+        appliedVersionCount: 3,
+        jobReportSha256: 'd'.repeat(64),
+      },
+    },
+    deployment: {
+      id: 'dpl_candidate123', origin: 'https://billing-candidate.vercel.app',
+      sha: candidateSha, treeHash: FINAL_ACCEPTANCE_TREE_HASH,
+    },
+    stripe: { accountId: 'acct_testlawx123', livemode: false },
+    webhook: {
+      endpoint: 'https://billing-candidate.vercel.app/api/stripe/webhook',
+      livemode: false,
+      id: 'we_testendpoint123',
+    },
+    artifacts,
+    replayRuns: [1, 2].map((sequence) => ({
+      sequence,
+      status: 'passed',
+      startedAt: '2026-09-23T02:00:00.000Z',
+      finishedAt: '2026-09-23T02:10:00.000Z',
+      scenarioCount: 12,
+      scenarioDigest: 'e'.repeat(64),
+      cleanupDigest: 'f'.repeat(64),
+      manifestSha256: '1'.repeat(64),
+      manifestBytes: 1024,
+      receiptDigest: '2'.repeat(64),
+      provenance: {
+        ...provenance,
+        fixtureRunId: `fixture-${sequence}`,
+        manifestPath: sequence === 1 ? 'manifest.json' : 'replay-2/manifest.json',
+      },
+    })),
+    generatedAt: '2026-09-23T02:20:00.000Z',
+    replayVerification: { scope: 'independent-scenario-completion', businessOutcomeEquivalence: 'not-evaluated' },
+    financialReport: {
+      job: 'financial-e2e', sha256: '3'.repeat(64), bytes: 256, githubOutputSha256: '4'.repeat(64),
+    },
+    ...overrides,
+  };
+  if (overrides.candidate) manifest.candidate = { sha: candidateSha, treeHash: FINAL_ACCEPTANCE_TREE_HASH, ...overrides.candidate };
+  const unsigned = { ...manifest };
+  delete unsigned.manifestDigest;
+  manifest.manifestDigest = Object.hasOwn(overrides, 'manifestDigest')
+    ? overrides.manifestDigest
+    : createHash('sha256').update(canonicalJson(unsigned), 'utf8').digest('hex');
+  return manifest;
+}
+
 export function acceptanceDocument(overrides = {}) {
   return {
     version: 1,
@@ -107,9 +211,7 @@ export function acceptanceDocument(overrides = {}) {
 export function expectedAcceptanceIdentity(overrides = {}) {
   return {
     candidateSha: 'afd8955bf0b1332aa1c6c220a8267e2a7e6c0f13',
-    runId: '35810119625',
-    attempt: 1,
-    categories: [...ACCEPTANCE_CATEGORIES],
+    candidateTree: FINAL_ACCEPTANCE_TREE_HASH,
     ...overrides,
   };
 }
