@@ -7,7 +7,8 @@
   },
   "packageManager": "pnpm@11.5.1",
   "scripts": {
-    "test": "node --test test/workflows/dispatch.test.mjs test/workflows/workflow-policy.test.mjs",
+    "test": "node --test test/contracts/evidence.test.mjs test/github/candidate.test.mjs test/github/ci-evidence.test.mjs test/github/policy.test.mjs test/workflows/dispatch.test.mjs test/workflows/workflow-policy.test.mjs",
+    "test:github-metadata": "node --test test/github/metadata-integration.test.mjs",
     "lint:workflows": "node test/workflows/lint-workflows.mjs",
     "check:secret-boundary": "node test/workflows/secret-boundary.mjs"
   },

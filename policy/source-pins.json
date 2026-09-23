@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "protected_prefixes": [
+    ".github/workflows/",
+    ".github/actions/",
+    "scripts/",
+    "src/billing/",
+    "test/",
+    "tests/"
+  ],
+  "protected_paths": ["package.json", "pnpm-lock.yaml"],
+  "reviewed_blobs": {}
+}
