@@ -17,12 +17,13 @@ function invocation(caseId, providerState = paidProviderState(), current = paidD
 function delayedInvocation({ pendingWebhooks = 1, preFinancialEffect = false, preSnapshotMismatch = false,
   freshReceiptAtOffset = 60_000, includeFreshReceipt = true, postInboxStatus = 'processed',
   postReobservationMismatch = false, preInboxStatus = 'pending', includeInitialReceipt = true,
-  eventId = 'evt_task6', omitIdentityEventId = false, processedAtOffset = 60_500 } = {}) {
+  eventId = 'evt_task6', omitIdentityEventId = false, processedAtOffset = 60_500,
+  preProcessedAtOffset = null } = {}) {
   const baseTime = Date.now();
   const iso = (offset) => new Date(baseTime + offset).toISOString();
   const initialInbox = { eventId, eventType: 'invoice.paid', objectId: 'in_task6',
     accountId: 'acct_task6test123', livemode: false, status: preInboxStatus, attempts: 1,
-    receivedAt: iso(-30_000), processedAt: null };
+    receivedAt: iso(-30_000), processedAt: preProcessedAtOffset === null ? null : iso(preProcessedAtOffset) };
   const provider = paidProviderState({ event: { id: eventId, pending_webhooks: pendingWebhooks }, inbox: initialInbox,
     receipt: { eventId, receivedAt: iso(-30_000) } });
   if (preInboxStatus === null) provider.inbox = null;
@@ -398,6 +399,21 @@ test('delayed webhook accepts only known non-processed receiver states before ch
     const result = await evaluate(fixture.input);
     assert.equal(result.passed, true, `status ${status} remains a valid unprocessed receiver state`);
   }
+});
+
+test('delayed webhook rejects non-null processedAt for every allowed unprocessed receiver state', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  const outcomes = [];
+  for (const status of ['pending', 'processing', 'failed']) {
+    const fixture = delayedInvocation({ preInboxStatus: status, preProcessedAtOffset: -20_000 });
+    const result = await evaluate(fixture.input);
+    outcomes.push({ status, passed: result.passed, checkpointCalls: fixture.checkpoint.calls.length });
+  }
+  assert.deepEqual(outcomes, [
+    { status: 'pending', passed: false, checkpointCalls: 0 },
+    { status: 'processing', passed: false, checkpointCalls: 0 },
+    { status: 'failed', passed: false, checkpointCalls: 0 },
+  ]);
 });
 
 test('delayed webhook binds a Stripe-generated event ID from trusted initial evidence', async () => {

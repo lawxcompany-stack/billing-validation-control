@@ -111,8 +111,7 @@ function delayedInboxMatches(inbox, event, context, startedAt, observedAt, proce
     receivedAt !== null && receivedAt >= started && receivedAt <= cutoff &&
     (processed ? processedAt !== null && processedAt > checkpointCompletedAt &&
       processedAt >= receivedAt && processedAt <= cutoff :
-      inbox.processedAt === null || inbox.processedAt === undefined ||
-      processedAt !== null && processedAt >= receivedAt && processedAt <= cutoff);
+      inbox.processedAt === null);
 }
 
 function delayedReceiptMatches(receipt, event, context, startedAt, observedAt) {
