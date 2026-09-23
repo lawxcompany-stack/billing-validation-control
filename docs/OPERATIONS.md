@@ -1,0 +1,35 @@
+# Billing validation control operations
+
+## Scope and current readiness
+
+Task 6 supplies a control-plane evaluator and injected provider adapters. The checked-in tests use mocks only. This is not permission or a procedure for a live Stripe/Supabase run: the current validation child is `MIGRATIONS_FAILED`, so integration readiness is **BLOCKED**, not passed. Do not call provider APIs, install DDL, read `.env*`, use a local database, or run candidate/application scripts as part of Task 6.
+
+The controller preserves the pinned registries of 45 financial cases and 15 supervised 3DS cases. `initial.challenge.incomplete` is an additional control-only negative case, not part of the supervised 15. Financial execution currently has fixed contracts only for `payment.approved`, `payment.declined`, `payment.3ds`, `payment.refresh`, and `payment.two-tabs`. Other registered financial cases have no executable outcome contract and refuse closed. The 3DS upgrade, add-area, and off-session renewal challenge cases are also explicitly unsupported until their operation-specific trusted evidence is implemented.
+
+## Trust and mutation boundaries
+
+An observation pass checks the current Task 5 attempt/fence before and after provider/database reads. Mutations go only through the injected adapter, after a current-fence check, with the exact Task 4 verified TEST account and child environment and a controller-owned, attempt-tied idempotency key. The provider/action allowlist is closed: Stripe checkout replay, Checkout Session expiration, and subscription cancellation; Supabase `fixtures.cleanup` only. Task 4's Stripe runtime remains read-only.
+
+Replaying an application checkout request preserves the application's persisted quote-scoped idempotency key and frozen request. The controller's provider mutation uses a separate per-attempt idempotency key; it must not rewrite the application's key or create a different request payload for the same app replay.
+
+Paid success requires injected Stripe, webhook, and exact Supabase observations. Expected outcome comes from the frozen scenario contract, never a caller override. An empty or missing expected-access set is invalid; active area grants must match the expected set exactly, with no duplicate or extra active grant. Challenge success additionally requires Stripe `authenticationResult === 'authenticated'` and a Task 7 opaque verifier capability bound to the current attempt, current fence, case, and PaymentIntent. A null `authenticationFlow` may be observed, but is not proof by itself. Operator acknowledgement, booleans, and arbitrary JSON are never payment or challenge evidence.
+
+## Webhook resend and replay evidence
+
+Stripe's [Events API](https://docs.stripe.com/api/events) exposes event listing/retrieval; the [webhook endpoint API](https://docs.stripe.com/api/webhook_endpoints) manages endpoints and does not provide an event-resend mutation. In the pinned application flow, resend is a Dashboard/manual checkpoint. Task 6 therefore asks an injected Task 7 checkpoint provider for an opaque capability bound to attempt, fence, case, and event; the checkpoint proves no outcome and causes **no Stripe mutation call**.
+
+After the checkpoint, the controller independently re-reads the event, endpoint configuration, signed-delivery receipt, processed inbox evidence, and exact financial snapshot. Pass requires a fresh matching verified receipt after the checkpoint, processed inbox evidence, and an unchanged financial snapshot. `pending_webhooks = 0` alone is insufficient. The inbox's existing processed state may predate a new append-only receipt; the receipt itself must be fresh. Endpoint ID/URL are verified as configuration for the event's time window. Delivery receipts do not bind endpoint ID, so results do not claim per-delivery endpoint attribution.
+
+## Cleanup and retained evidence
+
+Cleanup is ownership-scoped and works in reverse provider-resource order. It expires only open Checkout Sessions and cancels eligible subscriptions. It retains charges, PaymentIntents, invoices, SetupIntents, events, completed/expired Checkout Sessions, subscriptions after cancellation, and customers. Customer deletion is prohibited: Stripe documents it as irreversible and says it immediately cancels active subscriptions and removes stored cards ([Delete a customer](https://docs.stripe.com/api/customers/delete)).
+
+Database resource kinds resolve only through the closed schema-qualified catalog in `src/billing/cleanup.mjs`; caller-supplied table names, unqualified targets, unknown kinds, and `billing_validation_control` are rejected. No auth identity is deleted. The pinned history-delete trigger protects `billing_quotes`, `billing_checkout_attempts`, `billing_contract_revisions`, `billing_change_requests`, `billing_coupon_redemptions`, `billing_usage_events`, `billing_events`, `billing_effects`, `billing_financial_adjustments`, and `billing_audit_log`; `billing_settlement_effects` has its own history-delete trigger and restrictive foreign keys. These records are retained. Task 6 does not disable triggers, bypass foreign keys, or claim to restore the database baseline after a paid fixture.
+
+If the current attempt owns **any** retained database evidence, cleanup refuses success and leaves the Task 5 lease held. An active contract or area grant gets a specific refusal; inactive but immutable evidence also blocks reuse. No release receipt is returned in either case. Where there are no owned database rows and the observed snapshot exactly matches baseline, reversible provider cleanup is followed by a fenced, empty `fixtures.cleanup` callback, fresh re-observation, and only then lease release. In that narrow path `completed: true` means reversible provider fixture actions completed; `fixtureReusable: true` and `databaseBaselineRestored: true` are asserted only after exact baseline verification. Retained provider financial objects are listed explicitly in the result.
+
+The shared validation branch plus Task 5 lease serializes concurrent attempts; it does **not** roll back immutable database history. Paid fixtures can cause cumulative retained-row growth. Before remote provider tests, the project needs an explicit retention limit and branch rotation or an isolated per-attempt fixture/reset architecture. Task 6 does not reset, recreate, or rotate the branch. Live cleanup of retained paid fixtures remains unavailable until that architecture is approved and supplied by the later integration task.
+
+## Output hygiene
+
+Receipts and logs contain only sanitized synthetic/provider IDs, status, timestamps, and digests. Never emit API keys, Stripe client secrets, browser/session state, cookies, private operator capabilities, or raw provider/database rows. Capabilities are verified in-process and are not returned as evidence payloads.
