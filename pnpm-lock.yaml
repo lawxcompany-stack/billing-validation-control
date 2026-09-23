@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      playwright-core:
+        specifier: 1.62.1
+        version: 1.62.1
     devDependencies:
       yaml:
         specifier: 2.9.1
@@ -14,11 +18,18 @@ importers:
 
 packages:
 
+  playwright-core@1.62.1:
+    resolution: {integrity: sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw==}
+    engines: {node: '>=20'}
+    hasBin: true
+
   yaml@2.9.1:
     resolution: {integrity: sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==}
     engines: {node: '>= 14.6'}
     hasBin: true
 
 snapshots:
+
+  playwright-core@1.62.1: {}
 
   yaml@2.9.1: {}
