@@ -19,6 +19,7 @@ function refuse(code) { throw new StripeRefusal(code); }
 function object(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 
 async function getJson(path, key, fetchImpl) {
+  const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
   let response;
   try {
     response = await fetchImpl(`${API}${path}`, {
@@ -26,11 +27,12 @@ async function getJson(path, key, fetchImpl) {
       headers: { Accept: 'application/json', Authorization: `Bearer ${key}`, 'Cache-Control': 'no-store' },
       redirect: 'error',
       cache: 'no-store',
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal,
     });
   } catch {
     refuse('stripe_unavailable');
   }
+  if (signal.aborted) refuse('stripe_unavailable');
   if (!response || response.status !== 200 || !response.headers?.get('content-type')?.toLowerCase().startsWith('application/json')) {
     refuse('stripe_unavailable');
   }

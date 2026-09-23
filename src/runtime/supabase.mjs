@@ -23,6 +23,7 @@ function sha256(value) { return createHash('sha256').update(value).digest('hex')
 function compare(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
 
 async function getJson(path, token, fetchImpl, limit) {
+  const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
   let response;
   try {
     response = await fetchImpl(`${API}${path}`, {
@@ -30,11 +31,12 @@ async function getJson(path, token, fetchImpl, limit) {
       headers: { Accept: 'application/json', Authorization: `Bearer ${token}`, 'Cache-Control': 'no-store' },
       redirect: 'error',
       cache: 'no-store',
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal,
     });
   } catch {
     refuse('supabase_unavailable');
   }
+  if (signal.aborted) refuse('supabase_unavailable');
   if (!response || response.status !== 200 || !response.headers?.get('content-type')?.toLowerCase().startsWith('application/json')) {
     refuse('supabase_unavailable');
   }
@@ -85,8 +87,9 @@ export async function verifySupabaseEnvironment({ policy, token, fetchImpl = glo
   const seen = new Set();
   const canonical = [];
   for (const entry of migrations) {
-    if (!object(entry) || Object.keys(entry).length !== 2 || !VERSION.test(entry.version) ||
-        !NAME.test(entry.name) || seen.has(entry.version)) refuse('supabase_migrations_invalid');
+    if (!object(entry) || Object.keys(entry).length !== 2 || typeof entry.version !== 'string' ||
+        typeof entry.name !== 'string' || !VERSION.test(entry.version) || !NAME.test(entry.name) ||
+        seen.has(entry.version)) refuse('supabase_migrations_invalid');
     seen.add(entry.version);
     canonical.push({ version: entry.version, name: entry.name });
   }

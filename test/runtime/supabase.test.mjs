@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { verifySupabaseEnvironment } from '../../src/runtime/supabase.mjs';
 import * as supabaseModule from '../../src/runtime/supabase.mjs';
@@ -107,6 +108,21 @@ test('refuses malformed, duplicate, and drifted migration history before generat
   }
 });
 
+test('rejects numeric migration versions and names even when their coerced values match the pinned digest', async () => {
+  for (const entry of [
+    { version: 202609230001, name: 'init' },
+    { version: '202609230001', name: 123 },
+  ]) {
+    const digest = createHash('sha256').update(JSON.stringify([entry])).digest('hex');
+    const network = fixture([branch, [entry], types]);
+    await assert.rejects(verifySupabaseEnvironment({
+      policy: { ...policy, database: { ...policy.database, migrationHistorySha256: digest } },
+      token, fetchImpl: network.fetchImpl,
+    }), { code: 'supabase_migrations_invalid' });
+    assert.equal(network.calls.length, 2);
+  }
+});
+
 test('refuses absent, empty, ambiguous, and drifted generated types without returning raw schema', async () => {
   const cases = [
     { value: {}, code: 'supabase_types_invalid' },
@@ -136,6 +152,28 @@ test('bounds Supabase responses and sanitizes redirects, rate limits, timeouts, 
       assert.equal(error.message.includes(token), false);
       return true;
     });
+  }
+});
+
+test('refuses a successful-looking response after the request timeout signal aborts', async () => {
+  const originalTimeout = AbortSignal.timeout;
+  const controller = new AbortController();
+  let timeoutMs;
+  const network = fixture();
+  AbortSignal.timeout = (milliseconds) => { timeoutMs = milliseconds; return controller.signal; };
+  try {
+    await assert.rejects(verifySupabaseEnvironment({
+      policy, token,
+      fetchImpl: async (url, options) => {
+        assert.equal(options.signal, controller.signal);
+        controller.abort(new DOMException('synthetic timeout', 'TimeoutError'));
+        return network.fetchImpl(url, options);
+      },
+    }), { code: 'supabase_unavailable' });
+    assert.equal(timeoutMs, 10_000);
+    assert.equal(network.calls.length, 1);
+  } finally {
+    AbortSignal.timeout = originalTimeout;
   }
 });
 

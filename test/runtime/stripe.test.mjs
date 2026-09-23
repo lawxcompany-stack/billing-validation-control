@@ -112,6 +112,28 @@ test('bounds Stripe responses and sanitizes redirects, rate limits, timeouts, an
   }
 });
 
+test('refuses a successful-looking response after the request timeout signal aborts', async () => {
+  const originalTimeout = AbortSignal.timeout;
+  const controller = new AbortController();
+  let timeoutMs;
+  const network = fixture();
+  AbortSignal.timeout = (milliseconds) => { timeoutMs = milliseconds; return controller.signal; };
+  try {
+    await assert.rejects(verifyStripeEnvironment({
+      policy, deployment, key,
+      fetchImpl: async (url, options) => {
+        assert.equal(options.signal, controller.signal);
+        controller.abort(new DOMException('synthetic timeout', 'TimeoutError'));
+        return network.fetchImpl(url, options);
+      },
+    }), { code: 'stripe_unavailable' });
+    assert.equal(timeoutMs, 10_000);
+    assert.equal(network.calls.length, 1);
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+  }
+});
+
 test('rejects an oversized webhook response after a valid account read', async () => {
   let calls = 0;
   const fetchImpl = async () => {
