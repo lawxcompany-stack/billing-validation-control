@@ -3,7 +3,7 @@ import { ALL_THREE_DS_SCENARIOS, threeDsScenario } from './fixtures.mjs';
 import { assertCurrentAttempt, BillingControlRefusal } from './contracts.mjs';
 import { expectedGrantCount, hasNoFundsCollected, isValidExpectedAccess, matchingSettlementCount,
   observeFinancialEvidence } from './observations.mjs';
-import { resendWebhookDelivery } from './financial.mjs';
+import { resendWebhookDelivery, verifyDelayedWebhookDelivery } from './financial.mjs';
 import { verifyChallengeCapability } from './witnesses.mjs';
 
 function refuse(code) { throw new BillingControlRefusal(code); }
@@ -80,7 +80,7 @@ export async function runThreeDsCase({ context, caseId, identity, readers, expec
   if (scenario.supported === false) refuse('three_ds_scenario_unsupported');
   if (['paid_challenge', 'paid_frictionless'].includes(scenario.expectedOutcome) &&
       !isValidExpectedAccess(expectedAccess)) refuse('three_ds_expected_access_invalid');
-  const evidence = await observeFinancialEvidence({ context, caseId, identity, readers, startedAt });
+  let evidence = await observeFinancialEvidence({ context, caseId, identity, readers, startedAt });
   const failures = [];
   const witnessVerified = scenario.challenge ? await verifyChallengeWitness({ context, caseId,
     intentId: evidence.provider.intentId, challengeWitnessProvider, challengeVerifier }) : false;
@@ -88,6 +88,26 @@ export async function runThreeDsCase({ context, caseId, identity, readers, expec
 
   let caseEvidence = {};
   let webhookReplay;
+  let webhookDelayed;
+  if (scenario.webhookDelayed) {
+    try {
+      webhookDelayed = await verifyDelayedWebhookDelivery({ context, caseId, identity,
+        initialEvidence: evidence, readers, startedAt,
+        resendCheckpointProvider, resendCheckpointVerifier });
+      const postEvidence = await observeFinancialEvidence({ context, caseId, identity, readers, startedAt });
+      const postObservedAt = Date.parse(postEvidence.observedAt);
+      if (postEvidence.database.currentDigest !== webhookDelayed.postSnapshotDigest ||
+          !Number.isFinite(postObservedAt) || postObservedAt < Date.parse(webhookDelayed.afterObservedAt) ||
+          postEvidence.webhook.eventId !== webhookDelayed.eventId || postEvidence.webhook.pendingWebhooks !== 0 ||
+          !postEvidence.webhook.processed || !paidState(postEvidence, expectedAccess, identity)) {
+        failures.push('webhook_delay_post_reconciliation_unverified');
+      }
+      evidence = postEvidence;
+      caseEvidence.webhookDelayed = webhookDelayed;
+    } catch {
+      failures.push('webhook_delay_unverified');
+    }
+  }
   if (scenario.negativeCase === 'expired_checkout') {
     const checkout = await observeExpiredCheckoutSession(identity, readers);
     if (checkout) caseEvidence = { ...caseEvidence, ...checkout };
@@ -148,5 +168,5 @@ export async function runThreeDsCase({ context, caseId, identity, readers, expec
   return Object.freeze({ caseId, outcome, passed: failures.length === 0,
     failures: Object.freeze([...new Set(failures)]), challengeWitnessVerified: witnessVerified,
     singleEffectVerified: scenario.singleEffect === true && failures.length === 0,
-    webhookReplay, evidence: sanitizedEvidence });
+    webhookReplay, webhookDelayed, evidence: sanitizedEvidence });
 }

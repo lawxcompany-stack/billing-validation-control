@@ -190,7 +190,7 @@ class OpaqueManualResendCheckpoint {
   #opaque = true;
 }
 
-export function manualResendCapabilities({ verified = true, response } = {}) {
+export function manualResendCapabilities({ verified = true, response, eventId = 'evt_task6' } = {}) {
   const witness = response ?? Object.freeze(new OpaqueManualResendCheckpoint());
   const brand = new WeakSet(response === undefined ? [witness] : []);
   const calls = [];
@@ -200,7 +200,7 @@ export function manualResendCapabilities({ verified = true, response } = {}) {
     verifier: { async isOpaqueCapability(candidate) { return brand.has(candidate); }, async verify(candidate, binding) {
       calls.push({ kind: 'verify', candidate, binding: { ...binding } });
       return candidate === witness && verified && binding.attemptId === 'attempt-task6' &&
-        binding.caseId.length > 0 && binding.eventId === 'evt_task6';
+        binding.caseId.length > 0 && binding.eventId === eventId;
     } },
   };
 }

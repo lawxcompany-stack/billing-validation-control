@@ -166,6 +166,19 @@ test('a grant already present in the database baseline cannot prove new paid ent
   assert.ok(result.failures.includes('entitlement_mismatch'));
 });
 
+test('an inactive baseline grant that becomes active is not a newly created entitlement', async () => {
+  const reconcile = needExport(financial, 'reconcileFinancialCase');
+  const baseline = databaseSnapshot();
+  baseline.grants = [{ id: 'grant_task6', contractId: 'contract_task6', area: 'area_task6', status: 'inactive' }];
+  const current = paidDatabaseSnapshot();
+  const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
+    caseId: 'payment.approved', expectedOutcome: 'paid',
+    expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
+    readers: makeReaders({ baseline, current }), startedAt });
+  assert.equal(result.passed, false);
+  assert.ok(result.failures.includes('entitlement_mismatch'));
+});
+
 test('no entitlement may appear before authoritative provider reconciliation', async () => {
   const reconcile = needExport(financial, 'reconcileFinancialCase');
   const parts = makeAttemptParts();

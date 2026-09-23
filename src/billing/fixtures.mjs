@@ -31,7 +31,7 @@ const THREE_DS_CASE_CONTRACTS = Object.freeze({
   'initial.two_tabs': Object.freeze({ expectedOutcome: 'paid_challenge', challenge: true, singleEffect: true }),
   'initial.expired': Object.freeze({ expectedOutcome: 'no_new_access', challenge: false, negativeCase: 'expired_checkout' }),
   'initial.webhook_delayed': Object.freeze({ expectedOutcome: 'paid_challenge', challenge: true, singleEffect: true,
-    webhookReplay: true, supported: false }),
+    webhookDelayed: true }),
   'initial.webhook_replay': Object.freeze({ expectedOutcome: 'paid_challenge', challenge: true, singleEffect: true, webhookReplay: true }),
   'change.upgrade.challenge': Object.freeze({ expectedOutcome: 'paid_challenge', challenge: true, singleEffect: true, supported: false }),
   'change.add_area.challenge': Object.freeze({ expectedOutcome: 'paid_challenge', challenge: true, singleEffect: true, supported: false }),

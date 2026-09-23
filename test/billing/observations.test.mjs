@@ -24,6 +24,15 @@ test('observation rechecks only injected readers and strips provider secrets and
   assert.equal(parts.calls.mutations.length, 0);
 });
 
+test('delayed webhook initial evidence must be the exact trusted observation object', async () => {
+  const observe = needExport(observations, 'observeFinancialEvidence');
+  const isTrusted = needExport(observations, 'isTrustedFinancialObservation');
+  const evidence = await observe({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
+    caseId: 'payment.approved', identity: paymentIdentity, readers: makeReaders(), startedAt });
+  assert.equal(isTrusted(evidence), true);
+  assert.equal(isTrusted(structuredClone(evidence)), false);
+});
+
 test('invoice retrieval requests expansion for payments.data.payment.payment_intent', async () => {
   const observe = needExport(observations, 'observeFinancialEvidence');
   const readers = makeReaders();
@@ -50,6 +59,7 @@ test('invoice payment intent identity rejects missing, mismatched, multiple, and
     { payments: { data: [{ payment: { payment_intent: 'pi_task6' } }], has_more: true } },
     { payments: { data: [{ payment: { payment_intent: 'pi_task6' } }] } },
     { payments: null, payment_intent: 'pi_task6' },
+    { payments: { data: [], has_more: false }, payment_intent: 'pi_task6' },
   ];
   for (const invoice of invalidInvoices) {
     const readers = makeReaders({ provider: paidProviderState({ invoice }) });

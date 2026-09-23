@@ -14,6 +14,77 @@ function invocation(caseId, providerState = paidProviderState(), current = paidD
     expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, startedAt, ...extra } };
 }
 
+function delayedInvocation({ pendingWebhooks = 1, preFinancialEffect = false, preSnapshotMismatch = false,
+  freshReceiptAtOffset = 60_000, includeFreshReceipt = true, postInboxStatus = 'processed',
+  postReobservationMismatch = false, preInboxStatus = 'pending', includeInitialReceipt = true,
+  eventId = 'evt_task6', omitIdentityEventId = false, processedAtOffset = 60_500 } = {}) {
+  const baseTime = Date.now();
+  const iso = (offset) => new Date(baseTime + offset).toISOString();
+  const initialInbox = { eventId, eventType: 'invoice.paid', objectId: 'in_task6',
+    accountId: 'acct_task6test123', livemode: false, status: preInboxStatus, attempts: 1,
+    receivedAt: iso(-30_000), processedAt: null };
+  const provider = paidProviderState({ event: { id: eventId, pending_webhooks: pendingWebhooks }, inbox: initialInbox,
+    receipt: { eventId, receivedAt: iso(-30_000) } });
+  if (preInboxStatus === null) provider.inbox = null;
+  if (!includeInitialReceipt) provider.receipts = [];
+  const baseline = databaseSnapshot({ observedAt: iso(-40_000) });
+  const current = databaseSnapshot({ observedAt: iso(-15_000) });
+  if (preFinancialEffect) current.settlements.push({ id: 'sett_preexisting', contractId: 'contract_task6',
+    invoiceId: 'in_task6', subscriptionId: 'sub_task6', customerId: 'cus_task6', amount: 2500,
+    currency: 'BRL', operation: 'subscription_initial', revision: 1 });
+  const beforeSnapshot = structuredClone(current);
+  beforeSnapshot.observedAt = iso(-10_000);
+  if (preSnapshotMismatch) beforeSnapshot.usage.push({ id: 'usage_snapshot_mismatch', contractId: 'contract_task6',
+    includedUnits: 10, consumedUnits: 0, reservedUnits: 0 });
+  const afterSnapshot = paidDatabaseSnapshot({ observedAt: iso(61_000) });
+  const afterInbox = { ...initialInbox, status: postInboxStatus,
+    processedAt: postInboxStatus === 'processed' ? iso(processedAtOffset) : null };
+  const initialReceipt = provider.receipts[0] ?? { eventId, eventType: 'invoice.paid', objectId: 'in_task6',
+    accountId: 'acct_task6test123', livemode: false, apiVersion: '2026-01-01',
+    receivedAt: iso(-30_000) };
+  const freshReceipt = { ...initialReceipt, id: 'receipt_task6_delayed', receivedAt: iso(freshReceiptAtOffset) };
+  const beforeState = { observedAt: iso(-10_000), inbox: structuredClone(provider.inbox),
+    receipts: structuredClone(provider.receipts), snapshot: beforeSnapshot };
+  const afterState = { observedAt: iso(61_000), inbox: afterInbox,
+    receipts: includeFreshReceipt ? [...structuredClone(provider.receipts), freshReceipt] : structuredClone(provider.receipts),
+    snapshot: afterSnapshot };
+  const readers = makeReaders({ provider, baseline, current, replayStates: [beforeState, afterState] });
+  if (postReobservationMismatch) {
+    const readBillingSnapshot = readers.supabase.readBillingSnapshot.bind(readers.supabase);
+    let currentReads = 0;
+    readers.supabase.readBillingSnapshot = async (request) => {
+      const snapshot = await readBillingSnapshot(request);
+      if (request.phase === 'current' && ++currentReads === 2) {
+        snapshot.grants.push({ id: 'grant_task6_extra', contractId: 'contract_task6',
+          area: 'area_extra', status: 'active' });
+      }
+      return snapshot;
+    };
+  }
+  const capability = challengeCapabilities();
+  const checkpoint = manualResendCapabilities({ eventId });
+  const verifier = {
+    isOpaqueCapability: (...args) => checkpoint.verifier.isOpaqueCapability(...args),
+    async verify(witness, binding) {
+      const verified = await checkpoint.verifier.verify(witness, binding);
+      if (verified) {
+        provider.event.pending_webhooks = 0;
+        provider.inbox = structuredClone(afterInbox);
+        provider.receipts = structuredClone(afterState.receipts);
+        for (const [key, value] of Object.entries(afterSnapshot)) current[key] = structuredClone(value);
+      }
+      return verified;
+    },
+  };
+  const identity = { ...paymentIdentity };
+  if (omitIdentityEventId) delete identity.eventId;
+  const { parts, input } = invocation('initial.webhook_delayed', provider, current, {
+    identity,
+    readers, challengeWitnessProvider: capability.provider, challengeVerifier: capability.verifier,
+    resendCheckpointProvider: checkpoint.provider, resendCheckpointVerifier: verifier });
+  return { parts, input, provider, current, beforeState, afterState, checkpoint, readers };
+}
+
 test('paid challenge succeeds with null Stripe flow only after the bound opaque witness verifier approves', async () => {
   const evaluate = needExport(threeDs, 'runThreeDsCase');
   const capability = challengeCapabilities();
@@ -296,11 +367,97 @@ test('delayed and replay cases bind Task7 checkpoint and require a fresh receipt
   }
 });
 
-test('initial.webhook_delayed remains catalogued but refuses until latency and initial pending state are observed', async () => {
+test('delayed webhook requires pending/no-effect before checkpoint then exact paid reconciliation afterward', async () => {
   const evaluate = needExport(threeDs, 'runThreeDsCase');
-  const { input } = invocation('initial.webhook_delayed');
-  await assert.rejects(evaluate(input), { code: 'three_ds_scenario_unsupported' });
-  assert.equal(input.readers.calls.length, 0);
+  const fixture = delayedInvocation();
+  const result = await evaluate(fixture.input);
+  assert.equal(result.passed, true);
+  assert.equal(result.outcome, 'paid_challenge');
+  assert.equal(result.webhookDelayed.passed, true);
+  assert.equal(fixture.checkpoint.calls.map(({ kind }) => kind).join(','), 'request,verify');
+  assert.equal(fixture.parts.calls.mutations.length, 0);
+  assert.equal(result.evidence.webhook.pendingWebhooks, 0);
+  assert.equal(result.evidence.webhook.processed, true);
+  assert.equal(result.evidence.database.settlementCount, 1);
+  assert.equal(result.evidence.database.grantCount, 1);
+  assert.equal(fixture.readers.calls.filter((call) => call === 'supabase.readBillingSnapshot:current').length, 2);
+});
+
+test('delayed webhook accepts the paused state with no receiver row and no receipts', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  const fixture = delayedInvocation({ preInboxStatus: null, includeInitialReceipt: false });
+  const result = await evaluate(fixture.input);
+  assert.equal(result.passed, true);
+  assert.equal(fixture.checkpoint.calls.length, 2);
+});
+
+test('delayed webhook accepts only known non-processed receiver states before checkpoint', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  for (const status of ['pending', 'processing', 'failed']) {
+    const fixture = delayedInvocation({ preInboxStatus: status });
+    const result = await evaluate(fixture.input);
+    assert.equal(result.passed, true, `status ${status} remains a valid unprocessed receiver state`);
+  }
+});
+
+test('delayed webhook binds a Stripe-generated event ID from trusted initial evidence', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  const fixture = delayedInvocation({ eventId: 'evt_generated_task6', omitIdentityEventId: true });
+  const result = await evaluate(fixture.input);
+  assert.equal(result.passed, true);
+  assert.equal(result.webhookDelayed.eventId, 'evt_generated_task6');
+  assert.equal(fixture.checkpoint.calls[0].binding.eventId, 'evt_generated_task6');
+});
+
+test('delayed webhook requires processedAt strictly after verified checkpoint', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  const fixture = delayedInvocation({ processedAtOffset: -5_000 });
+  const result = await evaluate(fixture.input);
+  assert.equal(result.passed, false);
+  assert.equal(fixture.checkpoint.calls.length, 2);
+});
+
+test('delayed webhook refuses without a pending before-state or when pre-state has financial effects', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  for (const fixture of [delayedInvocation({ pendingWebhooks: 0 }), delayedInvocation({ preFinancialEffect: true })]) {
+    const result = await evaluate(fixture.input);
+    assert.equal(result.passed, false);
+    assert.equal(fixture.checkpoint.calls.length, 0);
+  }
+});
+
+test('delayed webhook binds the before snapshot to initial observation before requesting checkpoint', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  const fixture = delayedInvocation({ preSnapshotMismatch: true });
+  const result = await evaluate(fixture.input);
+  assert.equal(result.passed, false);
+  assert.equal(fixture.checkpoint.calls.length, 0);
+});
+
+test('delayed webhook rejects an old receipt even when it appears during the resend checkpoint', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  const fixture = delayedInvocation({ freshReceiptAtOffset: -5_000 });
+  const result = await evaluate(fixture.input);
+  assert.equal(result.passed, false);
+  assert.equal(fixture.checkpoint.calls.length, 2);
+});
+
+test('delayed webhook requires a fresh receipt and processed inbox after checkpoint', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  for (const fixture of [delayedInvocation({ includeFreshReceipt: false }),
+    delayedInvocation({ postInboxStatus: 'pending' })]) {
+    const result = await evaluate(fixture.input);
+    assert.equal(result.passed, false);
+    assert.equal(fixture.checkpoint.calls.length, 2);
+  }
+});
+
+test('delayed webhook refuses when the post-state snapshot differs from fresh observation', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  const fixture = delayedInvocation({ postReobservationMismatch: true });
+  const result = await evaluate(fixture.input);
+  assert.equal(result.passed, false);
+  assert.equal(fixture.checkpoint.calls.length, 2);
 });
 
 test('webhook replay fails when the exact DB snapshot changes during the checkpoint', async () => {

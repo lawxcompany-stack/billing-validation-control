@@ -72,6 +72,10 @@ export function databaseSnapshotDigest(snapshot) {
   return digest(snapshotFacts(cleanSnapshot));
 }
 
+export function isTrustedFinancialObservation(evidence) {
+  return INTERNAL_EVIDENCE.has(evidence);
+}
+
 export function databaseSnapshotsEqual(left, right) {
   const a = sanitizeDatabaseSnapshot(left);
   const b = sanitizeDatabaseSnapshot(right);
@@ -127,14 +131,16 @@ async function readObservation(operation) {
 
 function invoicePaymentIntentMatches(invoice, expectedPaymentIntentId) {
   const payments = invoice?.payments;
-  if (payments !== undefined &&
-      (!isObject(payments) || !Array.isArray(payments.data) || payments.has_more !== false)) return false;
   const paymentIntentIds = new Set();
-  const legacyPaymentIntentId = ref(invoice?.payment_intent);
-  if (legacyPaymentIntentId) paymentIntentIds.add(legacyPaymentIntentId);
-  for (const entry of payments?.data ?? []) {
-    const paymentIntentId = ref(entry?.payment?.payment_intent);
-    if (paymentIntentId) paymentIntentIds.add(paymentIntentId);
+  if (payments !== undefined) {
+    if (!isObject(payments) || !Array.isArray(payments.data) || payments.has_more !== false) return false;
+    for (const entry of payments.data) {
+      const paymentIntentId = ref(entry?.payment?.payment_intent);
+      if (paymentIntentId) paymentIntentIds.add(paymentIntentId);
+    }
+  } else {
+    const legacyPaymentIntentId = ref(invoice?.payment_intent);
+    if (legacyPaymentIntentId) paymentIntentIds.add(legacyPaymentIntentId);
   }
   return paymentIntentIds.size === 1 && paymentIntentIds.has(expectedPaymentIntentId);
 }
@@ -290,8 +296,10 @@ export function expectedGrantCount(evidence, expectedAccess) {
   const active = current.grants.filter((grant) => grant.status === 'active');
   const baselineActiveForContract = internal.baseline.grants.filter((grant) =>
     grant.contractId === expectedAccess.contractId && grant.status === 'active');
+  const baselineGrantIds = new Set(internal.baseline.grants.map((grant) => grant.id));
   const newActiveForContract = internal.grantDelta.filter((grant) =>
-    grant.contractId === expectedAccess.contractId && grant.status === 'active');
+    grant.contractId === expectedAccess.contractId && grant.status === 'active' &&
+    !baselineGrantIds.has(grant.id));
   if (baselineActiveForContract.length || newActiveForContract.length !== areas.length ||
       newActiveForContract.some((grant) => !areas.includes(grant.area)) ||
       new Set(newActiveForContract.map((grant) => grant.area)).size !== areas.length) return 0;
