@@ -1,0 +1,156 @@
+name: Validate billing control boundary
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Trusted control operation
+        required: true
+        type: choice
+        options: [collect, recheck]
+      candidate_repository:
+        description: Must be the approved LawX application repository
+        required: true
+        type: string
+        default: lawxcompany-stack/Plataforma-LawX
+      candidate_sha:
+        description: Full 40-character candidate commit SHA
+        required: true
+        type: string
+      source_run_id:
+        description: Collect workflow run ID; required only for recheck
+        required: false
+        type: string
+        default: ''
+      source_run_attempt:
+        description: Collect workflow run attempt; required only for recheck
+        required: false
+        type: string
+        default: ''
+      runner_label:
+        description: Per-attempt billing-validation-<32 lowercase hex> label; collect only
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout control repository PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Install locked dependencies
+        run: npx --yes pnpm@11.5.1 --ignore-workspace install --frozen-lockfile --ignore-scripts
+      - name: Run workflow and dispatch policy tests
+        run: npx --yes pnpm@11.5.1 --ignore-workspace test
+      - name: Lint workflow policy
+        run: npx --yes pnpm@11.5.1 --ignore-workspace lint:workflows
+      - name: Check secret boundaries
+        run: npx --yes pnpm@11.5.1 --ignore-workspace check:secret-boundary
+
+  authorize:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      operation: ${{ steps.authorize.outputs.operation }}
+      candidate_sha: ${{ steps.authorize.outputs.candidate_sha }}
+      runner_label: ${{ steps.authorize.outputs.runner_label }}
+    steps:
+      - name: Checkout protected control default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Set up Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Refuse untrusted dispatches before candidate access
+        id: authorize
+        env:
+          CONTROL_REF: ${{ github.ref }}
+          CONTROL_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          DISPATCH_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          import { parseDispatch } from './src/contracts/dispatch.mjs';
+
+          try {
+            const identity = parseDispatch(JSON.parse(process.env.DISPATCH_INPUTS), {
+              ref: process.env.CONTROL_REF,
+              defaultBranch: process.env.CONTROL_DEFAULT_BRANCH,
+              repository: process.env.CONTROL_REPOSITORY,
+            });
+            appendFileSync(process.env.GITHUB_OUTPUT, [
+              `operation=${identity.operation}`,
+              `candidate_sha=${identity.candidateSha}`,
+              `runner_label=${identity.runnerLabel ?? ''}`,
+              '',
+            ].join('\n'));
+            console.log(`Authorized ${identity.operation} dispatch for a full candidate SHA.`);
+          } catch (error) {
+            const code = typeof error?.code === 'string' ? error.code : 'dispatch_refused';
+            console.error(`Dispatch refused (${code}).`);
+            process.exitCode = 1;
+          }
+          NODE
+
+  reader:
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' }}
+    needs: authorize
+    runs-on: ubuntu-latest
+    environment: billing-validation-reader
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Fail closed until Task 2 supplies the read-only candidate resolver
+        run: |
+          echo 'Candidate API access is not enabled by Task 1.' >&2
+          exit 1
+
+  test:
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && needs.reader.result == 'success' }}
+    needs: [authorize, reader]
+    runs-on: ${{ needs.authorize.outputs.runner_label != '' && fromJSON(format('["self-hosted","linux","{0}"]', needs.authorize.outputs.runner_label)) || 'ubuntu-latest' }}
+    environment: billing-validation-tests
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Fail closed until the isolated collector is implemented
+        run: |
+          echo 'Billing and browser execution is not enabled by Task 1.' >&2
+          exit 1
+
+  publisher:
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && needs.test.result == 'success' }}
+    needs: [authorize, reader, test]
+    runs-on: ubuntu-latest
+    environment: billing-validation-publisher
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Fail closed until canonical check publication is implemented
+        run: |
+          echo 'Readiness check publication is not enabled by Task 1.' >&2
+          exit 1
