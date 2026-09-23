@@ -35,7 +35,8 @@ export function validWorkflow(workflow) {
 
 export function validResourceIds(ids) {
   return Array.isArray(ids) && ids.length <= 100 && ids.every((id) =>
-    typeof id === 'string' && /^(?:cus|in|pi|sub|price|prod|evt|ch|re|pm|seti|cs)_[A-Za-z0-9_]{1,120}$/.test(id));
+    typeof id === 'string' && /^(?:cus|in|pi|sub|price|prod|evt|ch|re|pm|seti|cs)_[A-Za-z0-9_]{1,120}$/.test(id) &&
+    !/(?:^|_)secret(?:_|$)/i.test(id));
 }
 
 export function validArtifact(artifact) {

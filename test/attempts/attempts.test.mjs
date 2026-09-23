@@ -47,6 +47,7 @@ function fakeAdapter({ trustedRecovery = true } = {}) {
       await previous;
       const before = snapshot();
       const tx = {
+        lockAttempt: async () => {},
         now: () => clock,
         getAttempt: async (id) => structuredClone(attempts.get(id) ?? null),
         putAttempt: async (row) => attempts.set(row.attemptId, structuredClone(row)),
@@ -152,6 +153,21 @@ test('same attempt resumes recheck with a new fence only after terminal run and 
   await assert.rejects(withExternalFence(store, row, async () => {}), { code: 'lease_fence_lost' });
 });
 
+test('collect replay cannot obtain a recheck owner fence', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const row = await prepareAttempt(store, input());
+  const { fence: _fence, ...publicRow } = row;
+  const { snapshot, artifact } = createSnapshot({ ...publicRow, state: 'collected' }, 'artifact-321');
+  await store.transition({ attemptId: row.attemptId, fence: row.fence,
+    from: 'collecting', to: 'collected', artifact });
+  const resumed = await resumeRecheck(store, { attemptId: row.attemptId, snapshot, artifact,
+    artifactId: artifact.id, artifactDigest: artifact.digest, workflow: row.workflow,
+    environment, candidateSha: shaA, currentHeadSha: shaA, recheckRun });
+  await assert.rejects(prepareAttempt(store, input()), { code: 'attempt_replay_not_owner' });
+  assert.equal(adapter.leases.get(JSON.stringify(key)).fence, resumed.fence);
+});
+
 test('takeover after expiry requires terminal run, removed runner and completed cleanup', async () => {
   const adapter = fakeAdapter();
   const store = createAttemptStore(adapter);
@@ -255,6 +271,20 @@ test('direct store resume refuses artifact substitution before rotating a fence'
   assert.equal((await store.getAttempt(first.attemptId)).state, 'collected');
 });
 
+test('generic transition cannot enter rechecking with the collect fence', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const row = await prepareAttempt(store, input());
+  const { fence: _fence, ...publicRow } = row;
+  const { artifact } = createSnapshot({ ...publicRow, state: 'collected' }, 'artifact-321');
+  await store.transition({ attemptId: row.attemptId, fence: row.fence,
+    from: 'collecting', to: 'collected', artifact });
+  await assert.rejects(store.transition({ attemptId: row.attemptId, fence: row.fence,
+    from: 'collected', to: 'rechecking' }), { code: 'invalid_transition' });
+  assert.equal(adapter.attempts.get(row.attemptId).state, 'collected');
+  assert.equal(adapter.leases.get(JSON.stringify(key)).fence, row.fence);
+});
+
 test('prepare refuses untrusted metadata fields and malformed stable identities', async () => {
   const store = createAttemptStore(fakeAdapter());
   await assert.rejects(prepareAttempt(store, { ...input(), workflow: { ...input().workflow,
@@ -277,6 +307,19 @@ test('collect transition refuses secret-bearing resources and malformed artifact
   { code: 'attempt_input_invalid' });
 });
 
+test('collect transition refuses Stripe client secrets before persistence', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const row = await prepareAttempt(store, input());
+  for (const secret of ['pi_123_secret_abc', 'seti_123_secret_abc']) {
+    await assert.rejects(store.transition({ attemptId: row.attemptId, fence: row.fence,
+      from: 'collecting', to: 'collected', artifact: { id: 'artifact-321',
+        digest: 'c'.repeat(64), schema: 1 }, resourceIds: [secret] }),
+    { code: 'attempt_input_invalid' });
+  }
+  assert.deepEqual(adapter.attempts.get(row.attemptId).resourceIds, []);
+});
+
 test('failed renewal aborts supervised work', async () => {
   const store = createAttemptStore(fakeAdapter());
   const row = await prepareAttempt(store, input());
@@ -286,6 +329,56 @@ test('failed renewal aborts supervised work', async () => {
     signal.addEventListener('abort', () => reject(signal.reason), { once: true });
   }) });
   await assert.rejects(result, { code: 'lease_fence_lost' });
+});
+
+test('renewal supervision rejects an interval longer than its lease TTL', async () => {
+  const store = createAttemptStore(fakeAdapter());
+  const row = await prepareAttempt(store, input());
+  await assert.rejects(withRenewingLease(store, row, { ttlSeconds: 1, intervalMs: 1000,
+    work: async () => 'ran' }), TypeError);
+});
+
+test('stalled renewal aborts work before a later renewal can succeed', async () => {
+  const store = createAttemptStore(fakeAdapter());
+  const row = await prepareAttempt(store, input());
+  let renewals = 0;
+  const stalledStore = { ...store, async renew() {
+    renewals++;
+    if (renewals === 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { ...row, expiresAt: 1060, serverNow: 1000 };
+    }
+    throw Object.assign(new Error('lost'), { code: 'lease_fence_lost' });
+  } };
+  await assert.rejects(withRenewingLease(stalledStore, row, { ttlSeconds: 60,
+    intervalMs: 5, work: (signal) => new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    }) }), { code: 'lease_renewal_timeout' });
+});
+
+test('renewal supervision uses the confirmed database expiry as its deadline', async () => {
+  const store = createAttemptStore(fakeAdapter());
+  const row = await prepareAttempt(store, input());
+  const shortStore = { ...store, assertFence: async () => ({ ...row,
+    expiresAt: 1000.02, serverNow: 1000 }), renew: async () => new Promise(() => {}) };
+  await assert.rejects(withRenewingLease(shortStore, row, { ttlSeconds: 60,
+    intervalMs: 15, work: (signal) => new Promise((resolve, reject) => {
+      const fallback = setTimeout(() => reject(Object.assign(new Error('test timeout'),
+        { code: 'test_timeout' })), 100);
+      signal.addEventListener('abort', () => { clearTimeout(fallback); reject(signal.reason); },
+        { once: true });
+    }) }), { code: 'lease_expired' });
+});
+
+test('expired confirmed lease never starts supervised work', async () => {
+  const store = createAttemptStore(fakeAdapter());
+  const row = await prepareAttempt(store, input());
+  let started = false;
+  const expiredStore = { ...store, assertFence: async () => ({ ...row,
+    expiresAt: 1000, serverNow: 1000 }) };
+  await assert.rejects(withRenewingLease(expiredStore, row, { ttlSeconds: 60,
+    intervalMs: 5, work: async () => { started = true; } }), { code: 'lease_expired' });
+  assert.equal(started, false);
 });
 
 test('caller-supplied recovery flags cannot reclaim a lease without a trusted verifier', async () => {

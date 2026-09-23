@@ -10,7 +10,7 @@ export function refuse(code) { throw new AttemptRefusal(code); }
 
 const transitions = {
   collecting: new Set(['collected', 'cancelled', 'timed_out']),
-  collected: new Set(['rechecking', 'cancelled', 'timed_out']),
+  collected: new Set(['cancelled', 'timed_out']),
   rechecking: new Set(['complete', 'cancelled', 'timed_out']),
 };
 
@@ -41,13 +41,20 @@ export function createAttemptStore(adapter) {
         refuse('attempt_input_invalid');
       }
       return adapter.transaction(async (tx) => {
+        await tx.lockAttempt(attemptId);
         const now = await tx.now();
         const existing = await tx.getAttempt(attemptId);
         const lease = await tx.getLease(key);
         if (existing) {
           if (!equal(existing.key, key) || existing.candidateSha !== candidateSha ||
               !equal(existing.workflow, workflow) || !equal(existing.environment, environment)) refuse('attempt_replay_mismatch');
-          if (lease?.attemptId === attemptId && lease.expiresAt > now) return { ...existing, fence: lease.fence };
+          if (lease?.attemptId === attemptId && lease.expiresAt > now) {
+            if (existing.state !== 'collecting' || lease.candidateSha !== candidateSha ||
+                lease.ownerRepository !== workflow.repository || lease.ownerRef !== workflow.ref ||
+                lease.ownerRunId !== workflow.runId ||
+                lease.ownerRunAttempt !== workflow.runAttempt) refuse('attempt_replay_not_owner');
+            return { ...existing, fence: lease.fence };
+          }
           refuse('attempt_replay_expired');
         }
         if (lease) {
@@ -72,14 +79,18 @@ export function createAttemptStore(adapter) {
     async getAttempt(attemptId) { return adapter.transaction((tx) => tx.getAttempt(attemptId)); },
     async assertFence({ attemptId, fence }) {
       return adapter.transaction(async (tx) => {
+        await tx.lockAttempt(attemptId);
         const row = await tx.getAttempt(attemptId);
         if (!row) refuse('attempt_missing');
-        assertOwner(await tx.getLease(row.key), attemptId, fence, await tx.now());
-        return row;
+        const lease = await tx.getLease(row.key);
+        const now = await tx.now();
+        assertOwner(lease, attemptId, fence, now);
+        return { ...row, expiresAt: lease.expiresAt, serverNow: now };
       });
     },
     async fixtureMutation({ attemptId, fence }, mutation) {
       return adapter.transaction(async (tx) => {
+        await tx.lockAttempt(attemptId);
         const row = await tx.getAttempt(attemptId);
         if (!row) refuse('attempt_missing');
         assertOwner(await tx.getLease(row.key), attemptId, fence, await tx.now());
@@ -89,17 +100,19 @@ export function createAttemptStore(adapter) {
     async renew({ attemptId, fence, ttlSeconds }) {
       if (!validTtl(ttlSeconds)) refuse('attempt_input_invalid');
       return adapter.transaction(async (tx) => {
+        await tx.lockAttempt(attemptId);
         const row = await tx.getAttempt(attemptId);
         if (!row) refuse('attempt_missing');
         const lease = await tx.getLease(row.key);
         const now = await tx.now();
         assertOwner(lease, attemptId, fence, now);
         await tx.putLease({ ...lease, expiresAt: now + ttlSeconds }, fence);
-        return { ...row, fence, expiresAt: now + ttlSeconds };
+        return { ...row, fence, expiresAt: now + ttlSeconds, serverNow: now };
       });
     },
     async transition({ attemptId, fence, from, to, artifact, resourceIds }) {
       return adapter.transaction(async (tx) => {
+        await tx.lockAttempt(attemptId);
         const row = await tx.getAttempt(attemptId);
         if (!row) refuse('attempt_missing');
         assertOwner(await tx.getLease(row.key), attemptId, fence, await tx.now());
@@ -116,6 +129,7 @@ export function createAttemptStore(adapter) {
     async resumeRecheck({ attemptId, artifact, snapshot, artifactId, artifactDigest, workflow,
       environment, candidateSha, currentHeadSha, recheckRun, ttlSeconds = 60 }) {
       return adapter.transaction(async (tx) => {
+        await tx.lockAttempt(attemptId);
         const row = await tx.getAttempt(attemptId);
         if (!row || row.state !== 'collected') refuse('invalid_transition');
         const lease = await tx.getLease(row.key);
@@ -145,6 +159,7 @@ export function createAttemptStore(adapter) {
     },
     async cleanup({ attemptId, fence }) {
       return adapter.transaction(async (tx) => {
+        await tx.lockAttempt(attemptId);
         const row = await tx.getAttempt(attemptId);
         if (!row) refuse('attempt_missing');
         const lease = await tx.getLease(row.key);

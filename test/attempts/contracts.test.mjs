@@ -70,3 +70,12 @@ test('public snapshot is immutable even when source row is later changed', () =>
   assert.throws(() => snapshot.resourceIds.push('cus_untrusted'), TypeError);
   assert.throws(() => { snapshot.workflow.runId = '999'; }, TypeError);
 });
+
+test('Stripe client secrets cannot be copied into public resource IDs', () => {
+  for (const secret of ['pi_123_secret_abc', 'seti_123_secret_abc']) {
+    assert.throws(() => createSnapshot({ ...row, resourceIds: [secret] }, 'artifact-321'),
+      { code: 'attempt_private_material' });
+  }
+  assert.deepEqual(createSnapshot({ ...row, resourceIds: ['pi_123', 'seti_123'] },
+    'artifact-321').snapshot.resourceIds, ['pi_123', 'seti_123']);
+});

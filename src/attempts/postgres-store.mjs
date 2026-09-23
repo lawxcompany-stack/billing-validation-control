@@ -1,12 +1,34 @@
 import { readFile } from 'node:fs/promises';
+import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { createAttemptStore, refuse } from './store.mjs';
 
 const PRODUCTION_LABEL = /(?:^|[-_.])(?:main|master|prod|production|primary|default)(?:$|[-_.])/i;
+const PROJECT_REF = /^[a-z0-9]{20}$/;
+const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
+const DIGEST = /^[a-f0-9]{64}$/;
+function exactKeys(value, keys) {
+  return value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
 
 function verifiedTarget(preflight, target) {
   const expected = preflight?.expectedEnvironment?.database;
   const verified = preflight?.providerVerification?.supabase;
-  return expected && verified && target &&
+  const stripe = preflight?.providerVerification?.stripe;
+  return isValidExpectedEnvironment(preflight?.expectedEnvironment) &&
+    exactKeys(preflight?.providerVerification, ['supabase', 'stripe']) &&
+    exactKeys(verified, ['projectRef', 'parentProjectRef', 'branchId', 'branchName',
+      'schemaFingerprintSha256', 'migrationHistorySha256']) &&
+    exactKeys(stripe, ['accountId', 'webhookEndpointId', 'webhookUrl', 'livemode']) &&
+    stripe.accountId === preflight.expectedEnvironment.stripe.accountId && stripe.livemode === false &&
+    /^we_[A-Za-z0-9]+$/.test(stripe.webhookEndpointId) &&
+    stripe.webhookUrl === `${preflight.expectedEnvironment.deployment.origin}/api/stripe/webhook` &&
+    target &&
+    PROJECT_REF.test(verified.projectRef) && PROJECT_REF.test(verified.parentProjectRef) &&
+    BRANCH.test(verified.branchId) && BRANCH.test(verified.branchName) &&
+    DIGEST.test(verified.schemaFingerprintSha256) && DIGEST.test(verified.migrationHistorySha256) &&
+    PROJECT_REF.test(target.projectRef) && PROJECT_REF.test(target.parentProjectRef) &&
+    BRANCH.test(target.branchId) && BRANCH.test(target.branchName) &&
     target.projectRef === expected.projectRef && target.branchId === expected.branchId &&
     verified.projectRef === target.projectRef && verified.branchId === target.branchId &&
     verified.parentProjectRef === target.parentProjectRef && verified.branchName === target.branchName &&
@@ -45,6 +67,10 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, expectedEnvir
     transaction: (fn) => client.transaction(async (queryClient) => {
     if (typeof queryClient?.query !== 'function') refuse('store_client_invalid');
     const tx = {
+      async lockAttempt(attemptId) {
+        await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+          [JSON.stringify(['attempt', attemptId])]);
+      },
       async now() {
         const result = await queryClient.query('SELECT extract(epoch FROM clock_timestamp()) AS now', []);
         return Number(result.rows[0].now);
@@ -62,7 +88,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, expectedEnvir
           row.environment.deployment.origin, row.environment.stripe.accountId, row.state,
           row.cleanupStatus, row.artifact?.id ?? null, row.artifact?.digest ?? null,
           row.artifact?.schema ?? null, JSON.stringify(row.resourceIds), row.createdAt, row.updatedAt];
-        await queryClient.query(`INSERT INTO billing_validation_control.attempts
+        const result = await queryClient.query(`INSERT INTO billing_validation_control.attempts
           (attempt_id, branch_id, suite, fixture_key, candidate_sha, workflow_repository, workflow_ref,
            workflow_run_id, workflow_run_attempt, runner_label, database_project_ref, deployment_id,
            deployment_origin, stripe_account_id, state, cleanup_status, artifact_id, artifact_digest,
@@ -76,6 +102,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, expectedEnvir
           WHERE billing_validation_control.attempts.branch_id = EXCLUDED.branch_id
             AND billing_validation_control.attempts.suite = EXCLUDED.suite
             AND billing_validation_control.attempts.fixture_key = EXCLUDED.fixture_key`, values);
+        if (result.rowCount !== 1) refuse('attempt_conflict');
       },
       async getLease(key) {
         // This lock serializes even the first insert for an absent key. Hash collisions only reduce concurrency.

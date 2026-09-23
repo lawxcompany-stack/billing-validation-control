@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_leases (
   branch_id text NOT NULL,
   suite text NOT NULL,
   fixture_key text NOT NULL,
-  attempt_id text NOT NULL REFERENCES billing_validation_control.attempts(attempt_id),
+  attempt_id text NOT NULL,
   owner_candidate_sha char(40) NOT NULL,
   owner_repository text NOT NULL,
   owner_ref text NOT NULL,
@@ -40,7 +40,9 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_leases (
   owner_run_attempt integer NOT NULL,
   fence uuid NOT NULL,
   expires_at timestamptz NOT NULL,
-  PRIMARY KEY (branch_id, suite, fixture_key)
+  PRIMARY KEY (branch_id, suite, fixture_key),
+  FOREIGN KEY (attempt_id, branch_id, suite, fixture_key)
+    REFERENCES billing_validation_control.attempts(attempt_id, branch_id, suite, fixture_key)
 );
 CREATE INDEX IF NOT EXISTS billing_validation_lease_expiry
   ON billing_validation_control.fixture_leases (expires_at);
