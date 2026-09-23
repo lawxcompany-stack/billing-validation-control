@@ -3,6 +3,8 @@ import { createRequire } from 'node:module';
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { resolvePreviewDeployment } from '../github/deployments.mjs';
 import { verifyDeploymentAttestation } from './vercel.mjs';
+import { verifySupabaseEnvironment } from './supabase.mjs';
+import { verifyStripeEnvironment } from './stripe.mjs';
 
 const require = createRequire(import.meta.url);
 const DEFAULT_POLICY = require('../../policy/environment-policy.json');
@@ -15,6 +17,7 @@ const ID_PATTERN = {
   branchName: /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u,
   accountId: /^acct_[A-Za-z0-9_]+$/u,
   webhookEndpointId: /^we_[A-Za-z0-9]+$/u,
+  sha256: /^[0-9a-f]{64}$/u,
 };
 const PRODUCTION_BRANCH_LABELS = new Set(['main', 'master', 'prod', 'production', 'primary', 'default']);
 const PRODUCTION_BRANCH_PART = /(?:^|[-_.])(?:main|master|prod|production|primary|default)(?:$|[-_.])/u;
@@ -54,9 +57,9 @@ function validPublicKey(value) {
 }
 
 export function validateEnvironmentPolicy(policy) {
-  if (!exactKeys(policy, POLICY_KEYS) || policy.schema_version !== 1 || policy.environment !== 'billing-validation' ||
+  if (!exactKeys(policy, POLICY_KEYS) || policy.schema_version !== 2 || policy.environment !== 'billing-validation' ||
       !exactKeys(policy.vercel, ['projectId', 'teamId']) ||
-      !exactKeys(policy.database, ['projectRef', 'branchId', 'branchName']) ||
+      !exactKeys(policy.database, ['projectRef', 'parentProjectRef', 'branchId', 'branchName', 'schemaFingerprintSha256', 'migrationHistorySha256']) ||
       !exactKeys(policy.stripe, ['accountId', 'webhookEndpointId', 'livemode']) ||
       !exactKeys(policy.attestation, ['publicKeyPem'])) return false;
 
@@ -65,8 +68,12 @@ export function validateEnvironmentPolicy(policy) {
   return nullableMatch(policy.vercel.projectId, ID_PATTERN.projectId) &&
     nullableMatch(policy.vercel.teamId, ID_PATTERN.teamId) &&
     nullableMatch(policy.database.projectRef, ID_PATTERN.projectRef) &&
+    nullableMatch(policy.database.parentProjectRef, ID_PATTERN.projectRef) &&
+    (policy.database.parentProjectRef === null || policy.database.projectRef === null || policy.database.parentProjectRef !== policy.database.projectRef) &&
     nullableMatch(policy.database.branchId, ID_PATTERN.branchId) &&
     nullableMatch(policy.database.branchName, ID_PATTERN.branchName) &&
+    nullableMatch(policy.database.schemaFingerprintSha256, ID_PATTERN.sha256) &&
+    nullableMatch(policy.database.migrationHistorySha256, ID_PATTERN.sha256) &&
     !PRODUCTION_BRANCH_LABELS.has(branchIdLabel) && !PRODUCTION_BRANCH_LABELS.has(branchNameLabel) &&
     !PRODUCTION_BRANCH_PART.test(branchIdLabel) && !PRODUCTION_BRANCH_PART.test(branchNameLabel) &&
     nullableMatch(policy.stripe.accountId, ID_PATTERN.accountId) && policy.stripe.accountId !== 'platform' &&
@@ -76,14 +83,17 @@ export function validateEnvironmentPolicy(policy) {
 
 function hasRequiredTaskIdentities(policy) {
   return policy.vercel.projectId !== null && policy.vercel.teamId !== null &&
-    policy.database.projectRef !== null && policy.database.branchId !== null && policy.database.branchName !== null &&
-    policy.stripe.accountId !== null && policy.attestation.publicKeyPem !== null;
+    policy.database.projectRef !== null && policy.database.parentProjectRef !== null &&
+    policy.database.branchId !== null && policy.database.branchName !== null &&
+    policy.database.schemaFingerprintSha256 !== null && policy.database.migrationHistorySha256 !== null &&
+    policy.stripe.accountId !== null && policy.stripe.webhookEndpointId !== null &&
+    policy.attestation.publicKeyPem !== null;
 }
 
 export async function preflightRuntime(options = {}) {
   if (!isObject(options) || Object.keys(options).some((key) =>
-    !['api', 'candidate', 'policy', 'fetchImpl', 'now'].includes(key))) refuse('preflight_input_invalid');
-  const { api, candidate, fetchImpl, now } = options;
+    !['api', 'candidate', 'policy', 'fetchImpl', 'now', 'supabaseToken', 'stripeKey'].includes(key))) refuse('preflight_input_invalid');
+  const { api, candidate, fetchImpl, now, supabaseToken, stripeKey } = options;
   const policy = options.policy ?? DEFAULT_POLICY;
   if (!validateEnvironmentPolicy(policy)) refuse('environment_policy_invalid');
   if (!hasRequiredTaskIdentities(policy)) refuse('environment_policy_unconfigured');
@@ -101,5 +111,7 @@ export async function preflightRuntime(options = {}) {
   });
   if (!isValidExpectedEnvironment(expectedEnvironment)) refuse('environment_identity_invalid');
 
-  return Object.freeze({ expectedEnvironment });
+  const supabase = await verifySupabaseEnvironment({ policy, token: supabaseToken, fetchImpl });
+  const stripe = await verifyStripeEnvironment({ policy, deployment, key: stripeKey, fetchImpl });
+  return Object.freeze({ expectedEnvironment, providerVerification: Object.freeze({ supabase, stripe }) });
 }
