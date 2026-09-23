@@ -141,6 +141,31 @@ test('paid reconciliation rejects extra and duplicate active area grants', async
   }
 });
 
+test('paid reconciliation requires the new settlement to belong to the expected contract', async () => {
+  const reconcile = needExport(financial, 'reconcileFinancialCase');
+  const current = paidDatabaseSnapshot();
+  current.settlements[0].contractId = 'contract_other';
+  const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
+    caseId: 'payment.approved', expectedOutcome: 'paid',
+    expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
+    readers: makeReaders({ current }), startedAt });
+  assert.equal(result.passed, false);
+  assert.ok(result.failures.includes('settlement_not_unique'));
+});
+
+test('a grant already present in the database baseline cannot prove new paid entitlement', async () => {
+  const reconcile = needExport(financial, 'reconcileFinancialCase');
+  const current = paidDatabaseSnapshot();
+  const baseline = databaseSnapshot();
+  baseline.grants = structuredClone(current.grants);
+  const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
+    caseId: 'payment.approved', expectedOutcome: 'paid',
+    expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
+    readers: makeReaders({ baseline, current }), startedAt });
+  assert.equal(result.passed, false);
+  assert.ok(result.failures.includes('entitlement_mismatch'));
+});
+
 test('no entitlement may appear before authoritative provider reconciliation', async () => {
   const reconcile = needExport(financial, 'reconcileFinancialCase');
   const parts = makeAttemptParts();
@@ -189,6 +214,8 @@ test('pending_webhooks zero without a fresh post-checkpoint receipt refuses repl
   const resend = needExport(financial, 'resendWebhookDelivery');
   const parts = makeAttemptParts();
   const replay = webhookReplayStates({ fresh: false });
+  const afterState = replay.states[1];
+  const priorReceipts = [...replay.states[0].receipts];
   const checkpoint = manualResendCapabilities();
   await expectRefusal(resend({ context: needExport(contracts, 'createVerifiedContext')(parts),
     caseId: 'initial.webhook_replay', eventId: 'evt_task6', readers: makeReaders({ provider: replay.provider, replayStates: replay.states }),
@@ -210,6 +237,38 @@ test('a fresh replay receipt is accepted alongside the original processed inbox 
     resendCheckpointProvider: checkpoint.provider, resendCheckpointVerifier: checkpoint.verifier });
   assert.equal(result.passed, true);
   assert.equal(result.afterReceiptIds.includes('receipt_task6_replay'), true);
+  assert.equal(parts.calls.mutations.length, 0);
+});
+
+test('a receipt arriving while the manual checkpoint request is pending cannot satisfy replay', async () => {
+  const resend = needExport(financial, 'resendWebhookDelivery');
+  const parts = makeAttemptParts();
+  const replay = webhookReplayStates({ fresh: false });
+  const checkpoint = manualResendCapabilities();
+  const afterState = replay.states[1];
+  const priorReceipts = replay.states[0].receipts;
+  let receiptArrivedBeforeCheckpointReturned = false;
+  const delayedProvider = {
+    async request(binding) {
+      const witness = await checkpoint.provider.request(binding);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const receivedAt = new Date().toISOString();
+      Object.assign(afterState, {
+        observedAt: new Date(Date.now() + 60_000).toISOString(),
+        receipts: [...priorReceipts,
+          { ...replay.provider.receipts[0], id: 'receipt_during_checkpoint', receivedAt }],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      receiptArrivedBeforeCheckpointReturned = true;
+      return witness;
+    },
+  };
+  await expectRefusal(resend({ context: needExport(contracts, 'createVerifiedContext')(parts),
+    caseId: 'initial.webhook_replay', eventId: 'evt_task6',
+    readers: makeReaders({ provider: replay.provider, replayStates: replay.states }),
+    resendCheckpointProvider: delayedProvider, resendCheckpointVerifier: checkpoint.verifier }),
+  'webhook_replay_receipt_missing');
+  assert.equal(receiptArrivedBeforeCheckpointReturned, true);
   assert.equal(parts.calls.mutations.length, 0);
 });
 

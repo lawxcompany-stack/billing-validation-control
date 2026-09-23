@@ -107,6 +107,32 @@ test('paid 3DS refuses absent or empty expected access before provider reads', a
   }
 });
 
+test('paid 3DS requires the new settlement to belong to the expected contract', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  const capability = challengeCapabilities();
+  const current = paidDatabaseSnapshot();
+  current.settlements[0].contractId = 'contract_other';
+  const { input } = invocation('initial.challenge.success', paidProviderState(), current, {
+    challengeWitnessProvider: capability.provider, challengeVerifier: capability.verifier });
+  const result = await evaluate(input);
+  assert.equal(result.passed, false);
+  assert.ok(result.failures.includes('payment_reconciliation_incomplete'));
+});
+
+test('paid 3DS cannot count an active grant that was already present in the baseline', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  const capability = challengeCapabilities();
+  const current = paidDatabaseSnapshot();
+  const baseline = databaseSnapshot();
+  baseline.grants = structuredClone(current.grants);
+  const readers = makeReaders({ baseline, current });
+  const { input } = invocation('initial.challenge.success', paidProviderState(), current, {
+    readers, challengeWitnessProvider: capability.provider, challengeVerifier: capability.verifier });
+  const result = await evaluate(input);
+  assert.equal(result.passed, false);
+  assert.ok(result.failures.includes('payment_reconciliation_incomplete'));
+});
+
 test('challenge failure shows no settlement, grant, revision, or usage change', async () => {
   const evaluate = needExport(threeDs, 'runThreeDsCase');
   const capability = challengeCapabilities();
@@ -240,12 +266,22 @@ test('foreign_actor passes only when a trusted access observation proves cross-t
 
 test('delayed and replay cases bind Task7 checkpoint and require a fresh receipt with unchanged DB', async () => {
   const evaluate = needExport(threeDs, 'runThreeDsCase');
-  for (const caseId of ['initial.webhook_delayed', 'initial.webhook_replay']) {
+  for (const caseId of ['initial.webhook_replay']) {
     const capability = challengeCapabilities();
     const checkpoint = manualResendCapabilities();
     const replay = webhookReplayStates();
-    const readers = makeReaders({ provider: replay.provider, replayStates: replay.states });
-    const { parts, input } = invocation(caseId, replay.provider, paidDatabaseSnapshot(), {
+    const [beforeReplay, afterReplay] = replay.states;
+    const current = replay.initialSnapshot;
+    assert.ok(current, 'fixture provides an initial pre-checkpoint database snapshot');
+    const initialObservedAt = Date.parse(current.observedAt);
+    const originalReceiptTimes = replay.provider.receipts.map(({ receivedAt }) => Date.parse(receivedAt));
+    assert.ok(originalReceiptTimes.every((receivedAt) => receivedAt <= initialObservedAt));
+    assert.ok(Date.parse(replay.provider.inbox.processedAt) <= initialObservedAt);
+    assert.ok(initialObservedAt <= Date.parse(beforeReplay.observedAt));
+    assert.equal(Date.parse(beforeReplay.snapshot.observedAt), Date.parse(beforeReplay.observedAt));
+    assert.equal(Date.parse(afterReplay.snapshot.observedAt), Date.parse(afterReplay.observedAt));
+    const readers = makeReaders({ provider: replay.provider, current, replayStates: replay.states });
+    const { parts, input } = invocation(caseId, replay.provider, current, {
       readers, challengeWitnessProvider: capability.provider, challengeVerifier: capability.verifier,
       resendCheckpointProvider: checkpoint.provider, resendCheckpointVerifier: checkpoint.verifier });
     const result = await evaluate(input);
@@ -254,7 +290,17 @@ test('delayed and replay cases bind Task7 checkpoint and require a fresh receipt
     assert.deepEqual(checkpoint.calls[0].binding, { attemptId: 'attempt-task6', fence: 'fence-task6',
       caseId, eventId: 'evt_task6' });
     assert.equal(parts.calls.mutations.length, 0, 'manual resend never uses a provider mutation adapter');
+    const freshReceipt = afterReplay.receipts.find(({ id }) => id === 'receipt_task6_replay');
+    assert.ok(Date.parse(freshReceipt.receivedAt) > Date.parse(result.webhookReplay.checkpointAt));
+    assert.ok(Date.parse(freshReceipt.receivedAt) <= Date.parse(afterReplay.observedAt));
   }
+});
+
+test('initial.webhook_delayed remains catalogued but refuses until latency and initial pending state are observed', async () => {
+  const evaluate = needExport(threeDs, 'runThreeDsCase');
+  const { input } = invocation('initial.webhook_delayed');
+  await assert.rejects(evaluate(input), { code: 'three_ds_scenario_unsupported' });
+  assert.equal(input.readers.calls.length, 0);
 });
 
 test('webhook replay fails when the exact DB snapshot changes during the checkpoint', async () => {
@@ -262,8 +308,9 @@ test('webhook replay fails when the exact DB snapshot changes during the checkpo
   const capability = challengeCapabilities();
   const checkpoint = manualResendCapabilities();
   const replay = webhookReplayStates({ unchanged: false });
-  const { input } = invocation('initial.webhook_replay', replay.provider, paidDatabaseSnapshot(), {
-    readers: makeReaders({ provider: replay.provider, replayStates: replay.states }),
+  const current = replay.initialSnapshot;
+  const { input } = invocation('initial.webhook_replay', replay.provider, current, {
+    readers: makeReaders({ provider: replay.provider, current, replayStates: replay.states }),
     challengeWitnessProvider: capability.provider, challengeVerifier: capability.verifier,
     resendCheckpointProvider: checkpoint.provider, resendCheckpointVerifier: checkpoint.verifier });
   const result = await evaluate(input);

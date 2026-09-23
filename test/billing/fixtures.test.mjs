@@ -43,7 +43,8 @@ test('3DS catalog keeps the 15 supervised cases and separates the control-only i
   assert.deepEqual(needValue(fixtures, 'CONTROL_ONLY_THREE_DS_SCENARIOS'), ['initial.challenge.incomplete']);
   assert.equal(needValue(fixtures, 'ALL_THREE_DS_SCENARIOS').length, 16);
   assert.equal(needExport(fixtures, 'threeDsScenario')('initial.challenge.incomplete').expectedOutcome, 'incomplete');
-  for (const id of ['change.upgrade.challenge', 'change.add_area.challenge', 'renewal.off_session.challenge']) {
+  for (const id of ['initial.webhook_delayed', 'change.upgrade.challenge', 'change.add_area.challenge',
+    'renewal.off_session.challenge']) {
     assert.equal(needExport(fixtures, 'threeDsScenario')(id).supported, false);
   }
   assert.throws(() => fixtures.threeDsScenario('not-a-case'), { code: 'three_ds_scenario_invalid' });

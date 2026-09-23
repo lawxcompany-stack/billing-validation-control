@@ -82,14 +82,16 @@ async function requestResendCheckpoint(context, caseId, eventId, provider, verif
   }
   const current = await assertCurrentAttempt(context);
   const binding = Object.freeze({ attemptId: context.owner.attemptId, fence: current.fence, caseId, eventId });
-  const checkpointRequestedAt = Date.now();
   let witness;
   try { witness = await provider.request(binding); }
   catch { refuse('webhook_replay_checkpoint_invalid'); }
   const verified = await verifyOpaqueCapability({ witness, binding, verifier });
   await assertCurrentAttempt(context);
   if (!verified) refuse('webhook_replay_checkpoint_invalid');
-  return checkpointRequestedAt;
+  // The Task7 verifier must only approve a capability after the operator's manual
+  // Dashboard action is complete. Starting the clock after verification prevents
+  // an unrelated retry while the operator is still acting from counting as proof.
+  return Date.now();
 }
 
 export async function resendWebhookDelivery({ context, caseId, eventId, readers,
@@ -112,9 +114,9 @@ export async function resendWebhookDelivery({ context, caseId, eventId, readers,
   if (beforeEvent?.id !== eventId || beforeEvent.type !== 'invoice.paid' || beforeEvent.livemode !== false ||
       !replayStateValid(before, beforeEvent, context)) refuse('webhook_replay_checkpoint_missing');
   if (!validWebhookConfiguration(beforeEndpoint, beforeEvent, context)) refuse('webhook_replay_endpoint_unverified');
-  let checkpointRequestedAt;
+  let checkpointCompletedAt;
   try {
-    checkpointRequestedAt = await requestResendCheckpoint(context, caseId, eventId,
+    checkpointCompletedAt = await requestResendCheckpoint(context, caseId, eventId,
       resendCheckpointProvider, resendCheckpointVerifier);
   } catch (error) {
     if (error instanceof BillingControlRefusal) throw error;
@@ -138,11 +140,11 @@ export async function resendWebhookDelivery({ context, caseId, eventId, readers,
   if (!replayStateValid(after, afterEvent, context)) refuse('webhook_replay_receipt_missing');
   const priorIds = new Set(before.receipts.map((receipt) => receipt.id));
   const fresh = after.receipts.filter((receipt) => !priorIds.has(receipt.id) &&
-    Date.parse(receipt.receivedAt) > checkpointRequestedAt &&
+    Date.parse(receipt.receivedAt) > checkpointCompletedAt &&
     Date.parse(receipt.receivedAt) <= Date.parse(after.observedAt));
   if (!fresh.length) refuse('webhook_replay_receipt_missing');
   await assertCurrentAttempt(context);
-  return Object.freeze({ passed: true, eventId, checkpointAt: new Date(checkpointRequestedAt).toISOString(),
+  return Object.freeze({ passed: true, eventId, checkpointAt: new Date(checkpointCompletedAt).toISOString(),
     beforeReceiptIds: before.receipts.map((receipt) => receipt.id),
     afterReceiptIds: after.receipts.map((receipt) => receipt.id),
     financialStateDigest: databaseSnapshotDigest(after.snapshot),
@@ -164,7 +166,7 @@ export async function reconcileFinancialCase({ context, caseId, expectedOutcome,
   const failures = [];
   const challengeWitnessVerified = contract.challenge ? await verifyChallengeCapability({ context, caseId,
     paymentIntentId: evidence.provider.intentId, challengeWitnessProvider, challengeVerifier }) : false;
-  const matchedSettlements = matchingSettlementCount(evidence, identity);
+  const matchedSettlements = matchingSettlementCount(evidence, identity, expectedAccess?.contractId);
   const expectedGrants = expectedGrantCount(evidence, expectedAccess);
   const newAccess = evidence.database.settlementCount > 0 || evidence.database.grantCount > 0 ||
     evidence.database.revisionCount > 0 || evidence.database.usageCount > 0;

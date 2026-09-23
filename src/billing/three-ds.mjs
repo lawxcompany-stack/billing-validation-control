@@ -34,7 +34,7 @@ function noNewAccess(evidence) {
 function paidState(evidence, expectedAccess, identity) {
   return evidence.provider.stripePaid && evidence.provider.authenticationResult === 'authenticated' &&
     evidence.webhook.processed && evidence.database.contextCount === 1 && evidence.database.settlementCount === 1 &&
-    matchingSettlementCount(evidence, identity) === 1 &&
+    matchingSettlementCount(evidence, identity, expectedAccess?.contractId) === 1 &&
     expectedGrantCount(evidence, expectedAccess) === expectedAccess?.areas?.length;
 }
 

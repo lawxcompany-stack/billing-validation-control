@@ -68,7 +68,7 @@ export function needValue(module, name) {
   return module[name];
 }
 
-export function databaseSnapshot({ observedAt = '2026-09-23T09:00:00.000Z',
+export function databaseSnapshot({ observedAt = '2026-09-23T09:20:00.000Z',
   paymentSettled = false, changedUsage = false } = {}) {
   return {
     observedAt,
@@ -95,7 +95,9 @@ const eventCreated = Math.floor(Date.parse('2026-09-23T09:10:00.000Z') / 1000);
 
 export function paidProviderState(overrides = {}) {
   const invoice = { id: 'in_task6', livemode: false, customer: 'cus_task6', subscription: 'sub_task6',
+    payment_intent: 'pi_task6',
     status: 'paid', amount_due: 2500, amount_paid: 2500, amount_remaining: 0, currency: 'brl',
+    payments: { data: [{ payment: { payment_intent: 'pi_task6' } }], has_more: false },
     client_secret: 'pi_secret_private', metadata: { operatorCapability: 'private' } };
   const intent = { id: 'pi_task6', livemode: false, customer: 'cus_task6', status: 'succeeded',
     amount_received: 2500, currency: 'brl', latest_charge: 'ch_task6', client_secret: 'pi_secret_private' };
@@ -160,7 +162,9 @@ export function makeReaders({ provider = paidProviderState(), baseline = databas
   return { stripe, supabase, calls };
 }
 
-export function paidDatabaseSnapshot() { return databaseSnapshot({ paymentSettled: true }); }
+export function paidDatabaseSnapshot({ observedAt } = {}) {
+  return databaseSnapshot({ ...(observedAt === undefined ? {} : { observedAt }), paymentSettled: true });
+}
 
 export class OpaqueChallengeWitness {
   #opaque = true;
@@ -207,14 +211,16 @@ export function webhookReplayStates({ unchanged = true, fresh = true } = {}) {
   const provider = paidProviderState();
   provider.receipts = provider.receipts.map((receipt) => ({ ...receipt, receivedAt: iso(-30_000) }));
   provider.inbox = { ...provider.inbox, receivedAt: iso(-30_000), processedAt: iso(-20_000) };
-  const base = databaseSnapshot({ paymentSettled: true });
+  const initialSnapshot = databaseSnapshot({ observedAt: iso(-15_000), paymentSettled: true });
+  const beforeSnapshot = databaseSnapshot({ observedAt: iso(-10_000), paymentSettled: true });
   const first = { observedAt: iso(-10_000), inbox: provider.inbox,
-    receipts: provider.receipts, snapshot: base };
+    receipts: provider.receipts, snapshot: beforeSnapshot };
   const replayReceipt = { ...provider.receipts[0], id: 'receipt_task6_replay', receivedAt: iso(60_000) };
   const after = { observedAt: iso(61_000), inbox: provider.inbox,
     receipts: fresh ? [...provider.receipts, replayReceipt] : provider.receipts,
-    snapshot: unchanged ? base : databaseSnapshot({ paymentSettled: true, changedUsage: true }) };
-  return { provider, states: [first, after] };
+    snapshot: unchanged ? databaseSnapshot({ observedAt: iso(61_000), paymentSettled: true }) :
+      databaseSnapshot({ observedAt: iso(61_000), paymentSettled: true, changedUsage: true }) };
+  return { provider, initialSnapshot, states: [first, after] };
 }
 
 export function expectRefusal(promise, code) {

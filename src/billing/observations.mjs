@@ -78,12 +78,14 @@ export function databaseSnapshotsEqual(left, right) {
   return canonical(snapshotFacts(a)) === canonical(snapshotFacts(b));
 }
 
-function settlementMatches(row, provider, identity) {
+function settlementMatches(row, provider, identity, expectedContractId) {
   return row.invoiceId === provider.invoiceId && row.subscriptionId === provider.subscriptionId &&
-    row.customerId === identity.customerId && row.amount === provider.amountPaid && row.currency === 'BRL';
+    row.customerId === identity.customerId && row.contractId === expectedContractId &&
+    row.amount === provider.amountPaid && row.currency === 'BRL';
 }
 
-function collectEventEvidence(event, inbox, receipts, endpoint, expectedEndpoint, expectedAccount, startedAt) {
+function collectEventEvidence(event, inbox, receipts, endpoint, expectedEndpoint, expectedAccount, startedAt,
+  observationCutoff) {
   if (!event || event.type !== 'invoice.paid' || !safeToken(event.data?.object?.id) ||
       !safeToken(event.id) ||
       !Number.isSafeInteger(event.created) || !Number.isSafeInteger(event.pending_webhooks) ||
@@ -91,16 +93,20 @@ function collectEventEvidence(event, inbox, receipts, endpoint, expectedEndpoint
       event.data.object.id === '' || ref(event.data.object.customer) === null ||
       event.data.object.customer !== undefined && ref(event.data.object.customer) === '') return null;
   const started = dateMs(startedAt);
-  if (started === null || event.created * 1000 < started) return null;
+  const cutoff = dateMs(observationCutoff);
+  if (started === null || cutoff === null || event.created * 1000 < started || event.created * 1000 > cutoff) return null;
   const receiptRows = Array.isArray(receipts) ? receipts.filter((receipt) => isObject(receipt) &&
     safeToken(receipt.id) && receipt.eventId === event.id && receipt.eventType === event.type &&
     receipt.objectId === event.data.object.id && receipt.accountId === expectedAccount && receipt.livemode === false &&
-    receipt.apiVersion === (event.api_version ?? null) && dateMs(receipt.receivedAt) >= started) : [];
+    receipt.apiVersion === (event.api_version ?? null) && dateMs(receipt.receivedAt) >= started &&
+    dateMs(receipt.receivedAt) <= cutoff) : [];
+  const inboxReceivedAt = dateMs(inbox?.receivedAt);
+  const inboxProcessedAt = dateMs(inbox?.processedAt);
   const inboxValid = isObject(inbox) && inbox.eventId === event.id && inbox.eventType === event.type &&
     inbox.objectId === event.data.object.id && inbox.accountId === expectedAccount && inbox.livemode === false &&
     inbox.status === 'processed' && Number.isSafeInteger(inbox.attempts) && inbox.attempts >= 1 &&
-    dateMs(inbox.receivedAt) !== null && dateMs(inbox.processedAt) !== null &&
-    dateMs(inbox.receivedAt) >= started && dateMs(inbox.processedAt) >= dateMs(inbox.receivedAt);
+    inboxReceivedAt !== null && inboxProcessedAt !== null &&
+    inboxReceivedAt >= started && inboxProcessedAt >= inboxReceivedAt && inboxProcessedAt <= cutoff;
   const endpointWindow = isObject(endpoint) && endpoint.id === expectedEndpoint.webhookEndpointId &&
     endpoint.url === expectedEndpoint.webhookUrl && endpoint.livemode === false &&
     Number.isSafeInteger(endpoint.created) && endpoint.created <= event.created &&
@@ -109,9 +115,28 @@ function collectEventEvidence(event, inbox, receipts, endpoint, expectedEndpoint
   return { eventId: event.id, processed: verified, inboxStatus: inbox?.status ?? null,
     receiptCount: receiptRows.length, pendingWebhooks: event.pending_webhooks,
     providerCreatedAt: new Date(event.created * 1000).toISOString(),
-    receivedAt: inboxValid ? new Date(dateMs(inbox.receivedAt)).toISOString() : null,
-    processedAt: inboxValid ? new Date(dateMs(inbox.processedAt)).toISOString() : null,
+    receivedAt: inboxValid ? new Date(inboxReceivedAt).toISOString() : null,
+    processedAt: inboxValid ? new Date(inboxProcessedAt).toISOString() : null,
     endpointWindowVerified: endpointWindow, endpointAttribution: 'configuration-window-only' };
+}
+
+async function readObservation(operation) {
+  try { return await operation(); }
+  catch { refuse('observation_read_failed'); }
+}
+
+function invoicePaymentIntentMatches(invoice, expectedPaymentIntentId) {
+  const payments = invoice?.payments;
+  if (payments !== undefined &&
+      (!isObject(payments) || !Array.isArray(payments.data) || payments.has_more !== false)) return false;
+  const paymentIntentIds = new Set();
+  const legacyPaymentIntentId = ref(invoice?.payment_intent);
+  if (legacyPaymentIntentId) paymentIntentIds.add(legacyPaymentIntentId);
+  for (const entry of payments?.data ?? []) {
+    const paymentIntentId = ref(entry?.payment?.payment_intent);
+    if (paymentIntentId) paymentIntentIds.add(paymentIntentId);
+  }
+  return paymentIntentIds.size === 1 && paymentIntentIds.has(expectedPaymentIntentId);
 }
 
 export async function observeFinancialEvidence({ context, caseId, identity, readers, startedAt } = {}) {
@@ -127,17 +152,19 @@ export async function observeFinancialEvidence({ context, caseId, identity, read
   await assertCurrentAttempt(context);
 
   const accountId = context.preflight.providerVerification.stripe.accountId;
-  const beforeRaw = await readers.supabase.readBillingSnapshot({ attemptId: context.owner.attemptId,
-    caseId, teamId: identity.teamId, phase: 'baseline' });
+  const beforeRaw = await readObservation(() => readers.supabase.readBillingSnapshot({ attemptId: context.owner.attemptId,
+    caseId, teamId: identity.teamId, phase: 'baseline' }));
   const before = sanitizeDatabaseSnapshot(beforeRaw);
-  const invoice = await readers.stripe.retrieve('invoice', identity.invoiceId);
-  const intent = await readers.stripe.retrieve('payment_intent', identity.paymentIntentId);
+  const invoice = await readObservation(() => readers.stripe.retrieve('invoice', identity.invoiceId,
+    { expand: ['payments.data.payment.payment_intent'] }));
+  const intent = await readObservation(() => readers.stripe.retrieve('payment_intent', identity.paymentIntentId));
   const latestChargeId = ref(intent?.latest_charge);
-  const charge = latestChargeId ? await readers.stripe.retrieve('charge', latestChargeId) : null;
+  const charge = latestChargeId ? await readObservation(() => readers.stripe.retrieve('charge', latestChargeId)) : null;
 
   const invoiceSubscription = ref(invoice?.parent?.subscription_details?.subscription ?? invoice?.subscription);
   const lineageValid = invoice?.id === identity.invoiceId && invoice.livemode === false &&
     ref(invoice.customer) === identity.customerId && invoiceSubscription === (identity.subscriptionId ?? invoiceSubscription) &&
+    invoicePaymentIntentMatches(invoice, identity.paymentIntentId) &&
     intent?.id === identity.paymentIntentId && intent.livemode === false && ref(intent.customer) === identity.customerId &&
     (!identity.subscriptionId || invoiceSubscription === identity.subscriptionId) &&
     (!latestChargeId || charge?.id === latestChargeId && charge.livemode === false &&
@@ -167,28 +194,32 @@ export async function observeFinancialEvidence({ context, caseId, identity, read
     typeof intent.last_payment_error?.decline_code === 'string' && intent.last_payment_error.decline_code.length > 0 &&
     (!charge || charge.paid === false && charge.amount_captured === 0);
 
-  const rawEvents = await readers.stripe.listEvents({ customerId: identity.customerId,
-    objectId: identity.invoiceId, types: ['invoice.paid'], created: { gte: Math.floor(dateMs(startedAt) / 1000) } });
+  const rawEvents = await readObservation(() => readers.stripe.listEvents({ customerId: identity.customerId,
+    objectId: identity.invoiceId, types: ['invoice.paid'], created: { gte: Math.floor(dateMs(startedAt) / 1000) } }));
+  const webhookCandidates = [];
   let webhook = { eventId: null, processed: false, inboxStatus: null, receiptCount: 0,
     pendingWebhooks: null, providerCreatedAt: null, receivedAt: null, processedAt: null,
     endpointWindowVerified: false, endpointAttribution: 'configuration-window-only' };
   for (const event of Array.isArray(rawEvents) ? rawEvents : []) {
     if (event?.type !== 'invoice.paid' || event.data?.object?.id !== identity.invoiceId ||
         ref(event.data.object.customer) !== identity.customerId || event.livemode !== false) continue;
-    const [inbox, receipts, endpoint] = await Promise.all([
+    const [inbox, receipts, endpoint] = await readObservation(() => Promise.all([
       readers.supabase.readWebhookInbox(event.id),
       readers.supabase.readWebhookReceipts(event.id),
       readers.stripe.retrieveWebhookEndpoint(context.preflight.providerVerification.stripe.webhookEndpointId),
-    ]);
+    ]));
+    webhookCandidates.push({ event, inbox, receipts, endpoint });
+  }
+
+  const currentRaw = await readObservation(() => readers.supabase.readBillingSnapshot({ attemptId: context.owner.attemptId,
+    caseId, teamId: identity.teamId, phase: 'current' }));
+  const current = sanitizeDatabaseSnapshot(currentRaw);
+  for (const { event, inbox, receipts, endpoint } of webhookCandidates) {
     const evidence = collectEventEvidence(event, inbox, receipts, endpoint,
-      context.preflight.providerVerification.stripe, accountId, startedAt);
+      context.preflight.providerVerification.stripe, accountId, startedAt, current.observedAt);
     if (evidence?.processed) { webhook = evidence; break; }
     if (evidence && evidence.receiptCount >= webhook.receiptCount) webhook = evidence;
   }
-
-  const currentRaw = await readers.supabase.readBillingSnapshot({ attemptId: context.owner.attemptId,
-    caseId, teamId: identity.teamId, phase: 'current' });
-  const current = sanitizeDatabaseSnapshot(currentRaw);
   const tableDelta = Object.fromEntries(TABLES.map((table) => [table,
     current[table].filter((row) => !before[table].some((old) => canonical(old) === canonical(row)))]));
   const internal = {
@@ -197,6 +228,7 @@ export async function observeFinancialEvidence({ context, caseId, identity, read
     baseline: snapshotFacts(before),
     current: snapshotFacts(current),
     settlementDelta: tableDelta.settlements,
+    grantDelta: tableDelta.grants,
   };
   const data = {
     caseId,
@@ -234,10 +266,11 @@ export async function observeFinancialEvidence({ context, caseId, identity, read
   return evidence;
 }
 
-export function matchingSettlementCount(evidence, identity) {
+export function matchingSettlementCount(evidence, identity, expectedContractId) {
   const internal = INTERNAL_EVIDENCE.get(evidence);
   if (!internal) return 0;
-  return internal.settlementDelta.filter((row) => settlementMatches(row, internal.provider, identity)).length;
+  return internal.settlementDelta.filter((row) => settlementMatches(row, internal.provider, identity,
+    expectedContractId)).length;
 }
 
 export function hasVerifiedDeclineState(evidence) {
@@ -251,9 +284,17 @@ export function hasNoFundsCollected(evidence) {
 export function expectedGrantCount(evidence, expectedAccess) {
   if (!isValidExpectedAccess(expectedAccess)) return 0;
   const areas = expectedAccess.areas;
-  const current = INTERNAL_EVIDENCE.get(evidence)?.current;
-  if (!current) return 0;
+  const internal = INTERNAL_EVIDENCE.get(evidence);
+  const current = internal?.current;
+  if (!current || !internal.baseline || !Array.isArray(internal.grantDelta)) return 0;
   const active = current.grants.filter((grant) => grant.status === 'active');
+  const baselineActiveForContract = internal.baseline.grants.filter((grant) =>
+    grant.contractId === expectedAccess.contractId && grant.status === 'active');
+  const newActiveForContract = internal.grantDelta.filter((grant) =>
+    grant.contractId === expectedAccess.contractId && grant.status === 'active');
+  if (baselineActiveForContract.length || newActiveForContract.length !== areas.length ||
+      newActiveForContract.some((grant) => !areas.includes(grant.area)) ||
+      new Set(newActiveForContract.map((grant) => grant.area)).size !== areas.length) return 0;
   if (new Set(active.map((grant) => grant.area)).size !== active.length || active.length !== areas.length ||
       active.some((grant) => grant.contractId !== expectedAccess.contractId || !areas.includes(grant.area))) return 0;
   return areas.every((area) => active.some((grant) => grant.area === area)) ? areas.length : 0;
