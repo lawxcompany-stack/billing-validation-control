@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "environment": "billing-validation",
+  "vercel": {
+    "projectId": "prj_NEAKAPvyPzh76wfoHqYF6mRSfBs0",
+    "teamId": "team_Legw262JzvhZUhIZtv5pFE4T"
+  },
+  "database": {
+    "projectRef": "zjvqjdntasprusoqfsgw",
+    "branchId": "e2f26c0b-8a79-4cd5-ad80-faaf91fb51a2",
+    "branchName": "lawx-billing-validation-20260912"
+  },
+  "stripe": {
+    "accountId": "acct_1TWh8jF7lfHrHdNa",
+    "webhookEndpointId": null,
+    "livemode": false
+  },
+  "attestation": {
+    "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAI0nX26g836K1cAtoHepqjXviK7jajMQb4Ut3fZu4hSg=\n-----END PUBLIC KEY-----\n"
+  }
+}
