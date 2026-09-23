@@ -136,3 +136,20 @@ test('refuses ambiguous selection and mismatched deployment detail identity', as
   const wrongId = apiFixture({ deploymentDetails: details({ id: 'dpl_other123' }) });
   await assert.rejects(resolvePreviewDeployment({ api: wrongId, candidate, policy }), { code: 'deployment_identity_mismatch' });
 });
+
+test('refuses conflicting detail teamId even when ownerId matches configured team', async () => {
+  const api = apiFixture({ deploymentDetails: details({ teamId: 'team_other', ownerId: policy.vercel.teamId }) });
+  await assert.rejects(resolvePreviewDeployment({ api, candidate, policy }), { code: 'deployment_identity_mismatch' });
+});
+
+test('requires every returned team identity field to agree and permits ownerId-only fallback', async () => {
+  const conflictingOwner = apiFixture({ deploymentDetails: details({ ownerId: 'team_other' }) });
+  await assert.rejects(resolvePreviewDeployment({ api: conflictingOwner, candidate, policy }), {
+    code: 'deployment_identity_mismatch',
+  });
+
+  const ownerOnlyDetails = details({ ownerId: policy.vercel.teamId });
+  delete ownerOnlyDetails.teamId;
+  const ownerOnly = apiFixture({ deploymentDetails: ownerOnlyDetails });
+  await resolvePreviewDeployment({ api: ownerOnly, candidate, policy });
+});

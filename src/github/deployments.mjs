@@ -71,6 +71,16 @@ function deploymentOrigin(value) {
   return origin;
 }
 
+function hasUnambiguousTeamIdentity(detail, expectedTeamId) {
+  const hasTeamId = Object.hasOwn(detail, 'teamId');
+  const hasOwnerId = Object.hasOwn(detail, 'ownerId');
+  // teamId is authoritative when present; ownerId is a fallback only when teamId is absent.
+  // Any identity field returned by Vercel must agree with the configured team.
+  return (hasTeamId || hasOwnerId) &&
+    (!hasTeamId || detail.teamId === expectedTeamId) &&
+    (!hasOwnerId || detail.ownerId === expectedTeamId);
+}
+
 export async function resolvePreviewDeployment(input = {}) {
   validateSelection(input);
   const { api, candidate, policy } = input;
@@ -103,7 +113,7 @@ export async function resolvePreviewDeployment(input = {}) {
   if (!isObject(detail) || !DEPLOYMENT_ID.test(detail.id ?? '') || !Object.hasOwn(detail, 'target') ||
       typeof detail.projectId !== 'string' || typeof detail.readyState !== 'string' ||
       !isObject(detail.gitSource) || typeof detail.url !== 'string') refuse('deployment_metadata_invalid');
-  if (detail.id !== listed.uid || detail.teamId !== policy.vercel.teamId && detail.ownerId !== policy.vercel.teamId) {
+  if (detail.id !== listed.uid || !hasUnambiguousTeamIdentity(detail, policy.vercel.teamId)) {
     refuse('deployment_identity_mismatch');
   }
   if (detail.projectId !== policy.vercel.projectId) refuse('deployment_project_mismatch');
