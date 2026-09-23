@@ -381,6 +381,73 @@ test('expired confirmed lease never starts supervised work', async () => {
   assert.equal(started, false);
 });
 
+test('delayed initial confirmation cannot start work after reported expiry', async () => {
+  const store = createAttemptStore(fakeAdapter());
+  const row = await prepareAttempt(store, input());
+  let started = false;
+  const delayedStore = { ...store, async assertFence() {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return { ...row, expiresAt: 1000.02, serverNow: 1000 };
+  } };
+  await assert.rejects(withRenewingLease(delayedStore, row, { ttlSeconds: 60,
+    intervalMs: 5, work: async () => { started = true; return 'ran'; } }),
+  { code: 'lease_expired' });
+  assert.equal(started, false);
+});
+
+test('delayed renewal response cannot grant already elapsed lease time', async () => {
+  const store = createAttemptStore(fakeAdapter());
+  const row = await prepareAttempt(store, input());
+  let reportRenewal;
+  const renewalReported = new Promise((resolve) => { reportRenewal = resolve; });
+  let lateMutation = 0;
+  const delayedStore = { ...store,
+    assertFence: async () => ({ ...row, expiresAt: 1001, serverNow: 1000 }),
+    async renew() {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      reportRenewal();
+      return { ...row, expiresAt: 2000.02, serverNow: 2000 };
+    },
+  };
+  await assert.rejects(withRenewingLease(delayedStore, row, { ttlSeconds: 1,
+    intervalMs: 100, work: (signal) => new Promise((resolve, reject) => {
+      const fallback = setTimeout(() => reject(Object.assign(new Error('test timeout'),
+        { code: 'test_timeout' })), 500);
+      signal.addEventListener('abort', () => { clearTimeout(fallback); reject(signal.reason); },
+        { once: true });
+      renewalReported.then(() => setTimeout(() => {
+        if (!signal.aborted) lateMutation++;
+      }, 0));
+    }) }), { code: 'lease_expired' });
+  assert.equal(lateMutation, 0);
+});
+
+test('malformed renewal clock values cannot keep supervised work alive', async () => {
+  const store = createAttemptStore(fakeAdapter());
+  const row = await prepareAttempt(store, input());
+  let reportRenewal;
+  const renewalReported = new Promise((resolve) => { reportRenewal = resolve; });
+  let lateMutation = 0;
+  const malformedStore = { ...store,
+    assertFence: async () => ({ ...row, expiresAt: 1001, serverNow: 1000 }),
+    async renew() {
+      reportRenewal();
+      return { ...row, expiresAt: '2000.02', serverNow: '2000' };
+    },
+  };
+  await assert.rejects(withRenewingLease(malformedStore, row, { ttlSeconds: 1,
+    intervalMs: 5, work: (signal) => new Promise((resolve, reject) => {
+      const fallback = setTimeout(() => reject(Object.assign(new Error('test timeout'),
+        { code: 'test_timeout' })), 100);
+      signal.addEventListener('abort', () => { clearTimeout(fallback); reject(signal.reason); },
+        { once: true });
+      renewalReported.then(() => setTimeout(() => {
+        if (!signal.aborted) lateMutation++;
+      }, 0));
+    }) }), { code: 'lease_expired' });
+  assert.equal(lateMutation, 0);
+});
+
 test('caller-supplied recovery flags cannot reclaim a lease without a trusted verifier', async () => {
   const adapter = fakeAdapter({ trustedRecovery: false });
   const store = createAttemptStore(adapter);

@@ -6,6 +6,7 @@ const PRODUCTION_LABEL = /(?:^|[-_.])(?:main|master|prod|production|primary|defa
 const PROJECT_REF = /^[a-z0-9]{20}$/;
 const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
+function stringMatches(value, pattern) { return typeof value === 'string' && pattern.test(value); }
 function exactKeys(value, keys) {
   return value && typeof value === 'object' && !Array.isArray(value) &&
     Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
@@ -20,15 +21,17 @@ function verifiedTarget(preflight, target) {
     exactKeys(verified, ['projectRef', 'parentProjectRef', 'branchId', 'branchName',
       'schemaFingerprintSha256', 'migrationHistorySha256']) &&
     exactKeys(stripe, ['accountId', 'webhookEndpointId', 'webhookUrl', 'livemode']) &&
+    typeof stripe.accountId === 'string' && typeof stripe.webhookUrl === 'string' &&
     stripe.accountId === preflight.expectedEnvironment.stripe.accountId && stripe.livemode === false &&
-    /^we_[A-Za-z0-9]+$/.test(stripe.webhookEndpointId) &&
+    stringMatches(stripe.webhookEndpointId, /^we_[A-Za-z0-9]+$/) &&
     stripe.webhookUrl === `${preflight.expectedEnvironment.deployment.origin}/api/stripe/webhook` &&
     target &&
-    PROJECT_REF.test(verified.projectRef) && PROJECT_REF.test(verified.parentProjectRef) &&
-    BRANCH.test(verified.branchId) && BRANCH.test(verified.branchName) &&
-    DIGEST.test(verified.schemaFingerprintSha256) && DIGEST.test(verified.migrationHistorySha256) &&
-    PROJECT_REF.test(target.projectRef) && PROJECT_REF.test(target.parentProjectRef) &&
-    BRANCH.test(target.branchId) && BRANCH.test(target.branchName) &&
+    stringMatches(verified.projectRef, PROJECT_REF) && stringMatches(verified.parentProjectRef, PROJECT_REF) &&
+    stringMatches(verified.branchId, BRANCH) && stringMatches(verified.branchName, BRANCH) &&
+    stringMatches(verified.schemaFingerprintSha256, DIGEST) &&
+    stringMatches(verified.migrationHistorySha256, DIGEST) &&
+    stringMatches(target.projectRef, PROJECT_REF) && stringMatches(target.parentProjectRef, PROJECT_REF) &&
+    stringMatches(target.branchId, BRANCH) && stringMatches(target.branchName, BRANCH) &&
     target.projectRef === expected.projectRef && target.branchId === expected.branchId &&
     verified.projectRef === target.projectRef && verified.branchId === target.branchId &&
     verified.parentProjectRef === target.parentProjectRef && verified.branchName === target.branchName &&

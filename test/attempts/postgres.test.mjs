@@ -73,6 +73,25 @@ test('schema installer refuses absent identity pins before issuing DDL', async (
   }
 });
 
+test('schema installer refuses null or coerced child identity fields before DDL', async () => {
+  const malformed = [
+    { field: 'branchName', value: null },
+    { field: 'branchName', value: 123 },
+    { field: 'parentProjectRef', value: new String(database.parentProjectRef) },
+  ];
+  for (const { field, value } of malformed) {
+    const client = recordingClient();
+    await assert.rejects(installAttemptSchema({ client,
+      preflight: { ...preflight, providerVerification: {
+        ...preflight.providerVerification,
+        supabase: { ...preflight.providerVerification.supabase, [field]: value },
+      } },
+      target: { ...target, [field]: value },
+    }), { code: 'schema_target_unverified' });
+    assert.equal(client.calls.length, 0);
+  }
+});
+
 test('verified installer issues only the dedicated control schema DDL', async () => {
   const client = recordingClient();
   await installAttemptSchema({ client, preflight, target });
