@@ -42,6 +42,10 @@ function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function hasExactKeys(value, keys) {
+  return isObject(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
 function isNonemptyString(value) {
   return typeof value === 'string' && value.length > 0;
 }
@@ -61,8 +65,14 @@ function validProducerProvenance(value, includeReplayIdentity = false) {
 }
 
 function validMigrationArtifacts(artifacts) {
-  return Array.isArray(artifacts) && artifacts.length >= 5 && artifacts.every((item) =>
-    hasStrings(item, ['path', 'sha256']) && SHA256.test(item.sha256) && isCount(item.bytes));
+  if (!Array.isArray(artifacts) || artifacts.length < 5) return false;
+  let previousPath;
+  for (const item of artifacts) {
+    if (!hasStrings(item, ['path', 'sha256']) || !SHA256.test(item.sha256) || !isCount(item.bytes) ||
+        (previousPath !== undefined && previousPath >= item.path)) return false;
+    previousPath = item.path;
+  }
+  return true;
 }
 
 function validBootstrap(bootstrap) {
@@ -83,6 +93,18 @@ function validDeploymentOrigin(value) {
   }
 }
 
+export function isValidExpectedEnvironment(environment) {
+  return hasExactKeys(environment, ['database', 'deployment', 'stripe']) &&
+    hasExactKeys(environment.database, ['projectRef', 'branchId']) &&
+    typeof environment.database.projectRef === 'string' && DATABASE_PROJECT_REF.test(environment.database.projectRef) &&
+    typeof environment.database.branchId === 'string' && DATABASE_BRANCH_ID.test(environment.database.branchId) &&
+    hasExactKeys(environment.deployment, ['id', 'origin']) &&
+    typeof environment.deployment.id === 'string' && DEPLOYMENT_ID.test(environment.deployment.id) &&
+    validDeploymentOrigin(environment.deployment.origin) &&
+    hasExactKeys(environment.stripe, ['accountId']) &&
+    typeof environment.stripe.accountId === 'string' && STRIPE_ACCOUNT_ID.test(environment.stripe.accountId);
+}
+
 function validArtifactEvidence(kind, evidence) {
   if (!isObject(evidence)) return false;
   if (Object.hasOwn(SIMPLE_ARTIFACT_REPORTS, kind)) {
@@ -100,11 +122,21 @@ function validFinalProducerShape(document) {
   const { candidate, database, deployment, stripe, webhook, artifacts, replayRuns } = document;
   if (!isObject(database) || !hasStrings(database, ['projectRef', 'branchId', 'migrationDigest', 'migrationDigestScope']) ||
       !DATABASE_PROJECT_REF.test(database.projectRef) || !DATABASE_BRANCH_ID.test(database.branchId) ||
-      !SHA256.test(database.migrationDigest) || !validBootstrap(database.bootstrap) ||
+      !SHA256.test(database.migrationDigest) || database.migrationDigestScope !== 'reviewed-assets' ||
+      !validBootstrap(database.bootstrap) || database.bootstrap.projectRef !== database.projectRef ||
       !validMigrationArtifacts(database.migrationArtifacts) ||
       (database.branchName !== undefined && !isNonemptyString(database.branchName)) ||
       (database.observedSchemaDigest !== undefined && !SHA256.test(database.observedSchemaDigest)) ||
       (database.schemaFingerprintVersion !== undefined && database.schemaFingerprintVersion !== 1)) return false;
+
+  const fingerprintGroupAbsent = database.schemaFingerprintVersion === undefined &&
+    database.observedSchemaDigest === undefined && database.bootstrap.schemaFingerprintVersion === undefined;
+  const fingerprintGroupValid = database.schemaFingerprintVersion === 1 &&
+    database.bootstrap.schemaFingerprintVersion === 1 && SHA256.test(database.observedSchemaDigest) &&
+    database.observedSchemaDigest === database.bootstrap.schemaDigest;
+  if (!fingerprintGroupAbsent && !fingerprintGroupValid) return false;
+  if (database.migrationDigest !== createHash('sha256')
+    .update(canonicalJson(database.migrationArtifacts), 'utf8').digest('hex')) return false;
 
   if (!hasStrings(deployment, ['id', 'origin', 'sha', 'treeHash']) || !DEPLOYMENT_ID.test(deployment.id) ||
       !validDeploymentOrigin(deployment.origin) ||
@@ -352,11 +384,21 @@ function parseDocument(contents, expected) {
   const calculatedDigest = createHash('sha256').update(canonicalJson(unsigned), 'utf8').digest('hex');
   if (manifestDigest !== calculatedDigest) refuse('evidence_manifest_digest_invalid');
 
-  if (!expected || typeof expected.candidateSha !== 'string' || !FULL_SHA.test(expected.candidateSha) ||
+  if (!hasExactKeys(expected, ['candidateSha', 'candidateTree', 'environment']) ||
+      typeof expected.candidateSha !== 'string' || !FULL_SHA.test(expected.candidateSha) ||
       typeof expected.candidateTree !== 'string' || !FULL_SHA.test(expected.candidateTree)) {
     refuse('evidence_identity_invalid');
   }
+  if (!isValidExpectedEnvironment(expected.environment)) refuse('evidence_identity_invalid');
   if (document.candidate.sha !== expected.candidateSha || document.candidate.treeHash !== expected.candidateTree) {
+    refuse('evidence_identity_mismatch');
+  }
+  if (document.database.projectRef !== expected.environment.database.projectRef ||
+      document.database.branchId !== expected.environment.database.branchId ||
+      document.deployment.id !== expected.environment.deployment.id ||
+      document.deployment.origin !== expected.environment.deployment.origin ||
+      document.stripe.accountId !== expected.environment.stripe.accountId ||
+      document.webhook.endpoint !== `${expected.environment.deployment.origin}/api/stripe/webhook`) {
     refuse('evidence_identity_mismatch');
   }
   return Object.freeze({

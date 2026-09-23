@@ -56,7 +56,7 @@ function reverseObjectKeys(value) {
 
 test('parses the sealed final producer manifest into a minimal projection', () => {
   const document = finalAcceptanceDocument();
-  assert.equal(document.manifestDigest, '0f5b289cbac372a887bc694a80444ee55701c0923c1783d60f9fcd20caf6aa49');
+  assert.equal(document.manifestDigest, '8da953c72340020fb8a2aa5592f4ad58063dd7939606a0a1381940aabac5c873');
   const archive = archiveFor([jsonEntry(document)]);
   const parsed = parseEvidenceArchive(archive, {
     digest: digest(archive),
@@ -115,6 +115,7 @@ test('rejects missing producer-critical nested structures after resealing', () =
     (document) => { document.database.bootstrap = []; },
     (document) => { document.database.migrationArtifacts = {}; },
     (document) => { document.deployment.treeHash = undefined; },
+    (document) => { document.deployment.treeHash = null; },
     (document) => { delete document.stripe.accountId; },
     (document) => { delete document.webhook.endpoint; },
     (document) => { delete document.artifacts[0].provenance; },
@@ -157,6 +158,95 @@ test('rejects resealed manifests with producer environment identities outside ap
   ];
 
   for (const mutate of malformed) assertRejectedManifest(archiveForMutation(mutate));
+});
+
+test('rejects resealed manifests whose Supabase bootstrap and migration fingerprints are inconsistent', () => {
+  const malformed = [
+    (document) => { document.database.bootstrap.projectRef = 'zyxwvutsrqponmlkjihg'; },
+    (document) => { document.database.migrationDigestScope = 'all-migrations'; },
+    (document) => { document.database.schemaFingerprintVersion = 2; },
+    (document) => { document.database.observedSchemaDigest = 'd'.repeat(64); },
+    (document) => { delete document.database.observedSchemaDigest; },
+    (document) => { delete document.database.schemaFingerprintVersion; },
+    (document) => { delete document.database.bootstrap.schemaFingerprintVersion; },
+    (document) => { document.database.migrationDigest = '0'.repeat(64); },
+    (document) => { document.database.migrationArtifacts[0].bytes += 1; },
+    (document) => {
+      document.database.migrationArtifacts.reverse();
+      document.database.migrationDigest = createHash('sha256')
+        .update(canonicalProducerJson(document.database.migrationArtifacts), 'utf8').digest('hex');
+    },
+  ];
+  for (const mutate of malformed) assertRejectedManifest(archiveForMutation(mutate));
+});
+
+test('accepts a producer manifest with the entire optional schema fingerprint group absent', () => {
+  const archive = archiveForMutation((document) => {
+    delete document.database.schemaFingerprintVersion;
+    delete document.database.observedSchemaDigest;
+    delete document.database.bootstrap.schemaFingerprintVersion;
+  });
+  assert.doesNotThrow(() => parseEvidenceArchive(archive, {
+    digest: digest(archive),
+    expected: expectedAcceptanceIdentity(),
+  }));
+});
+
+test('binds manifest environment identities to trusted expected values without exposing them', () => {
+  const mismatches = [
+    [(document) => {
+      document.database.projectRef = 'zyxwvutsrqponmlkjihg';
+      document.database.bootstrap.projectRef = 'zyxwvutsrqponmlkjihg';
+    }, 'zyxwvutsrqponmlkjihg'],
+    [(document) => { document.database.branchId = 'other-validation-branch'; }, 'other-validation-branch'],
+    [(document) => { document.deployment.id = 'dpl_othercandidate123'; }, 'dpl_othercandidate123'],
+    [(document) => {
+      document.deployment.origin = 'https://other-billing-candidate.vercel.app';
+      document.webhook.endpoint = `${document.deployment.origin}/api/stripe/webhook`;
+    }, 'https://other-billing-candidate.vercel.app'],
+    [(document) => { document.stripe.accountId = 'acct_othertestaccount'; }, 'acct_othertestaccount'],
+  ];
+
+  for (const [mutate, untrustedValue] of mismatches) {
+    const archive = archiveForMutation(mutate);
+    assert.throws(() => parseEvidenceArchive(archive, {
+      digest: digest(archive),
+      expected: expectedAcceptanceIdentity(),
+    }), (error) => {
+      assert.equal(error.code, 'evidence_identity_mismatch');
+      assert.equal(error.message, 'evidence_identity_mismatch');
+      assert.equal(error.message.includes(untrustedValue), false);
+      return true;
+    });
+  }
+});
+
+test('rejects a webhook endpoint that differs from the expected test deployment route', () => {
+  const archive = archiveForMutation((document) => {
+    document.webhook.endpoint = 'https://other-billing-candidate.vercel.app/api/stripe/webhook';
+  });
+  assertRejectedManifest(archive, 'evidence_schema_invalid');
+});
+
+test('rejects missing or malformed expected environment identities', () => {
+  const expectedEnvironment = expectedAcceptanceIdentity().environment;
+  const invalidEnvironments = [
+    undefined,
+    null,
+    {},
+    { ...expectedEnvironment, extra: 'not-allowed' },
+    { ...expectedEnvironment, database: { projectRef: 'bad', branchId: 'billing-validation-2026' } },
+    { ...expectedEnvironment, deployment: { id: 'dpl_candidate123', origin: 'http://billing-candidate.vercel.app' } },
+    { ...expectedEnvironment, stripe: { accountId: 'acct_test-lawx' } },
+  ];
+  const archive = archiveFor([jsonEntry()]);
+
+  for (const environment of invalidEnvironments) {
+    assert.throws(() => parseEvidenceArchive(archive, {
+      digest: digest(archive),
+      expected: expectedAcceptanceIdentity({ environment }),
+    }), { code: 'evidence_identity_invalid' });
+  }
 });
 
 test('verifies producer canonical JSON independent of object key insertion order', () => {

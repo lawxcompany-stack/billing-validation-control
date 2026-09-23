@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { parseEvidenceArchive, EVIDENCE_ARCHIVE_LIMITS } from '../contracts/evidence.mjs';
+import {
+  parseEvidenceArchive,
+  EVIDENCE_ARCHIVE_LIMITS,
+  isValidExpectedEnvironment,
+} from '../contracts/evidence.mjs';
 
 const require = createRequire(import.meta.url);
 const CANDIDATE_WORKFLOW_POLICY = require('../../policy/candidate-workflows.json');
@@ -185,7 +189,7 @@ async function readBoundedStream(stream, maxBytes) {
   return Buffer.concat(chunks, size);
 }
 
-async function collectWorkflow(api, candidate, workflow, baseBranch) {
+async function collectWorkflow(api, candidate, workflow, baseBranch, expectedEnvironment) {
   if (!Number.isSafeInteger(workflow.id) || workflow.id < 1 || typeof workflow.path !== 'string' ||
       workflow.event !== 'pull_request' || typeof workflow.suite !== 'string' ||
       workflow.path !== '.github/workflows/ci.yml' || workflow.id !== 290018021 || workflow.suite !== 'ci' ||
@@ -217,6 +221,7 @@ async function collectWorkflow(api, candidate, workflow, baseBranch) {
       expected: {
         candidateSha: candidate.candidateSha,
         candidateTree: candidate.treeSha,
+        environment: expectedEnvironment,
       },
     });
   } catch (error) {
@@ -239,8 +244,9 @@ async function collectWorkflow(api, candidate, workflow, baseBranch) {
 
 export async function collectCiEvidence(options = {}) {
   if (options === null || typeof options !== 'object' || Array.isArray(options) ||
-      Object.keys(options).some((key) => !['api', 'candidate'].includes(key))) refuse('ci_input_invalid');
-  const { api, candidate } = options;
+      Object.keys(options).some((key) => !['api', 'candidate', 'expectedEnvironment'].includes(key))) refuse('ci_input_invalid');
+  const { api, candidate, expectedEnvironment } = options;
+  if (!isValidExpectedEnvironment(expectedEnvironment)) refuse('expected_environment_invalid');
   if (!candidate || candidate.repository !== 'lawxcompany-stack/Plataforma-LawX' ||
       !Number.isSafeInteger(candidate.repositoryId) || !Number.isSafeInteger(candidate.pullNumber) ||
       typeof candidate.candidateSha !== 'string' || !/^[0-9a-f]{40}$/u.test(candidate.candidateSha) ||
@@ -254,6 +260,6 @@ export async function collectCiEvidence(options = {}) {
       policy.workflows[0]?.id !== 290018021) {
     refuse('workflow_policy_invalid');
   }
-  const result = await collectWorkflow(api, candidate, policy.workflows[0], policy.base_branch);
+  const result = await collectWorkflow(api, candidate, policy.workflows[0], policy.base_branch, expectedEnvironment);
   return Object.freeze([result]);
 }

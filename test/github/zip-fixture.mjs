@@ -95,6 +95,11 @@ export const ACCEPTANCE_CATEGORIES = Object.freeze([
 ]);
 
 export const FINAL_ACCEPTANCE_TREE_HASH = 'b'.repeat(40);
+export const FINAL_ACCEPTANCE_ENVIRONMENT = Object.freeze({
+  database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst', branchId: 'billing-validation-2026' }),
+  deployment: Object.freeze({ id: 'dpl_candidate123', origin: 'https://billing-candidate.vercel.app' }),
+  stripe: Object.freeze({ accountId: 'acct_testlawx123' }),
+});
 
 function canonicalJson(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -105,6 +110,13 @@ function canonicalJson(value) {
 export function finalAcceptanceDocument(overrides = {}) {
   const candidateSha = 'afd8955bf0b1332aa1c6c220a8267e2a7e6c0f13';
   const reportKinds = { lint: 'quality', typecheck: 'quality', coverage: 'regression', build: 'build', sql: 'billing-remote' };
+  const migrationArtifacts = [
+    { path: 'supabase/baselines/acl.json', bytes: 48, sha256: '9'.repeat(64) },
+    { path: 'supabase/baselines/allowlist.json', bytes: 32, sha256: 'a'.repeat(64) },
+    { path: 'supabase/baselines/data.sql', bytes: 64, sha256: '8'.repeat(64) },
+    { path: 'supabase/baselines/main.sql', bytes: 128, sha256: '6'.repeat(64) },
+    { path: 'supabase/baselines/manifest.json', bytes: 96, sha256: '7'.repeat(64) },
+  ];
   const provenance = {
     source: 'github-actions',
     synthetic: false,
@@ -137,20 +149,17 @@ export function finalAcceptanceDocument(overrides = {}) {
     database: {
       projectRef: 'abcdefghijklmnopqrst',
       branchId: 'billing-validation-2026',
-      migrationDigest: 'a'.repeat(64),
+      migrationDigest: createHash('sha256').update(canonicalJson(migrationArtifacts), 'utf8').digest('hex'),
       migrationDigestScope: 'reviewed-assets',
-      migrationArtifacts: [
-        { path: 'supabase/baselines/main.sql', bytes: 128, sha256: '6'.repeat(64) },
-        { path: 'supabase/baselines/manifest.json', bytes: 96, sha256: '7'.repeat(64) },
-        { path: 'supabase/baselines/data.sql', bytes: 64, sha256: '8'.repeat(64) },
-        { path: 'supabase/baselines/acl.json', bytes: 48, sha256: '9'.repeat(64) },
-        { path: 'supabase/baselines/allowlist.json', bytes: 32, sha256: 'a'.repeat(64) },
-      ],
+      migrationArtifacts,
+      schemaFingerprintVersion: 1,
+      observedSchemaDigest: 'c'.repeat(64),
       bootstrap: {
         binding: 'baseline-seed-acl-and-migration-versions',
         receiptSha256: 'b'.repeat(64),
         projectRef: 'abcdefghijklmnopqrst',
         schemaDigest: 'c'.repeat(64),
+        schemaFingerprintVersion: 1,
         completedAt: '2026-09-23T01:59:00.000Z',
         appliedVersionCount: 3,
         jobReportSha256: 'd'.repeat(64),
@@ -229,6 +238,7 @@ export function expectedAcceptanceIdentity(overrides = {}) {
   return {
     candidateSha: 'afd8955bf0b1332aa1c6c220a8267e2a7e6c0f13',
     candidateTree: FINAL_ACCEPTANCE_TREE_HASH,
+    environment: FINAL_ACCEPTANCE_ENVIRONMENT,
     ...overrides,
   };
 }

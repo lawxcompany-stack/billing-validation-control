@@ -2,8 +2,13 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { collectCiEvidence } from '../../src/github/ci-evidence.mjs';
-import { finalAcceptanceDocument, FINAL_ACCEPTANCE_TREE_HASH, makeZip } from './zip-fixture.mjs';
+import { collectCiEvidence as collectCiEvidenceRaw } from '../../src/github/ci-evidence.mjs';
+import {
+  finalAcceptanceDocument,
+  FINAL_ACCEPTANCE_ENVIRONMENT,
+  FINAL_ACCEPTANCE_TREE_HASH,
+  makeZip,
+} from './zip-fixture.mjs';
 
 const repo = 'lawxcompany-stack/Plataforma-LawX';
 const sha = 'afd8955bf0b1332aa1c6c220a8267e2a7e6c0f13';
@@ -17,8 +22,25 @@ const candidate = {
   baseSha: '1'.repeat(40),
   treeSha: FINAL_ACCEPTANCE_TREE_HASH,
 };
+const expectedEnvironment = FINAL_ACCEPTANCE_ENVIRONMENT;
 const started = '2026-09-23T02:22:55Z';
 const completed = '2026-09-23T02:28:00Z';
+
+function collectCiEvidence(options = {}) {
+  return collectCiEvidenceRaw({ expectedEnvironment, ...options });
+}
+
+function canonicalProducerJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalProducerJson).join(',')}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalProducerJson(value[key])}`).join(',')}}`;
+}
+
+function resealProducerDocument(document) {
+  delete document.manifestDigest;
+  document.manifestDigest = createHash('sha256').update(canonicalProducerJson(document), 'utf8').digest('hex');
+  return document;
+}
 
 function run(overrides = {}, selectedWorkflow = workflow, index = 0) {
   return {
@@ -38,10 +60,8 @@ function run(overrides = {}, selectedWorkflow = workflow, index = 0) {
   };
 }
 
-function artifact(overrides = {}, selectedRun = run(), selectedWorkflow = workflow, index = 0) {
-  const document = finalAcceptanceDocument({
-    candidate: { sha, treeHash: candidate.treeSha },
-  });
+function artifact(overrides = {}, selectedRun = run(), selectedWorkflow = workflow, index = 0,
+  document = finalAcceptanceDocument({ candidate: { sha, treeHash: candidate.treeSha } })) {
   const bytes = makeZip([{ name: 'billing-acceptance.json', contents: JSON.stringify(document), method: 8 }]);
   return {
     id: 881 + index,
@@ -77,7 +97,7 @@ function defaultAttempts(selectedRun) {
   return attempts;
 }
 
-function apiFixture({ selectedRun, attemptsByRun = {}, artifactsByRun = {}, extraRuns = [] } = {}) {
+function apiFixture({ selectedRun, attemptsByRun = {}, artifactsByRun = {}, extraRuns = [], artifactDocument } = {}) {
   const calls = [];
   const initialRun = selectedRun ?? run();
   const runRecords = new Map([[workflow.id, [initialRun, ...extraRuns]]]);
@@ -87,7 +107,8 @@ function apiFixture({ selectedRun, attemptsByRun = {}, artifactsByRun = {}, extr
 
   for (const runRecord of [initialRun, ...extraRuns]) {
     attemptRecordsByRun.set(runRecord.id, attemptsByRun[runRecord.id] ?? defaultAttempts(runRecord));
-    const records = artifactsByRun[runRecord.id] ?? [artifact({}, runRecord, workflow, Number(runRecord.id - 35810119625))];
+    const records = artifactsByRun[runRecord.id] ?? [artifact({}, runRecord, workflow,
+      Number(runRecord.id - 35810119625), artifactDocument)];
     artifactRecordsByRun.set(runRecord.id, records);
     for (const item of records) artifactsById.set(item.id, item);
   }
@@ -143,6 +164,56 @@ test('requires a resolved full candidate tree identity before querying CI', asyn
       code: 'candidate_identity_invalid',
     });
     assert.deepEqual(api.calls, []);
+  }
+});
+
+test('rejects absent or malformed expected environment identities before any GitHub API call', async () => {
+  const malformedEnvironments = [
+    undefined,
+    null,
+    {},
+    { ...expectedEnvironment, extra: 'not-allowed' },
+    { ...expectedEnvironment, database: { projectRef: 'bad', branchId: 'billing-validation-2026' } },
+    { ...expectedEnvironment, deployment: { id: 'dpl_candidate123', origin: 'http://billing-candidate.vercel.app' } },
+    { ...expectedEnvironment, stripe: { accountId: 'acct_test-lawx' } },
+  ];
+
+  for (const environment of malformedEnvironments) {
+    const api = apiFixture();
+    await assert.rejects(collectCiEvidenceRaw({ api, candidate, expectedEnvironment: environment }), {
+      code: 'expected_environment_invalid',
+    });
+    assert.deepEqual(api.calls, []);
+  }
+});
+
+test('rejects CI manifests bound to another expected test environment', async () => {
+  const mutations = [
+    (document) => {
+      document.database.projectRef = 'zyxwvutsrqponmlkjihg';
+      document.database.bootstrap.projectRef = 'zyxwvutsrqponmlkjihg';
+    },
+    (document) => { document.database.branchId = 'other-validation-branch'; },
+    (document) => { document.deployment.id = 'dpl_othercandidate123'; },
+    (document) => {
+      document.deployment.origin = 'https://other-billing-candidate.vercel.app';
+      document.webhook.endpoint = `${document.deployment.origin}/api/stripe/webhook`;
+    },
+    (document) => { document.stripe.accountId = 'acct_othertestaccount'; },
+  ];
+
+  for (const mutate of mutations) {
+    const document = structuredClone(finalAcceptanceDocument({ candidate: { sha, treeHash: candidate.treeSha } }));
+    mutate(document);
+    resealProducerDocument(document);
+    const selected = run();
+    const mismatchedArtifact = artifact({}, selected, workflow, 0, document);
+    const api = apiFixture({ selectedRun: selected, artifactsByRun: { [selected.id]: [mismatchedArtifact] } });
+    await assert.rejects(collectCiEvidence({ api, candidate }), (error) => {
+      assert.equal(error.code, 'evidence_identity_mismatch');
+      assert.equal(error.message, 'evidence_identity_mismatch');
+      return true;
+    });
   }
 });
 
