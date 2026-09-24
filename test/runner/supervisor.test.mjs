@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { certificateFixture } from './certificate-fixture.mjs';
 
 const supervisor = await import('../../runner/supervisor.mjs').catch(() => ({}));
 const supervisorInternal = await import('../../runner/supervisor-internal.mjs').catch(() => ({}));
@@ -60,7 +61,9 @@ function syntheticGhOutput(manifest, bytes, certificateOverrides = {}) {
     ...certificateOverrides,
   };
   return JSON.stringify([{
-    attestation: { synthetic: true },
+    attestation: { bundle: { verificationMaterial: { certificate: {
+      rawBytes: certificateFixture(),
+    } } } },
     verificationResult: {
       signature: { certificate },
       verifiedTimestamps: [{ type: 'rekor', uri: 'https://rekor.sigstore.dev/api/v1/log/entries/synthetic',

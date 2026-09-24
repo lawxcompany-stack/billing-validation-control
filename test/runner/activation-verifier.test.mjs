@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, X509Certificate } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { test } from 'node:test';
+import { certificateFixture } from './certificate-fixture.mjs';
 
 const verifierUrl = new URL('../../runner/activation-verifier.mjs', import.meta.url);
 const internalVerifierUrl = new URL('../../runner/activation-verifier-internal.mjs', import.meta.url);
@@ -68,13 +69,15 @@ function trustedCertificate(overrides = {}) {
 }
 
 function verifiedOutput({ certificate = trustedCertificate(), digest = MANIFEST_DIGEST,
+  rawCertificate = certificateFixture(),
+  bundle = { verificationMaterial: { certificate: { rawBytes: rawCertificate } } },
   verifiedTimestamps = [{
     type: 'rekor',
     uri: 'https://rekor.sigstore.dev/api/v1/log/entries/0123456789abcdef',
     timestamp: '2026-09-23T12:34:56Z',
   }], predicate = {} } = {}) {
   return JSON.stringify([{
-    attestation: { bundle: 'untrusted-for-policy-test' },
+    attestation: { bundle },
     verificationResult: {
       signature: { certificate },
       verifiedTimestamps,
@@ -103,6 +106,11 @@ function processBoundary(output = verifiedOutput()) {
 }
 
 const TRUST_POLICY = Object.freeze({ reviewedControlRepositoryId: CONTROL_REPOSITORY_ID });
+
+test('the certificate DER fixture is a structurally parseable X.509 certificate', () => {
+  const certificate = new X509Certificate(Buffer.from(certificateFixture(), 'base64'));
+  assert.match(certificate.subject, /Billing validation fixture/u);
+});
 
 test('verifier calls gh with one fixed argument vector and hashes the exact local manifest bytes', async () => {
   const { verifyActivationAttestation } = requireVerifier();
@@ -170,6 +178,66 @@ for (const [claim, mutation] of [
     }), { code: 'activation_attestation_invalid' });
   });
 }
+
+for (const [claim, rawCertificate] of [
+  ['different', certificateFixture('billing-validation-other')],
+  ['missing', certificateFixture(null)],
+  ['leading BOM', certificateFixture('\uFEFFbilling-validation-attestation')],
+]) {
+  test(`verifier rejects a raw signed certificate with ${claim} GitHub deployment environment`, async () => {
+    const { verifyActivationAttestation } = requireVerifier();
+    const boundary = processBoundary(verifiedOutput({ rawCertificate }));
+    await assert.rejects(verifyActivationAttestation({
+      manifest: MANIFEST,
+      processBoundary: boundary,
+      ...TRUST_POLICY,
+    }), { code: 'activation_attestation_invalid' });
+  });
+}
+
+test('an unbound environment summary cannot replace a missing claim in the raw certificate', async () => {
+  const { verifyActivationAttestation } = requireVerifier();
+  const rawCertificate = certificateFixture(null);
+  const boundary = processBoundary(verifiedOutput({
+    certificate: trustedCertificate({ deploymentEnvironment: 'billing-validation-attestation' }),
+    rawCertificate,
+  }));
+  await assert.rejects(verifyActivationAttestation({
+    manifest: MANIFEST,
+    processBoundary: boundary,
+    ...TRUST_POLICY,
+  }), { code: 'activation_attestation_invalid' });
+});
+
+test('verifier reads the leaf certificate from the legacy Sigstore X.509 chain bundle shape', async () => {
+  const { verifyActivationAttestation } = requireVerifier();
+  const boundary = processBoundary(verifiedOutput({
+    bundle: { verificationMaterial: { x509CertificateChain: {
+      certificates: [{ rawBytes: certificateFixture() }],
+    } } },
+  }));
+  await assert.doesNotReject(verifyActivationAttestation({
+    manifest: MANIFEST,
+    processBoundary: boundary,
+    ...TRUST_POLICY,
+  }));
+});
+
+test('verifier refuses ambiguous bundles containing both certificate representations', async () => {
+  const { verifyActivationAttestation } = requireVerifier();
+  const rawBytes = certificateFixture();
+  const boundary = processBoundary(verifiedOutput({
+    bundle: { verificationMaterial: {
+      certificate: { rawBytes },
+      x509CertificateChain: { certificates: [{ rawBytes }] },
+    } },
+  }));
+  await assert.rejects(verifyActivationAttestation({
+    manifest: MANIFEST,
+    processBoundary: boundary,
+    ...TRUST_POLICY,
+  }), { code: 'activation_attestation_invalid' });
+});
 
 test('verifier rejects an attestation whose subject digest differs from the exact manifest bytes', async () => {
   const { verifyActivationAttestation } = requireVerifier();

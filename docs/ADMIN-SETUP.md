@@ -21,11 +21,12 @@ Create these exact environments in the control repository before any operational
 
 | Environment | Intended job | Required deployment ref | Secrets during Task 1 |
 | --- | --- | --- | --- |
+| `billing-validation-attestation` | GitHub-hosted activation-manifest signer | Protected default branch only | None |
 | `billing-validation-reader` | GitHub-hosted candidate metadata reader | Protected default branch only | None |
 | `billing-validation-tests` | Isolated billing/browser test job | Protected default branch only | None |
 | `billing-validation-publisher` | GitHub-hosted check publisher | Protected default branch only | None |
 
-Do not configure manual reviewers. Read back each environment's existence, deployment branch policy, reviewer list, and secret names without exposing values. The separate Apps and financial test credentials are later-task work; Task 1 references the environment names but does not consume secrets or create environments. An absent environment must block activation because GitHub may create an unprotected environment when a workflow first references it.
+Do not configure manual reviewers. Read back each environment's existence, deployment branch policy, reviewer list, and secret names without exposing values. The activation verifier reads the signed X.509 certificate's Fulcio Deployment Environment extension (`1.3.6.1.4.1.57264.1.23`) from the raw certificate in the `gh attestation verify --format=json` bundle and requires the exact value `billing-validation-attestation`; an absent, ambiguous, malformed, or different value is rejected. This uses certificate bytes rather than assuming every GitHub CLI version exposes the extension in its parsed certificate summary. Declaring the environment in workflow YAML does not prove that its administrative restrictions exist: Task 9 must verify the environment exists and is restricted to the protected default branch before enabling activation. The separate Apps and financial test credentials are later-task work; Task 1 references the environment names but does not consume secrets or create environments. An absent or unprotected environment must block activation because GitHub may create an unprotected environment when a workflow first references it.
 
 ## Dispatch and runner contract
 

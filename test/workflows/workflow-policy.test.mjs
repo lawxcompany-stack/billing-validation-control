@@ -121,6 +121,7 @@ test('only hosted collect attestation has signing permissions and runs after aut
   const attest = workflow.jobs['attest-activation'];
   assert.ok(attest, 'A hosted attestation job must bind the workstation activation');
   assert.ok(isHostedRunner(attest['runs-on']));
+  assert.equal(attest.environment, 'billing-validation-attestation');
   assert.deepEqual(attest.needs, ['authorize', 'reader']);
   assert.deepEqual(attest.permissions, {
     contents: 'read',

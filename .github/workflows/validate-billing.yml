@@ -126,6 +126,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && needs.authorize.result == 'success' && needs.reader.result == 'success' && needs.authorize.outputs.operation == 'collect' }}
     needs: [authorize, reader]
     runs-on: ubuntu-latest
+    environment: billing-validation-attestation
     timeout-minutes: 10
     permissions:
       contents: read
