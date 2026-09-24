@@ -10,10 +10,16 @@ const IMAGE = `sha256:${'c'.repeat(64)}`;
 const REPOSITORY = 'lawxcompany-stack/billing-validation-control';
 const WORKFLOW_REF = `${REPOSITORY}/.github/workflows/validate-billing.yml@refs/heads/main`;
 const ACTIONS_ENV_KEYS = ['GITHUB_REPOSITORY', 'GITHUB_EVENT_NAME', 'GITHUB_REF',
-  'GITHUB_WORKFLOW_REF', 'GITHUB_REF_PROTECTED'];
+  'GITHUB_WORKFLOW_REF', 'GITHUB_REF_PROTECTED', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_SHA'];
+const HEAD_SHA = 'a'.repeat(40);
 const TRUSTED_ACTIONS_ENV = Object.freeze({ GITHUB_REPOSITORY: REPOSITORY,
   GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REF: 'refs/heads/main',
-  GITHUB_WORKFLOW_REF: WORKFLOW_REF, GITHUB_REF_PROTECTED: 'true' });
+  GITHUB_WORKFLOW_REF: WORKFLOW_REF, GITHUB_REF_PROTECTED: 'true',
+  GITHUB_RUN_ID: '123456789', GITHUB_RUN_ATTEMPT: '2', GITHUB_SHA: HEAD_SHA });
+const VALID_RUN_ATTEMPT = Object.freeze({ id: 123456789, run_attempt: 2,
+  repository: { full_name: REPOSITORY },
+  path: '.github/workflows/validate-billing.yml@main',
+  event: 'workflow_dispatch', head_branch: 'main', head_sha: HEAD_SHA, status: 'in_progress' });
 
 function workflowContext(overrides = {}) {
   const ref = 'refs/heads/main';
@@ -36,8 +42,22 @@ async function withActionsRuntime(environment, operation) {
   }
 }
 
-function invokeSupervisor(options, environment = TRUSTED_ACTIONS_ENV) {
-  return withActionsRuntime(environment, () => supervisor.runSupervisedRunner(options));
+function githubResponse(payload, status = 200, headers = {}) {
+  const body = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  return new Response(body, { status, headers: { 'content-type': 'application/json', ...headers } });
+}
+
+async function withMockFetch(fetchImplementation, operation) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchImplementation;
+  try { return await operation(); }
+  finally { globalThis.fetch = originalFetch; }
+}
+
+function invokeSupervisor(options, environment = TRUSTED_ACTIONS_ENV,
+  fetchImplementation = async () => githubResponse(VALID_RUN_ATTEMPT)) {
+  return withActionsRuntime(environment, () => withMockFetch(fetchImplementation,
+    () => supervisor.runSupervisedRunner(options)));
 }
 
 async function fixture(options = {}) {
@@ -238,6 +258,189 @@ test('supervisor rejects mismatched or unprotected Actions runtime context befor
       assert.equal(fx.state.displayStarted, false);
     } finally { await fx.close(); }
   }
+});
+
+test('fabricated Actions environment without a matching public GitHub attempt is refused before side effects', async () => {
+  const fx = await fixture();
+  let tokenRequests = 0;
+  let requests = 0;
+  try {
+    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
+      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+    }), TRUSTED_ACTIONS_ENV, async () => {
+      requests += 1;
+      return githubResponse({ ...VALID_RUN_ATTEMPT, id: 123456788 });
+    }), { code: 'runner_workflow_context_invalid' });
+    assert.equal(requests, 1);
+    assert.equal(tokenRequests, 0);
+    assert.deepEqual(fx.state.calls, []);
+    assert.equal(fx.state.displayStarted, false);
+  } finally { await fx.close(); }
+});
+
+test('malformed run identifiers and source SHA refuse before a GitHub lookup', async () => {
+  const rejected = [
+    { ...TRUSTED_ACTIONS_ENV, GITHUB_RUN_ID: '1.5' },
+    { ...TRUSTED_ACTIONS_ENV, GITHUB_RUN_ID: '01' },
+    { ...TRUSTED_ACTIONS_ENV, GITHUB_RUN_ATTEMPT: '0' },
+    { ...TRUSTED_ACTIONS_ENV, GITHUB_RUN_ATTEMPT: '2x' },
+    { ...TRUSTED_ACTIONS_ENV, GITHUB_SHA: 'not-a-full-sha' },
+  ];
+  for (const environment of rejected) {
+    const fx = await fixture();
+    let tokenRequests = 0;
+    let requests = 0;
+    try {
+      await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
+        getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+      }), environment, async () => { requests += 1; return githubResponse(VALID_RUN_ATTEMPT); }),
+      { code: 'runner_workflow_context_invalid' });
+      assert.equal(requests, 0);
+      assert.equal(tokenRequests, 0);
+      assert.deepEqual(fx.state.calls, []);
+      assert.equal(fx.state.displayStarted, false);
+    } finally { await fx.close(); }
+  }
+});
+
+for (const [field, mutation] of [
+  ['run ID', (run) => ({ ...run, id: 123456788 })],
+  ['run attempt', (run) => ({ ...run, run_attempt: 1 })],
+  ['repository', (run) => ({ ...run, repository: { full_name: 'untrusted/candidate' } })],
+  ['workflow path', (run) => ({ ...run, path: '.github/workflows/other.yml@refs/heads/main' })],
+  ['event', (run) => ({ ...run, event: 'pull_request_target' })],
+  ['head branch', (run) => ({ ...run, head_branch: 'feature' })],
+  ['head SHA', (run) => ({ ...run, head_sha: 'b'.repeat(40) })],
+  ['status', (run) => ({ ...run, status: 'completed' })],
+]) {
+  test(`supervisor rejects authoritative workflow attempt ${field} mismatch before credentials`, async () => {
+    const fx = await fixture();
+    let tokenRequests = 0;
+    try {
+      await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
+        getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+      }), TRUSTED_ACTIONS_ENV, async () => githubResponse(mutation(VALID_RUN_ATTEMPT))),
+      { code: 'runner_workflow_context_invalid' });
+      assert.equal(tokenRequests, 0);
+      assert.deepEqual(fx.state.calls, []);
+      assert.equal(fx.state.displayStarted, false);
+    } finally { await fx.close(); }
+  });
+}
+
+test('supervisor rejects a noncanonical workflow path returned by GitHub before credentials', async () => {
+  const fx = await fixture();
+  let tokenRequests = 0;
+  try {
+    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
+      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+    }), TRUSTED_ACTIONS_ENV, async () => githubResponse({ ...VALID_RUN_ATTEMPT,
+      path: '.github/workflows/validate-billing.yml@refs/heads/main' })),
+    { code: 'runner_workflow_context_invalid' });
+    assert.equal(tokenRequests, 0);
+    assert.deepEqual(fx.state.calls, []);
+    assert.equal(fx.state.displayStarted, false);
+  } finally { await fx.close(); }
+});
+
+test('supervisor sends only the fixed unauthenticated read-only attempt lookup', async () => {
+  const fx = await fixture();
+  let tokenRequests = 0;
+  const requests = [];
+  try {
+    const result = await invokeSupervisor(supervisorOptions(fx, {
+      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+    }), TRUSTED_ACTIONS_ENV, async (input, init) => {
+      requests.push({ url: String(input), init });
+      return githubResponse(VALID_RUN_ATTEMPT);
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(tokenRequests, 1);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url,
+      'https://api.github.com/repos/lawxcompany-stack/billing-validation-control/actions/runs/123456789/attempts/2');
+    assert.equal(requests[0].init.method, 'GET');
+    assert.equal(requests[0].init.redirect, 'error');
+    assert.equal(requests[0].init.cache, 'no-store');
+    assert.equal(requests[0].init.credentials, 'omit');
+    assert.equal(new Headers(requests[0].init.headers).has('authorization'), false);
+  } finally { await fx.close(); }
+});
+
+test('supervisor rejects malformed or oversized GitHub attempt responses', async () => {
+  const oversizedBody = new ReadableStream({ start(controller) {
+    controller.enqueue(new Uint8Array(70 * 1024));
+  } });
+  const responses = [
+    githubResponse('{malformed'),
+    new Response(oversizedBody, { status: 200, headers: { 'content-type': 'application/json' } }),
+  ];
+  for (const response of responses) {
+    const fx = await fixture();
+    let tokenRequests = 0;
+    try {
+      await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
+        getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+      }), TRUSTED_ACTIONS_ENV, async () => response), { code: 'runner_workflow_context_invalid' });
+      assert.equal(tokenRequests, 0);
+      assert.deepEqual(fx.state.calls, []);
+      assert.equal(fx.state.displayStarted, false);
+    } finally { await fx.close(); }
+  }
+});
+
+test('supervisor refuses non-200 and redirect responses before credentials', async () => {
+  for (const response of [
+    githubResponse({ message: 'not found' }, 404),
+    githubResponse({ message: 'rate limited' }, 403),
+    githubResponse({ message: 'rate limited' }, 429),
+    githubResponse({ message: 'unavailable' }, 503),
+    new Response('', { status: 302, headers: { location: 'https://elsewhere.invalid/' } }),
+  ]) {
+    const fx = await fixture();
+    let tokenRequests = 0;
+    try {
+      await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
+        getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+      }), TRUSTED_ACTIONS_ENV, async () => response), { code: 'runner_workflow_context_invalid' });
+      assert.equal(tokenRequests, 0);
+      assert.deepEqual(fx.state.calls, []);
+      assert.equal(fx.state.displayStarted, false);
+    } finally { await fx.close(); }
+  }
+});
+
+test('supervisor attempt lookup times out and aborts before registration credentials', async () => {
+  const fx = await fixture();
+  let tokenRequests = 0;
+  try {
+    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
+      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+    }), TRUSTED_ACTIONS_ENV, (_input, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new DOMException('timed out', 'AbortError')), { once: true });
+    })), { code: 'runner_workflow_context_invalid' });
+    assert.equal(tokenRequests, 0);
+    assert.deepEqual(fx.state.calls, []);
+    assert.equal(fx.state.displayStarted, false);
+  } finally { await fx.close(); }
+});
+
+test('caller cancellation aborts a pending GitHub attempt lookup before runner setup', async () => {
+  const fx = await fixture();
+  const controller = new AbortController();
+  let tokenRequests = 0;
+  try {
+    const run = invokeSupervisor(supervisorOptions(fx, { signal: controller.signal,
+      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+    }), TRUSTED_ACTIONS_ENV, (_input, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      setImmediate(() => controller.abort());
+    }));
+    await assert.rejects(run, { code: 'runner_workflow_context_invalid' });
+    assert.equal(tokenRequests, 0);
+    assert.deepEqual(fx.state.calls, []);
+    assert.equal(fx.state.displayStarted, false);
+  } finally { await fx.close(); }
 });
 
 test('supervisor refuses process boundaries not bound to the isolated Docker context', async () => {

@@ -382,8 +382,6 @@ async function stopDisplay(displayProcess) {
 export async function runSupervisedRunner({ processBoundary, image, parentDisplay,
   parentXauthority, additionalEgressHosts = [], getRegistrationToken, signal,
   timeoutMs = 45 * 60 * 1000 } = {}) {
-  // Read trust inputs only from the Actions runtime; no caller-supplied context can authorize work.
-  const trusted = readTrustedRunnerWorkflowContext();
   if (cleanupUnverified) refuse('runner_cleanup_unverified');
   if (processBoundary && processBoundary.dockerContext !== ISOLATED_DOCKER_CONTEXT) {
     refuse('runner_docker_context_untrusted');
@@ -398,6 +396,9 @@ export async function runSupervisedRunner({ processBoundary, image, parentDispla
   if (signal?.aborted) refuse('runner_cancelled');
   if (activeDisplay.value) refuse('runner_display_already_in_use');
   activeDisplay.value = true;
+  let trusted;
+  try { trusted = await readTrustedRunnerWorkflowContext(signal); }
+  catch { activeDisplay.value = false; refuse('runner_workflow_context_invalid'); }
   const timerController = new AbortController();
   const timeout = setTimeout(() => timerController.abort(new RunnerSupervisorRefusal('runner_timeout')), timeoutMs);
   const onExternalAbort = () => timerController.abort(new RunnerSupervisorRefusal('runner_cancelled'));
