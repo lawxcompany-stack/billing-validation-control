@@ -1,46 +1,24 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
 const supervisor = await import('../../runner/supervisor.mjs').catch(() => ({}));
+const supervisorInternal = await import('../../runner/supervisor-internal.mjs').catch(() => ({}));
+const workflowContextInternal = await import('../../runner/workflow-context-internal.mjs').catch(() => ({}));
+const activationVerifierInternal = await import('../../runner/activation-verifier-internal.mjs').catch(() => ({}));
 const egress = await import('../../runner/egress-proxy.mjs').catch(() => ({}));
 const IMAGE = `sha256:${'c'.repeat(64)}`;
 const REPOSITORY = 'lawxcompany-stack/billing-validation-control';
-const WORKFLOW_REF = `${REPOSITORY}/.github/workflows/validate-billing.yml@refs/heads/main`;
-const ACTIONS_ENV_KEYS = ['GITHUB_REPOSITORY', 'GITHUB_EVENT_NAME', 'GITHUB_REF',
-  'GITHUB_WORKFLOW_REF', 'GITHUB_REF_PROTECTED', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_SHA'];
-const HEAD_SHA = 'a'.repeat(40);
-const TRUSTED_ACTIONS_ENV = Object.freeze({ GITHUB_REPOSITORY: REPOSITORY,
-  GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REF: 'refs/heads/main',
-  GITHUB_WORKFLOW_REF: WORKFLOW_REF, GITHUB_REF_PROTECTED: 'true',
-  GITHUB_RUN_ID: '123456789', GITHUB_RUN_ATTEMPT: '2', GITHUB_SHA: HEAD_SHA });
-const VALID_RUN_ATTEMPT = Object.freeze({ id: 123456789, run_attempt: 2,
-  repository: { full_name: REPOSITORY },
-  path: '.github/workflows/validate-billing.yml@main',
-  event: 'workflow_dispatch', head_branch: 'main', head_sha: HEAD_SHA, status: 'in_progress' });
-
-function workflowContext(overrides = {}) {
-  const ref = 'refs/heads/main';
-  return { repository: REPOSITORY, eventName: 'workflow_dispatch', defaultBranch: 'main', ref,
-    workflowRef: `${REPOSITORY}/.github/workflows/validate-billing.yml@${ref}`, ...overrides };
-}
-
-async function withActionsRuntime(environment, operation) {
-  const previous = new Map(ACTIONS_ENV_KEYS.map((key) => [key, process.env[key]]));
-  for (const key of ACTIONS_ENV_KEYS) {
-    if (Object.hasOwn(environment, key)) process.env[key] = environment[key];
-    else delete process.env[key];
-  }
-  try { return await operation(); }
-  finally {
-    for (const [key, value] of previous) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
-}
+const REPOSITORY_ID = '12345678';
+const RUN_ID = '123456789';
+const RUN_ATTEMPT = '2';
+const CONTROL_SHA = 'd'.repeat(40);
+const CANDIDATE_SHA = 'a'.repeat(40);
+const CONTROL_WORKFLOW_PATH = '.github/workflows/validate-billing.yml';
+const SELECTED_RUN = Object.freeze({ runId: RUN_ID, runAttempt: RUN_ATTEMPT });
 
 function githubResponse(payload, status = 200, headers = {}) {
   const body = typeof payload === 'string' ? payload : JSON.stringify(payload);
@@ -54,17 +32,72 @@ async function withMockFetch(fetchImplementation, operation) {
   finally { globalThis.fetch = originalFetch; }
 }
 
-function invokeSupervisor(options, environment = TRUSTED_ACTIONS_ENV,
-  fetchImplementation = async () => githubResponse(VALID_RUN_ATTEMPT)) {
-  return withActionsRuntime(environment, () => withMockFetch(fetchImplementation,
-    () => supervisor.runSupervisedRunner(options)));
+function validRunAttempt(overrides = {}) {
+  return { id: Number(RUN_ID), run_attempt: Number(RUN_ATTEMPT),
+    repository: { id: Number(REPOSITORY_ID), full_name: REPOSITORY },
+    head_repository: { id: Number(REPOSITORY_ID), full_name: REPOSITORY },
+    path: `${CONTROL_WORKFLOW_PATH}@main`, event: 'workflow_dispatch', head_branch: 'main',
+    head_sha: CONTROL_SHA, status: 'in_progress', ...overrides };
+}
+
+function syntheticGhOutput(manifest, bytes, certificateOverrides = {}) {
+  const repositoryUri = `https://github.com/${REPOSITORY}`;
+  const workflowUri = `${repositoryUri}/${CONTROL_WORKFLOW_PATH}`;
+  const certificate = {
+    issuer: 'https://token.actions.githubusercontent.com',
+    subjectAlternativeName: `${workflowUri}@refs/heads/main`,
+    buildSignerURI: `${workflowUri}@refs/heads/main`,
+    buildSignerDigest: manifest.controlWorkflowSha,
+    runInvocationURI: `${repositoryUri}/actions/runs/${manifest.runId}/attempts/${manifest.runAttempt}`,
+    sourceRepositoryURI: repositoryUri,
+    sourceRepositoryIdentifier: REPOSITORY_ID,
+    sourceRepositoryRef: 'refs/heads/main',
+    sourceRepositoryDigest: manifest.controlWorkflowSha,
+    githubWorkflowTrigger: 'workflow_dispatch',
+    githubWorkflowRef: 'refs/heads/main',
+    githubWorkflowSHA: manifest.controlWorkflowSha,
+    runnerEnvironment: 'github-hosted',
+    ...certificateOverrides,
+  };
+  return JSON.stringify([{
+    attestation: { synthetic: true },
+    verificationResult: {
+      signature: { certificate },
+      verifiedTimestamps: [{ type: 'rekor', uri: 'https://rekor.sigstore.dev/api/v1/log/entries/synthetic',
+        timestamp: '2026-09-23T12:34:56Z' }],
+      statement: { subject: [{ name: 'activation-manifest.json', digest: {
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      } }], predicateType: 'https://slsa.dev/provenance/v1', predicate: { untrusted: true } },
+    },
+  }]);
+}
+
+function createTestSupervisor(fx) {
+  return supervisorInternal.createRunnerSupervisor({
+    readSelectedRunAttempt: ({ runId, runAttempt, signal }) =>
+      workflowContextInternal.readSelectedRunAttemptWithRepositoryId({ runId, runAttempt,
+        reviewedControlRepositoryId: REPOSITORY_ID, signal }),
+    verifyActivationAttestation: ({ manifest, signal }) =>
+      activationVerifierInternal.verifyActivationAttestationWithBoundary({ manifest,
+        processBoundary: fx.boundary, reviewedControlRepositoryId: REPOSITORY_ID, signal }),
+  });
+}
+
+function invokeSupervisor(options, fetchImplementation = async () => githubResponse(validRunAttempt())) {
+  const run = options.__testRun;
+  const { __testRun: ignored, ...runOptions } = options;
+  assert.equal(typeof run, 'function');
+  return withMockFetch(async (input, init) => {
+    options.processBoundary.testState.activationEvents.push('api');
+    return fetchImplementation(input, init);
+  }, () => run(runOptions));
 }
 
 async function fixture(options = {}) {
   const root = await mkdtemp(path.join(tmpdir(), 'bvc-supervisor-test-'));
   const parentAuth = path.join(root, 'parent.Xauthority');
   await writeFile(parentAuth, 'test-only-empty-display-auth-file', { mode: 0o600 });
-  const state = { calls: [], networks: new Map(), containers: new Map(), displayStarted: false, displayStopped: false,
+  const state = { calls: [], processCalls: [], activationEvents: [], networks: new Map(), containers: new Map(), displayStarted: false, displayStopped: false,
     proxyStarted: false,
     tokenSeenByCreate: false, runnerStarted: false, ...options };
   const runnerWaitStarted = new Promise((resolve) => { state.markRunnerWaitStarted = resolve; });
@@ -73,11 +106,22 @@ async function fixture(options = {}) {
   const boundary = {
     dockerContext: 'billing-validation-isolated',
     async run(executable, args, callOptions = {}) {
+      if (executable === 'gh') {
+        state.activationEvents.push('attestation');
+        state.processCalls.push({ executable, args: [...args], callOptions });
+        if (state.ghFailure) throw new Error('test-only-gh-failure');
+        const manifestPath = args[2];
+        const bytes = await readFile(manifestPath);
+        state.manifestBytes = bytes;
+        const manifest = JSON.parse(bytes.toString('utf8'));
+        return { stdout: state.ghOutput ?? syntheticGhOutput(manifest, bytes, state.certificateOverrides) };
+      }
       if (executable !== 'docker') {
         if (executable === 'xset') return { stdout: '' };
         throw new Error('unexpected_process');
       }
       const [group, action, ...rest] = args;
+      if (!state.activationEvents.includes('docker')) state.activationEvents.push('docker');
       state.calls.push({ group, action, rest: rest.filter((item) => !String(item).startsWith('type=bind,source=')), hasRunnerToken:
         Object.hasOwn(callOptions.env ?? {}, 'RUNNER_REGISTRATION_TOKEN') });
       if (group === 'image' && action === 'inspect') return { stdout: `${IMAGE}\n` };
@@ -194,253 +238,97 @@ async function fixture(options = {}) {
       assert.equal(executable, 'Xephyr');
       assert.ok(args.includes('-nolisten') && args.includes('tcp'));
       state.displayStarted = true;
+      state.activationEvents.push('display');
       return { exitCode: null, async stop() { state.displayStopped = true; } };
     },
   };
+  boundary.testState = state;
   return { state, boundary, root, parentAuth, runnerWaitStarted,
     async close() { await rm(root, { recursive: true, force: true }); } };
 }
 
 function supervisorOptions(fx, overrides = {}) {
-  return { processBoundary: fx.boundary, workflowContext: workflowContext(), image: IMAGE,
+  const suppliedPresentation = overrides.presentActivation;
+  const suppliedSelection = overrides.selectRun;
+  const suppliedTokenProvider = overrides.getRegistrationToken;
+  const options = { processBoundary: fx.boundary, image: IMAGE, candidateSha: CANDIDATE_SHA,
     parentDisplay: ':0', parentXauthority: fx.parentAuth,
     additionalEgressHosts: ['preview.example.test', 'api.stripe.com', 'project.example.supabase.co'],
-    getRegistrationToken: async () => 'test-only-registration-token', ...overrides };
+    presentActivation: async (presentation) => {
+      fx.state.activationEvents.push('present');
+      fx.state.presentation = presentation;
+      return suppliedPresentation?.(presentation);
+    },
+    selectRun: async (presentation, context) => {
+      fx.state.activationEvents.push('select');
+      fx.state.selectorPresentation = presentation;
+      return suppliedSelection ? suppliedSelection(presentation, context) : SELECTED_RUN;
+    },
+    getRegistrationToken: async (...args) => {
+      fx.state.activationEvents.push('token');
+      return suppliedTokenProvider ? suppliedTokenProvider(...args) : 'test-only-registration-token';
+    },
+    ...overrides };
+  options.presentActivation = async (presentation) => {
+    fx.state.activationEvents.push('present');
+    fx.state.presentation = presentation;
+    return suppliedPresentation?.(presentation);
+  };
+  options.selectRun = async (presentation, context) => {
+    fx.state.activationEvents.push('select');
+    fx.state.selectorPresentation = presentation;
+    return suppliedSelection ? suppliedSelection(presentation, context) : SELECTED_RUN;
+  };
+  options.getRegistrationToken = async (...args) => {
+    fx.state.activationEvents.push('token');
+    return suppliedTokenProvider ? suppliedTokenProvider(...args) : 'test-only-registration-token';
+  };
+  options.__testRun = createTestSupervisor(fx);
+  return options;
 }
 
-test('caller-supplied workflow context cannot authorize without Actions runtime context', async () => {
+test('public supervisor rejects caller-supplied process, proof, and trust-ID seams before callbacks', async () => {
   assert.equal(typeof supervisor.runSupervisedRunner, 'function');
-  const fx = await fixture();
-  let tokenRequests = 0;
-  try {
-    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
-      workflowContext: workflowContext(),
-      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-    }), {}), { code: 'runner_workflow_context_invalid' });
-    assert.equal(tokenRequests, 0);
-    assert.deepEqual(fx.state.calls, []);
-    assert.equal(fx.state.displayStarted, false);
-  } finally { await fx.close(); }
-});
-
-test('pull_request_target runtime context is rejected before credentials or process invocation', async () => {
-  const fx = await fixture();
-  let tokenRequests = 0;
-  try {
-    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
-      workflowContext: workflowContext(),
-      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-    }), { ...TRUSTED_ACTIONS_ENV, GITHUB_EVENT_NAME: 'pull_request_target' }),
-    { code: 'runner_workflow_context_invalid' });
-    assert.equal(tokenRequests, 0);
-    assert.deepEqual(fx.state.calls, []);
-    assert.equal(fx.state.displayStarted, false);
-  } finally { await fx.close(); }
-});
-
-test('supervisor rejects mismatched or unprotected Actions runtime context before credentials', async () => {
-  const rejected = [
-    { ...TRUSTED_ACTIONS_ENV, GITHUB_REPOSITORY: 'untrusted/candidate' },
-    { ...TRUSTED_ACTIONS_ENV, GITHUB_EVENT_NAME: 'pull_request' },
-    { ...TRUSTED_ACTIONS_ENV, GITHUB_REF: 'refs/heads/feature' },
-    { ...TRUSTED_ACTIONS_ENV, GITHUB_WORKFLOW_REF: `${REPOSITORY}/.github/workflows/other.yml@refs/heads/main` },
-    { ...TRUSTED_ACTIONS_ENV, GITHUB_REF_PROTECTED: 'false' },
-  ];
-  for (const environment of rejected) {
-    const fx = await fixture();
-    let tokenRequests = 0;
-    try {
-      await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
-        getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-      }), environment), { code: 'runner_workflow_context_invalid' });
-      assert.equal(tokenRequests, 0);
-      assert.deepEqual(fx.state.calls, []);
-      assert.equal(fx.state.displayStarted, false);
-    } finally { await fx.close(); }
-  }
-});
-
-test('fabricated Actions environment without a matching public GitHub attempt is refused before side effects', async () => {
-  const fx = await fixture();
-  let tokenRequests = 0;
-  let requests = 0;
-  try {
-    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
-      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-    }), TRUSTED_ACTIONS_ENV, async () => {
-      requests += 1;
-      return githubResponse({ ...VALID_RUN_ATTEMPT, id: 123456788 });
-    }), { code: 'runner_workflow_context_invalid' });
-    assert.equal(requests, 1);
-    assert.equal(tokenRequests, 0);
-    assert.deepEqual(fx.state.calls, []);
-    assert.equal(fx.state.displayStarted, false);
-  } finally { await fx.close(); }
-});
-
-test('malformed run identifiers and source SHA refuse before a GitHub lookup', async () => {
-  const rejected = [
-    { ...TRUSTED_ACTIONS_ENV, GITHUB_RUN_ID: '1.5' },
-    { ...TRUSTED_ACTIONS_ENV, GITHUB_RUN_ID: '01' },
-    { ...TRUSTED_ACTIONS_ENV, GITHUB_RUN_ATTEMPT: '0' },
-    { ...TRUSTED_ACTIONS_ENV, GITHUB_RUN_ATTEMPT: '2x' },
-    { ...TRUSTED_ACTIONS_ENV, GITHUB_SHA: 'not-a-full-sha' },
-  ];
-  for (const environment of rejected) {
-    const fx = await fixture();
-    let tokenRequests = 0;
-    let requests = 0;
-    try {
-      await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
-        getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-      }), environment, async () => { requests += 1; return githubResponse(VALID_RUN_ATTEMPT); }),
-      { code: 'runner_workflow_context_invalid' });
-      assert.equal(requests, 0);
-      assert.equal(tokenRequests, 0);
-      assert.deepEqual(fx.state.calls, []);
-      assert.equal(fx.state.displayStarted, false);
-    } finally { await fx.close(); }
-  }
-});
-
-for (const [field, mutation] of [
-  ['run ID', (run) => ({ ...run, id: 123456788 })],
-  ['run attempt', (run) => ({ ...run, run_attempt: 1 })],
-  ['repository', (run) => ({ ...run, repository: { full_name: 'untrusted/candidate' } })],
-  ['workflow path', (run) => ({ ...run, path: '.github/workflows/other.yml@refs/heads/main' })],
-  ['event', (run) => ({ ...run, event: 'pull_request_target' })],
-  ['head branch', (run) => ({ ...run, head_branch: 'feature' })],
-  ['head SHA', (run) => ({ ...run, head_sha: 'b'.repeat(40) })],
-  ['status', (run) => ({ ...run, status: 'completed' })],
-]) {
-  test(`supervisor rejects authoritative workflow attempt ${field} mismatch before credentials`, async () => {
-    const fx = await fixture();
-    let tokenRequests = 0;
-    try {
-      await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
-        getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-      }), TRUSTED_ACTIONS_ENV, async () => githubResponse(mutation(VALID_RUN_ATTEMPT))),
-      { code: 'runner_workflow_context_invalid' });
-      assert.equal(tokenRequests, 0);
-      assert.deepEqual(fx.state.calls, []);
-      assert.equal(fx.state.displayStarted, false);
-    } finally { await fx.close(); }
-  });
-}
-
-test('supervisor rejects a noncanonical workflow path returned by GitHub before credentials', async () => {
-  const fx = await fixture();
-  let tokenRequests = 0;
-  try {
-    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
-      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-    }), TRUSTED_ACTIONS_ENV, async () => githubResponse({ ...VALID_RUN_ATTEMPT,
-      path: '.github/workflows/validate-billing.yml@refs/heads/main' })),
-    { code: 'runner_workflow_context_invalid' });
-    assert.equal(tokenRequests, 0);
-    assert.deepEqual(fx.state.calls, []);
-    assert.equal(fx.state.displayStarted, false);
-  } finally { await fx.close(); }
-});
-
-test('supervisor sends only the fixed unauthenticated read-only attempt lookup', async () => {
-  const fx = await fixture();
-  let tokenRequests = 0;
-  const requests = [];
-  try {
-    const result = await invokeSupervisor(supervisorOptions(fx, {
-      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-    }), TRUSTED_ACTIONS_ENV, async (input, init) => {
-      requests.push({ url: String(input), init });
-      return githubResponse(VALID_RUN_ATTEMPT);
-    });
-    assert.equal(result.exitCode, 0);
-    assert.equal(tokenRequests, 1);
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].url,
-      'https://api.github.com/repos/lawxcompany-stack/billing-validation-control/actions/runs/123456789/attempts/2');
-    assert.equal(requests[0].init.method, 'GET');
-    assert.equal(requests[0].init.redirect, 'error');
-    assert.equal(requests[0].init.cache, 'no-store');
-    assert.equal(requests[0].init.credentials, 'omit');
-    assert.equal(new Headers(requests[0].init.headers).has('authorization'), false);
-  } finally { await fx.close(); }
-});
-
-test('supervisor rejects malformed or oversized GitHub attempt responses', async () => {
-  const oversizedBody = new ReadableStream({ start(controller) {
-    controller.enqueue(new Uint8Array(70 * 1024));
-  } });
-  const responses = [
-    githubResponse('{malformed'),
-    new Response(oversizedBody, { status: 200, headers: { 'content-type': 'application/json' } }),
-  ];
-  for (const response of responses) {
-    const fx = await fixture();
-    let tokenRequests = 0;
-    try {
-      await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
-        getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-      }), TRUSTED_ACTIONS_ENV, async () => response), { code: 'runner_workflow_context_invalid' });
-      assert.equal(tokenRequests, 0);
-      assert.deepEqual(fx.state.calls, []);
-      assert.equal(fx.state.displayStarted, false);
-    } finally { await fx.close(); }
-  }
-});
-
-test('supervisor refuses non-200 and redirect responses before credentials', async () => {
-  for (const response of [
-    githubResponse({ message: 'not found' }, 404),
-    githubResponse({ message: 'rate limited' }, 403),
-    githubResponse({ message: 'rate limited' }, 429),
-    githubResponse({ message: 'unavailable' }, 503),
-    new Response('', { status: 302, headers: { location: 'https://elsewhere.invalid/' } }),
+  assert.equal(typeof supervisor.RunnerSupervisorRefusal, 'function');
+  const options = {
+    image: IMAGE,
+    parentDisplay: ':0',
+    parentXauthority: '/nonexistent/test-only-authority',
+    candidateSha: CANDIDATE_SHA,
+    presentActivation: async () => assert.fail('injected trust options must refuse before presentation'),
+    selectRun: async () => SELECTED_RUN,
+    getRegistrationToken: async () => assert.fail('injected trust options must refuse before token'),
+  };
+  const fakeBoundary = {
+    dockerContext: 'billing-validation-isolated',
+    async run() { assert.fail('caller-supplied process boundary must never run'); },
+    async start() { assert.fail('caller-supplied process boundary must never start'); },
+  };
+  for (const injection of [
+    { processBoundary: fakeBoundary },
+    { verifyActivationAttestation: async () => ({ manifest: {}, manifestDigest: 'f'.repeat(64) }) },
+    { readSelectedRunAttempt: async () => validRunAttempt() },
+    { reviewedControlRepositoryId: REPOSITORY_ID },
   ]) {
-    const fx = await fixture();
-    let tokenRequests = 0;
-    try {
-      await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
-        getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-      }), TRUSTED_ACTIONS_ENV, async () => response), { code: 'runner_workflow_context_invalid' });
-      assert.equal(tokenRequests, 0);
-      assert.deepEqual(fx.state.calls, []);
-      assert.equal(fx.state.displayStarted, false);
-    } finally { await fx.close(); }
+    await assert.rejects(supervisor.runSupervisedRunner({ ...options, ...injection }),
+      { code: 'runner_supervisor_config_invalid' });
   }
 });
 
-test('supervisor attempt lookup times out and aborts before registration credentials', async () => {
-  const fx = await fixture();
-  let tokenRequests = 0;
-  try {
-    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
-      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-    }), TRUSTED_ACTIONS_ENV, (_input, init) => new Promise((_resolve, reject) => {
-      init.signal.addEventListener('abort', () => reject(new DOMException('timed out', 'AbortError')), { once: true });
-    })), { code: 'runner_workflow_context_invalid' });
-    assert.equal(tokenRequests, 0);
-    assert.deepEqual(fx.state.calls, []);
-    assert.equal(fx.state.displayStarted, false);
-  } finally { await fx.close(); }
-});
-
-test('caller cancellation aborts a pending GitHub attempt lookup before runner setup', async () => {
-  const fx = await fixture();
-  const controller = new AbortController();
-  let tokenRequests = 0;
-  try {
-    const run = invokeSupervisor(supervisorOptions(fx, { signal: controller.signal,
-      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-    }), TRUSTED_ACTIONS_ENV, (_input, init) => new Promise((_resolve, reject) => {
-      init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
-      setImmediate(() => controller.abort());
-    }));
-    await assert.rejects(run, { code: 'runner_workflow_context_invalid' });
-    assert.equal(tokenRequests, 0);
-    assert.deepEqual(fx.state.calls, []);
-    assert.equal(fx.state.displayStarted, false);
-  } finally { await fx.close(); }
+test('public supervisor uses only its fixed process and proof boundaries and fails closed while trust ID is unset', async () => {
+  const events = [];
+  let tokenCalls = 0;
+  await assert.rejects(supervisor.runSupervisedRunner({
+    image: IMAGE,
+    parentDisplay: ':0',
+    parentXauthority: '/nonexistent/test-only-authority',
+    candidateSha: CANDIDATE_SHA,
+    presentActivation: async () => { events.push('present'); },
+    selectRun: async () => { events.push('select'); return SELECTED_RUN; },
+    getRegistrationToken: async () => { tokenCalls += 1; return 'synthetic-token'; },
+  }), { code: 'runner_workflow_context_invalid' });
+  assert.deepEqual(events, ['present', 'select']);
+  assert.equal(tokenCalls, 0);
 });
 
 test('supervisor refuses process boundaries not bound to the isolated Docker context', async () => {

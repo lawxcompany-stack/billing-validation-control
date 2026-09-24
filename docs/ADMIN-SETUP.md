@@ -1,12 +1,12 @@
 # Control repository administrator setup and readback
 
-This is an implementation checklist for the private billing control repository. It does not create or activate GitHub settings. The Task 1 workflows are a fail-closed bootstrap and do not validate billing readiness. Do not treat branch protection, environments, Apps, secrets, or runner restrictions as active until an authorized administrator completes Task 9 and records API readback.
+This is an implementation checklist for the public billing control repository. Public visibility is required for GitHub Artifact Attestations on the current GitHub Free plan. Keep credentials, activation nonces, registration tokens, browser capabilities, and private operational data out of the repository, workflow artifacts, and logs. This checklist does not create or activate GitHub settings. The Task 1 workflows are a fail-closed bootstrap and do not validate billing readiness. Do not treat branch protection, environments, Apps, secrets, or runner restrictions as active until an authorized administrator completes Task 9 and records API readback.
 
 ## Repository access and default branch
 
 Before enabling a dispatch:
 
-1. Confirm the private repository identity is `lawxcompany-stack/billing-validation-control`; record its numeric repository ID and current default branch from the GitHub API. The workflows read the default branch from the event and refuse any other control ref.
+1. Confirm repository identity `lawxcompany-stack/billing-validation-control`, public visibility, numeric repository ID, and default branch `main` using an authorized GitHub readback. Task 9 must pin the reviewed immutable repository ID in runtime trust policy; a request, local `GITHUB_*` value, or supervisor option must never supply it. The workflows refuse any other control ref.
 2. Grant repository write access only to the `billing-validation-maintainers` team. Remove write access from other teams and individual collaborators. Because GitHub dispatch requires write access, this also limits who can start `collect` and `recheck`.
 3. Protect the exact default branch with an active ruleset or branch-protection rule that requires a pull request and at least one approving review from a maintainer. Require approval from the CODEOWNER for changes covered by `.github/CODEOWNERS`, dismiss stale approvals, and require approval of the latest push.
 4. Prohibit force-pushes and branch deletion. Enable administrator enforcement and leave the bypass list empty. If using a ruleset, read back its enforcement state and bypass actors; if using branch protection, read back `allow_force_pushes`, `allow_deletions`, and administrator enforcement.

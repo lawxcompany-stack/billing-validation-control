@@ -16,6 +16,7 @@ const context = Object.freeze({
   ref: 'refs/heads/main',
   defaultBranch: 'main',
   repository: 'lawxcompany-stack/billing-validation-control',
+  refProtected: true,
 });
 
 const sha = 'a'.repeat(40);
@@ -26,6 +27,7 @@ const collectInput = Object.freeze({
   source_run_id: '',
   source_run_attempt: '',
   runner_label: `billing-validation-${'b'.repeat(32)}`,
+  supervisor_activation: 'c'.repeat(64),
 });
 
 const recheckInput = Object.freeze({
@@ -35,6 +37,7 @@ const recheckInput = Object.freeze({
   source_run_id: '1234567890',
   source_run_attempt: '2',
   runner_label: '',
+  supervisor_activation: '',
 });
 
 test('accepts a trusted collect identity with a per-attempt runner label', () => {
@@ -61,6 +64,41 @@ test('refuses a dispatch from a non-default control ref before returning an iden
     () => parseDispatch(collectInput, { ...context, ref: 'refs/heads/untrusted' }),
     { code: 'protected_ref_required' },
   );
+});
+
+test('refuses workflow_dispatch unless GitHub marks the default ref protected', () => {
+  assert.throws(
+    () => parseDispatch(collectInput, { ...context, refProtected: false }),
+    { code: 'protected_ref_required' },
+  );
+  assert.throws(
+    () => parseDispatch(collectInput, { ...context, refProtected: undefined }),
+    { code: 'protected_ref_required' },
+  );
+});
+
+test('collect requires a canonical workstation activation commitment', () => {
+  assert.throws(
+    () => parseDispatch({ ...collectInput, supervisor_activation: '' }, context),
+    { code: 'activation_commitment_required' },
+  );
+  assert.throws(
+    () => parseDispatch({ ...collectInput, supervisor_activation: 'C'.repeat(64) }, context),
+    { code: 'malformed_activation_commitment' },
+  );
+  assert.throws(
+    () => parseDispatch({ ...collectInput, supervisor_activation: 'a'.repeat(63) }, context),
+    { code: 'malformed_activation_commitment' },
+  );
+  assert.equal(parseDispatch(collectInput, context).activationCommitment, 'c'.repeat(64));
+});
+
+test('recheck requires an empty workstation activation commitment', () => {
+  assert.throws(
+    () => parseDispatch({ ...recheckInput, supervisor_activation: 'a'.repeat(64) }, context),
+    { code: 'activation_commitment_not_allowed_for_recheck' },
+  );
+  assert.equal(parseDispatch(recheckInput, context).activationCommitment, null);
 });
 
 test('returns a finite refusal for a malformed workflow context', () => {

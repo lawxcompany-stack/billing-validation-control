@@ -46,6 +46,9 @@ test('runner entrypoint requires the unique per-attempt label and configures one
   assert.match(entrypoint, /CONTROL_EVENT_NAME/u);
   assert.match(entrypoint, /CONTROL_WORKFLOW_REF/u);
   assert.match(entrypoint, /CONTROL_DEFAULT_BRANCH/u);
+  assert.match(entrypoint, /CONTROL_ACTIVATION_COMMITMENT/u);
+  assert.doesNotMatch(entrypoint, /GITHUB_/u,
+    'the entrypoint runs before GitHub assigns a job identity');
   assert.doesNotMatch(entrypoint, /--replace|--network\s+host|\/var\/run\/docker\.sock/iu);
   assert.match(entrypoint, /unset\s+RUNNER_REGISTRATION_TOKEN/u);
 });
@@ -84,11 +87,16 @@ exit "$BVC_TEST_RUN_STATUS"
     chmod(configPath, 0o700), chmod(runPath, 0o700),
   ]));
   const env = { ...process.env, ACTIONS_RUNNER_HOME: runnerHome,
-    GITHUB_REPOSITORY: 'lawxcompany-stack/billing-validation-control',
+    GITHUB_REPOSITORY: 'forged/local-value-is-ignored',
     CONTROL_REPOSITORY: 'lawxcompany-stack/billing-validation-control',
+    CONTROL_REPOSITORY_ID: '12345678',
     CONTROL_EVENT_NAME: 'workflow_dispatch', CONTROL_DEFAULT_BRANCH: 'main',
     CONTROL_REF: 'refs/heads/main',
+    CONTROL_WORKFLOW_PATH: '.github/workflows/validate-billing.yml',
     CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main',
+    CONTROL_RUN_ID: '123456789', CONTROL_RUN_ATTEMPT: '2',
+    CONTROL_WORKFLOW_SHA: 'd'.repeat(40), CONTROL_CANDIDATE_SHA: 'a'.repeat(40),
+    CONTROL_ACTIVATION_COMMITMENT: 'c'.repeat(64), CONTROL_RUNNER_LABEL: runnerLabel,
     CONTROL_RUNNER_GROUP: 'billing-validation-isolated',
     RUNNER_LABEL: runnerLabel, RUNNER_REGISTRATION_TOKEN: registrationToken,
     BVC_TEST_CONFIG_CAPTURE: capturePath, BVC_TEST_RUNNER_STARTED: path.join(runnerHome, 'runner-started'),
@@ -133,23 +141,31 @@ test('runner entrypoint refuses a fixed or malformed label before runner registr
   });
 });
 
-test('runner entrypoint refuses an unauthorized repository before consuming its registration token', async () => {
+test('runner entrypoint ignores forgeable local GitHub environment values', async () => {
   await withFakeRunner(0, async ({ env, runnerHome, capturePath }) => {
     const result = spawnSync('bash', [entrypointPath], { env: { ...env,
-      GITHUB_REPOSITORY: 'untrusted/candidate' }, encoding: 'utf8' });
-    assert.notEqual(result.status, 0);
-    assert.doesNotMatch(`${result.stdout}${result.stderr}`, /placeholder-value-not-a-credential/u);
-    await assert.rejects(access(capturePath));
+      GITHUB_REPOSITORY: 'attacker/repository', GITHUB_RUN_ID: '1',
+      GITHUB_RUN_ATTEMPT: '1', GITHUB_SHA: 'f'.repeat(40) }, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(await readFile(capturePath, 'utf8'), /--ephemeral/u);
     await assert.rejects(access(path.join(runnerHome, '.credentials')));
   });
 });
 
-test('runner entrypoint refuses pull_request and pull_request_target plus wrong workflow/ref/group before registration', async () => {
+test('runner entrypoint refuses malformed or mismatched CONTROL metadata before registration', async () => {
   const rejected = [
+    { CONTROL_REPOSITORY_ID: '0' },
     { CONTROL_EVENT_NAME: 'pull_request' },
-    { CONTROL_EVENT_NAME: 'pull_request_target' },
-    { CONTROL_REF: 'refs/heads/feature', CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/feature' },
+    { CONTROL_DEFAULT_BRANCH: 'trunk' },
+    { CONTROL_REF: 'refs/heads/feature' },
+    { CONTROL_WORKFLOW_PATH: '.github/workflows/other.yml' },
     { CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/other.yml@refs/heads/main' },
+    { CONTROL_RUN_ID: '01' },
+    { CONTROL_RUN_ATTEMPT: '0' },
+    { CONTROL_WORKFLOW_SHA: 'not-a-sha' },
+    { CONTROL_CANDIDATE_SHA: 'A'.repeat(40) },
+    { CONTROL_ACTIVATION_COMMITMENT: 'nonce-must-not-be-presented' },
+    { CONTROL_RUNNER_LABEL: `billing-validation-${'b'.repeat(32)}` },
     { CONTROL_RUNNER_GROUP: 'shared-runner-group' },
   ];
   for (const override of rejected) {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import YAML from 'yaml';
@@ -41,6 +42,14 @@ test('workflow token defaults are limited to contents read', () => {
     const workflow = readWorkflow(path);
     assert.deepEqual(workflow.permissions, { contents: 'read' }, `${path} must use least-privilege defaults`);
     for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
+      if (path === workflowPaths[0] && jobId === 'attest-activation') {
+        assert.deepEqual(job.permissions, {
+          contents: 'read',
+          'id-token': 'write',
+          attestations: 'write',
+        });
+        continue;
+      }
       assert.ok(!job.permissions || JSON.stringify(job.permissions) === JSON.stringify({ contents: 'read' }),
         `${path}:${jobId} must not widen token permissions`);
     }
@@ -76,10 +85,101 @@ test('dispatch authorization runs hosted without an environment before all privi
   assert.equal(authorize.environment, undefined);
   assert.equal(authorize['timeout-minutes'] <= 10, true);
   assert.equal(reader.needs, 'authorize');
-  assert.deepEqual(testJob.needs, ['authorize', 'reader']);
+  assert.deepEqual(testJob.needs, ['authorize', 'reader', 'attest-activation']);
   assert.deepEqual(publisher.needs, ['authorize', 'reader', 'test']);
   for (const job of [reader, testJob, publisher]) {
     assert.match(job.if, /needs\.authorize\.result\s*==\s*'success'/);
+  }
+});
+
+test('authorize and attestation checkouts pin the exact triggering workflow SHA', () => {
+  const { authorize, 'attest-activation': attest } = readWorkflow(workflowPaths[0]).jobs;
+  const checkoutRef = '${{ github.sha }}';
+  const checkoutFor = (job) => job.steps.find((step) => step.uses?.startsWith('actions/checkout@'))?.with?.ref;
+
+  assert.equal(checkoutFor(authorize), checkoutRef);
+  assert.equal(checkoutFor(attest), checkoutRef);
+});
+
+test('attestation consumes only the validated commitment output from authorization', () => {
+  const workflow = readWorkflow(workflowPaths[0]);
+  const authorize = workflow.jobs.authorize;
+  const attest = workflow.jobs['attest-activation'];
+  const manifestStep = attest.steps.find((step) => step.name === 'Compose canonical activation subject');
+
+  assert.equal(authorize.outputs.activation_commitment, '${{ steps.authorize.outputs.activation_commitment }}');
+  assert.equal(manifestStep.env.ACTIVATION_COMMITMENT, '${{ needs.authorize.outputs.activation_commitment }}');
+  assert.equal(manifestStep.env.CANDIDATE_SHA, '${{ needs.authorize.outputs.candidate_sha }}');
+  assert.equal(manifestStep.env.RUNNER_LABEL, '${{ needs.authorize.outputs.runner_label }}');
+  assert.equal(manifestStep.env.CANDIDATE_REPOSITORY, undefined,
+    'the fixed manifest writer must not consume an untrusted dispatch input');
+  assert.ok(!JSON.stringify(attest).includes('${{ inputs.supervisor_activation }}'));
+});
+
+test('only hosted collect attestation has signing permissions and runs after authorization', () => {
+  const workflow = readWorkflow(workflowPaths[0]);
+  const attest = workflow.jobs['attest-activation'];
+  assert.ok(attest, 'A hosted attestation job must bind the workstation activation');
+  assert.ok(isHostedRunner(attest['runs-on']));
+  assert.deepEqual(attest.needs, ['authorize', 'reader']);
+  assert.deepEqual(attest.permissions, {
+    contents: 'read',
+    'id-token': 'write',
+    attestations: 'write',
+  });
+  assert.match(attest.if, /github\.event_name\s*==\s*'workflow_dispatch'/);
+  assert.match(attest.if, /github\.ref\s*==\s*'refs\/heads\/main'/);
+  assert.match(attest.if, /github\.ref_protected/);
+  assert.match(attest.if, /needs\.authorize\.result\s*==\s*'success'/);
+  assert.match(attest.if, /needs\.authorize\.outputs\.operation\s*==\s*'collect'/);
+  assert.ok(attest.steps.some((step) =>
+    step.uses === 'actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d'));
+
+  for (const [jobId, job] of Object.entries(workflow.jobs)) {
+    if (jobId !== 'attest-activation') {
+      assert.ok(!JSON.stringify(job.permissions ?? {}).includes('id-token') &&
+        !JSON.stringify(job.permissions ?? {}).includes('attestations'),
+      `${jobId} must not receive signing permissions`);
+    }
+  }
+  const policy = workflow.jobs.policy;
+  assert.ok(!JSON.stringify(policy.permissions ?? {}).includes('id-token'));
+  assert.ok(!JSON.stringify(policy.permissions ?? {}).includes('attestations'));
+});
+
+test('attestation waits for successful candidate reader preflight before signing', () => {
+  const attest = readWorkflow(workflowPaths[0]).jobs['attest-activation'];
+  assert.deepEqual(attest.needs, ['authorize', 'reader']);
+  assert.match(attest.if, /needs\.reader\.result\s*==\s*'success'/);
+});
+
+test('self-hosted collect job waits for attestation and makes context comparison its first step', () => {
+  const workflow = readWorkflow(workflowPaths[0]);
+  const testJob = workflow.jobs.test;
+  assert.ok(testJob.needs.includes('attest-activation'));
+  assert.equal(testJob.steps[0].name, 'Verify activation metadata before protected work');
+  assert.match(testJob.if, /needs\.attest-activation\.result\s*==\s*'success'/);
+  const first = testJob.steps[0];
+  assert.equal(first.env.BVC_ACTIVATION_COMMITMENT, '${{ needs.authorize.outputs.activation_commitment }}');
+  for (const controlField of [
+    'CONTROL_REPOSITORY', 'CONTROL_REPOSITORY_ID', 'CONTROL_EVENT_NAME', 'CONTROL_DEFAULT_BRANCH', 'CONTROL_REF',
+    'CONTROL_WORKFLOW_REF', 'CONTROL_RUN_ID', 'CONTROL_RUN_ATTEMPT', 'CONTROL_WORKFLOW_SHA',
+    'CONTROL_CANDIDATE_SHA', 'CONTROL_ACTIVATION_COMMITMENT', 'CONTROL_RUNNER_LABEL',
+  ]) assert.ok(first.run.includes(`'${controlField}'`), `${controlField} must be checked first`);
+});
+
+test('workflow run blocks remain valid shell after YAML indentation is removed', () => {
+  const workflow = readWorkflow(workflowPaths[0]);
+  for (const [jobId, job] of Object.entries(workflow.jobs)) {
+    for (const step of job.steps ?? []) {
+      if (typeof step.run !== 'string') continue;
+      if (step.run.includes("<<'NODE'")) {
+        assert.match(step.run, /^NODE$/mu, `${jobId}:${step.name} must close its Node heredoc at column zero`);
+      }
+      const checked = spawnSync('bash', ['-n'], { input: step.run, encoding: 'utf8' });
+      assert.equal(checked.status, 0, `${jobId}:${step.name} must parse as shell: ${checked.stderr}`);
+      assert.equal(checked.stderr, '', `${jobId}:${step.name} must not leave shell parser warnings`);
+    }
   }
 });
 

@@ -1,5 +1,6 @@
 const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
 const CANDIDATE_REPOSITORY = 'lawxcompany-stack/Plataforma-LawX';
+const CONTROL_DEFAULT_BRANCH = 'main';
 const OPERATIONS = new Set(['collect', 'recheck']);
 const INPUT_KEYS = new Set([
   'operation',
@@ -8,6 +9,7 @@ const INPUT_KEYS = new Set([
   'source_run_id',
   'source_run_attempt',
   'runner_label',
+  'supervisor_activation',
 ]);
 
 export class DispatchRefusal extends Error {
@@ -26,12 +28,14 @@ export function assertProtectedDefaultRef(context = {}) {
   if (context === null || typeof context !== 'object' || Array.isArray(context)) {
     refuse('malformed_control_context');
   }
-  const { ref, defaultBranch, repository } = context;
+  const { ref, defaultBranch, repository, refProtected } = context;
   if (repository !== CONTROL_REPOSITORY) refuse('control_repository_not_allowed');
-  if (typeof defaultBranch !== 'string' || defaultBranch.length === 0) {
+  if (defaultBranch !== CONTROL_DEFAULT_BRANCH) {
     refuse('default_branch_unavailable');
   }
-  if (ref !== `refs/heads/${defaultBranch}`) refuse('protected_ref_required');
+  if (ref !== `refs/heads/${CONTROL_DEFAULT_BRANCH}` || refProtected !== true) {
+    refuse('protected_ref_required');
+  }
   return true;
 }
 
@@ -58,17 +62,26 @@ export function parseDispatch(input, context) {
   let sourceRunId = null;
   let sourceRunAttempt = null;
   let runnerLabel = null;
+  let activationCommitment = null;
 
   if (operation === 'collect') {
     if (input.source_run_id !== '' || input.source_run_attempt !== '') {
       refuse('source_run_not_allowed_for_collect');
     }
+    if (typeof input.supervisor_activation !== 'string' || input.supervisor_activation.length === 0) {
+      refuse('activation_commitment_required');
+    }
+    if (!/^[0-9a-f]{64}$/u.test(input.supervisor_activation)) {
+      refuse('malformed_activation_commitment');
+    }
+    activationCommitment = input.supervisor_activation;
     if (typeof input.runner_label !== 'string' ||
         !/^billing-validation-[0-9a-f]{32}$/.test(input.runner_label)) {
       refuse('per_attempt_runner_label_required');
     }
     runnerLabel = input.runner_label;
   } else {
+    if (input.supervisor_activation !== '') refuse('activation_commitment_not_allowed_for_recheck');
     if (input.runner_label !== '') refuse('runner_label_not_allowed_for_recheck');
     if (typeof input.source_run_id !== 'string' || !/^[1-9][0-9]{0,19}$/.test(input.source_run_id)) {
       refuse('malformed_source_run_id');
@@ -88,5 +101,6 @@ export function parseDispatch(input, context) {
     sourceRunId,
     sourceRunAttempt,
     runnerLabel,
+    activationCommitment,
   });
 }

@@ -17,8 +17,16 @@ for (const path of workflowPaths) {
       `${path}:${jobId} must not consume secrets during bootstrap`);
     assert.ok(!/\$\{\{\s*needs\.[^}]+\.outputs\.(?:private_key|token|secret)/i.test(serializedJob),
       `${path}:${jobId} must not propagate credential-like outputs`);
-    assert.ok(!job.permissions || JSON.stringify(job.permissions) === JSON.stringify({ contents: 'read' }),
-      `${path}:${jobId} must not widen token permissions`);
+    if (path === workflowPaths[0] && jobId === 'attest-activation') {
+      assert.deepEqual(job.permissions, {
+        contents: 'read',
+        'id-token': 'write',
+        attestations: 'write',
+      }, `${path}:${jobId} must scope signing permissions to the hosted activation attestation`);
+    } else {
+      assert.ok(!job.permissions || JSON.stringify(job.permissions) === JSON.stringify({ contents: 'read' }),
+        `${path}:${jobId} must not widen token permissions`);
+    }
   }
 }
 

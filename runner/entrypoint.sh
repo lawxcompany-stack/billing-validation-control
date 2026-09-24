@@ -13,36 +13,37 @@ if [[ ! -d "$runner_home" || -L "$runner_home" || "$runner_home" != /* ]]; then
   refuse runner_home_invalid
 fi
 control_repository=${CONTROL_REPOSITORY:-}
+control_repository_id=${CONTROL_REPOSITORY_ID:-}
 control_event=${CONTROL_EVENT_NAME:-}
 control_default_branch=${CONTROL_DEFAULT_BRANCH:-}
 control_ref=${CONTROL_REF:-}
+control_workflow_path=${CONTROL_WORKFLOW_PATH:-}
 control_workflow_ref=${CONTROL_WORKFLOW_REF:-}
+control_run_id=${CONTROL_RUN_ID:-}
+control_run_attempt=${CONTROL_RUN_ATTEMPT:-}
+control_workflow_sha=${CONTROL_WORKFLOW_SHA:-}
+control_candidate_sha=${CONTROL_CANDIDATE_SHA:-}
+control_activation_commitment=${CONTROL_ACTIVATION_COMMITMENT:-}
+control_runner_label=${CONTROL_RUNNER_LABEL:-}
 control_runner_group=${CONTROL_RUNNER_GROUP:-}
 if [[ "$control_repository" != lawxcompany-stack/billing-validation-control ||
+      ! "$control_repository_id" =~ ^[1-9][0-9]{0,19}$ ||
       "$control_event" != workflow_dispatch ||
-      ! "$control_default_branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$ ||
-      "$control_default_branch" == *..* || "$control_default_branch" == *//* ||
-      "$control_default_branch" == */ || "$control_default_branch" == *. ||
-      "$control_default_branch" == *'@{'* ]]; then
-  refuse runner_workflow_context_invalid
-fi
-IFS='/' read -r -a branch_parts <<< "$control_default_branch"
-for branch_part in "${branch_parts[@]}"; do
-  if [[ -z "$branch_part" || "$branch_part" == .* || "$branch_part" == *. ||
-        "$branch_part" == *.lock ]]; then
-    refuse runner_workflow_context_invalid
-  fi
-done
-expected_ref="refs/heads/${control_default_branch}"
-expected_workflow_ref="lawxcompany-stack/billing-validation-control/.github/workflows/validate-billing.yml@${expected_ref}"
-if [[ "$control_ref" != "$expected_ref" || "$control_workflow_ref" != "$expected_workflow_ref" ||
+      "$control_default_branch" != main ||
+      "$control_ref" != refs/heads/main ||
+      "$control_workflow_path" != .github/workflows/validate-billing.yml ||
+      "$control_workflow_ref" != lawxcompany-stack/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main ||
+      ! "$control_run_id" =~ ^[1-9][0-9]{0,15}$ ||
+      ! "$control_run_attempt" =~ ^[1-9][0-9]{0,7}$ ||
+      ! "$control_workflow_sha" =~ ^[a-f0-9]{40}$ ||
+      ! "$control_candidate_sha" =~ ^[a-f0-9]{40}$ ||
+      ! "$control_activation_commitment" =~ ^[a-f0-9]{64}$ ||
+      ! "$control_runner_label" =~ ^billing-validation-[a-f0-9]{32}$ ||
       "$control_runner_group" != billing-validation-isolated ]]; then
   refuse runner_workflow_context_invalid
 fi
-if [[ ${GITHUB_REPOSITORY:-} != lawxcompany-stack/billing-validation-control ]]; then
-  refuse runner_repository_invalid
-fi
-if [[ ! ${RUNNER_LABEL:-} =~ ^billing-validation-([0-9a-f]{32})$ ]]; then
+if [[ ! "$control_runner_label" =~ ^billing-validation-([0-9a-f]{32})$ ||
+      "$control_runner_label" != "${RUNNER_LABEL:-}" ]]; then
   refuse runner_label_invalid
 fi
 if [[ -z ${RUNNER_REGISTRATION_TOKEN:-} || ${#RUNNER_REGISTRATION_TOKEN} -gt 512 ||

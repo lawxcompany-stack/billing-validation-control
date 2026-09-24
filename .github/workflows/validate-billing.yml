@@ -34,6 +34,11 @@ on:
         required: false
         type: string
         default: ''
+      supervisor_activation:
+        description: Domain-separated SHA-256 workstation activation commitment; collect only
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -70,11 +75,12 @@ jobs:
       operation: ${{ steps.authorize.outputs.operation }}
       candidate_sha: ${{ steps.authorize.outputs.candidate_sha }}
       runner_label: ${{ steps.authorize.outputs.runner_label }}
+      activation_commitment: ${{ steps.authorize.outputs.activation_commitment }}
     steps:
-      - name: Checkout protected control default branch
+      - name: Checkout exact triggering workflow SHA
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Set up Node.js 22
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -87,6 +93,7 @@ jobs:
           CONTROL_REF: ${{ github.ref }}
           CONTROL_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           CONTROL_REPOSITORY: ${{ github.repository }}
+          CONTROL_REF_PROTECTED: ${{ github.ref_protected }}
           DISPATCH_INPUTS: ${{ toJSON(inputs) }}
         run: |
           node --input-type=module <<'NODE'
@@ -98,11 +105,13 @@ jobs:
               ref: process.env.CONTROL_REF,
               defaultBranch: process.env.CONTROL_DEFAULT_BRANCH,
               repository: process.env.CONTROL_REPOSITORY,
+              refProtected: process.env.CONTROL_REF_PROTECTED === 'true',
             });
             appendFileSync(process.env.GITHUB_OUTPUT, [
               `operation=${identity.operation}`,
               `candidate_sha=${identity.candidateSha}`,
               `runner_label=${identity.runnerLabel ?? ''}`,
+              `activation_commitment=${identity.activationCommitment ?? ''}`,
               '',
             ].join('\n'));
             console.log(`Authorized ${identity.operation} dispatch for a full candidate SHA.`);
@@ -112,6 +121,47 @@ jobs:
             process.exitCode = 1;
           }
           NODE
+
+  attest-activation:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && needs.authorize.result == 'success' && needs.reader.result == 'success' && needs.authorize.outputs.operation == 'collect' }}
+    needs: [authorize, reader]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout exact triggering workflow SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Compose canonical activation subject
+        env:
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          CONTROL_REPOSITORY_ID: ${{ github.repository_id }}
+          CONTROL_REF: ${{ github.ref }}
+          CONTROL_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CONTROL_RUN_ID: ${{ github.run_id }}
+          CONTROL_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CONTROL_WORKFLOW_SHA: ${{ github.sha }}
+          CONTROL_EVENT_NAME: ${{ github.event_name }}
+          CANDIDATE_SHA: ${{ needs.authorize.outputs.candidate_sha }}
+          RUNNER_LABEL: ${{ needs.authorize.outputs.runner_label }}
+          ACTIVATION_COMMITMENT: ${{ needs.authorize.outputs.activation_commitment }}
+          ACTIVATION_MANIFEST_PATH: ${{ runner.temp }}/activation-manifest.json
+        run: node runner/write-activation-manifest.mjs
+      - name: Attest only the canonical activation subject
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # reviewed immutable pin
+        with:
+          subject-path: ${{ runner.temp }}/activation-manifest.json
+
 
   reader:
     if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' }}
@@ -128,14 +178,51 @@ jobs:
           exit 1
 
   test:
-    if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && needs.reader.result == 'success' }}
-    needs: [authorize, reader]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && needs.reader.result == 'success' && ((needs.authorize.outputs.operation == 'collect' && needs.attest-activation.result == 'success') || (needs.authorize.outputs.operation == 'recheck' && needs.attest-activation.result == 'skipped')) }}
+    needs: [authorize, reader, attest-activation]
     runs-on: ${{ needs.authorize.outputs.runner_label != '' && fromJSON(format('["self-hosted","linux","{0}"]', needs.authorize.outputs.runner_label)) || 'ubuntu-latest' }}
     environment: billing-validation-tests
     timeout-minutes: 45
     permissions:
       contents: read
     steps:
+      - name: Verify activation metadata before protected work
+        if: ${{ needs.authorize.outputs.operation == 'collect' }}
+        env:
+          BVC_GITHUB_REPOSITORY: ${{ github.repository }}
+          BVC_GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          BVC_GITHUB_EVENT_NAME: ${{ github.event_name }}
+          BVC_GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BVC_GITHUB_REF: ${{ github.ref }}
+          BVC_GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          BVC_GITHUB_RUN_ID: ${{ github.run_id }}
+          BVC_GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          BVC_GITHUB_WORKFLOW_SHA: ${{ github.sha }}
+          BVC_CANDIDATE_SHA: ${{ needs.authorize.outputs.candidate_sha }}
+          BVC_ACTIVATION_COMMITMENT: ${{ needs.authorize.outputs.activation_commitment }}
+          BVC_RUNNER_LABEL: ${{ needs.authorize.outputs.runner_label }}
+        run: |
+          node --input-type=module <<'NODE'
+          const matches = [
+            ['CONTROL_REPOSITORY', 'BVC_GITHUB_REPOSITORY'],
+            ['CONTROL_REPOSITORY_ID', 'BVC_GITHUB_REPOSITORY_ID'],
+            ['CONTROL_EVENT_NAME', 'BVC_GITHUB_EVENT_NAME'],
+            ['CONTROL_DEFAULT_BRANCH', 'BVC_GITHUB_DEFAULT_BRANCH'],
+            ['CONTROL_REF', 'BVC_GITHUB_REF'],
+            ['CONTROL_WORKFLOW_REF', 'BVC_GITHUB_WORKFLOW_REF'],
+            ['CONTROL_RUN_ID', 'BVC_GITHUB_RUN_ID'],
+            ['CONTROL_RUN_ATTEMPT', 'BVC_GITHUB_RUN_ATTEMPT'],
+            ['CONTROL_WORKFLOW_SHA', 'BVC_GITHUB_WORKFLOW_SHA'],
+            ['CONTROL_CANDIDATE_SHA', 'BVC_CANDIDATE_SHA'],
+            ['CONTROL_ACTIVATION_COMMITMENT', 'BVC_ACTIVATION_COMMITMENT'],
+            ['CONTROL_RUNNER_LABEL', 'BVC_RUNNER_LABEL'],
+          ].every(([actual, expected]) => typeof process.env[actual] === 'string' &&
+            process.env[actual] === process.env[expected]);
+          if (!matches) {
+            console.error('Activation metadata does not match this GitHub job.');
+            process.exitCode = 1;
+          }
+          NODE
       - name: Fail closed until the isolated collector is implemented
         run: |
           echo 'Billing and browser execution is not enabled by Task 1.' >&2
