@@ -5,7 +5,7 @@ import path from 'node:path';
 import { buildEgressAllowlist } from './egress-proxy.mjs';
 import { createAttemptRunnerLabel } from './container-policy.mjs';
 import { ISOLATED_DOCKER_CONTEXT } from './process-boundary.mjs';
-import { ISOLATED_RUNNER_GROUP, validateRunnerWorkflowContext } from './workflow-context.mjs';
+import { ISOLATED_RUNNER_GROUP, readTrustedRunnerWorkflowContext } from './workflow-context.mjs';
 
 const DISPLAY_NUMBER = 99;
 const DISPLAY_SOCKET = `/tmp/.X11-unix/X${DISPLAY_NUMBER}`;
@@ -379,11 +379,11 @@ async function stopDisplay(displayProcess) {
   try { await displayProcess.stop(); return false; } catch { return true; }
 }
 
-export async function runSupervisedRunner({ processBoundary, workflowContext, image, parentDisplay,
+export async function runSupervisedRunner({ processBoundary, image, parentDisplay,
   parentXauthority, additionalEgressHosts = [], getRegistrationToken, signal,
   timeoutMs = 45 * 60 * 1000 } = {}) {
-  // Reject untrusted workflow/ref/event data before any process or credential-provider access.
-  const trusted = validateRunnerWorkflowContext(workflowContext);
+  // Read trust inputs only from the Actions runtime; no caller-supplied context can authorize work.
+  const trusted = readTrustedRunnerWorkflowContext();
   if (cleanupUnverified) refuse('runner_cleanup_unverified');
   if (processBoundary && processBoundary.dockerContext !== ISOLATED_DOCKER_CONTEXT) {
     refuse('runner_docker_context_untrusted');

@@ -144,9 +144,10 @@ test('runner entrypoint refuses an unauthorized repository before consuming its 
   });
 });
 
-test('runner entrypoint refuses PR, non-default-ref, wrong-workflow and wrong-group contexts before registration', async () => {
+test('runner entrypoint refuses pull_request and pull_request_target plus wrong workflow/ref/group before registration', async () => {
   const rejected = [
     { CONTROL_EVENT_NAME: 'pull_request' },
+    { CONTROL_EVENT_NAME: 'pull_request_target' },
     { CONTROL_REF: 'refs/heads/feature', CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/feature' },
     { CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/other.yml@refs/heads/main' },
     { CONTROL_RUNNER_GROUP: 'shared-runner-group' },

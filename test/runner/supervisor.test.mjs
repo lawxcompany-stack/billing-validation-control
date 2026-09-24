@@ -8,11 +8,36 @@ const supervisor = await import('../../runner/supervisor.mjs').catch(() => ({}))
 const egress = await import('../../runner/egress-proxy.mjs').catch(() => ({}));
 const IMAGE = `sha256:${'c'.repeat(64)}`;
 const REPOSITORY = 'lawxcompany-stack/billing-validation-control';
+const WORKFLOW_REF = `${REPOSITORY}/.github/workflows/validate-billing.yml@refs/heads/main`;
+const ACTIONS_ENV_KEYS = ['GITHUB_REPOSITORY', 'GITHUB_EVENT_NAME', 'GITHUB_REF',
+  'GITHUB_WORKFLOW_REF', 'GITHUB_REF_PROTECTED'];
+const TRUSTED_ACTIONS_ENV = Object.freeze({ GITHUB_REPOSITORY: REPOSITORY,
+  GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REF: 'refs/heads/main',
+  GITHUB_WORKFLOW_REF: WORKFLOW_REF, GITHUB_REF_PROTECTED: 'true' });
 
 function workflowContext(overrides = {}) {
-  const ref = 'refs/heads/trusted-default';
-  return { repository: REPOSITORY, eventName: 'workflow_dispatch', defaultBranch: 'trusted-default', ref,
+  const ref = 'refs/heads/main';
+  return { repository: REPOSITORY, eventName: 'workflow_dispatch', defaultBranch: 'main', ref,
     workflowRef: `${REPOSITORY}/.github/workflows/validate-billing.yml@${ref}`, ...overrides };
+}
+
+async function withActionsRuntime(environment, operation) {
+  const previous = new Map(ACTIONS_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of ACTIONS_ENV_KEYS) {
+    if (Object.hasOwn(environment, key)) process.env[key] = environment[key];
+    else delete process.env[key];
+  }
+  try { return await operation(); }
+  finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+function invokeSupervisor(options, environment = TRUSTED_ACTIONS_ENV) {
+  return withActionsRuntime(environment, () => supervisor.runSupervisedRunner(options));
 }
 
 async function fixture(options = {}) {
@@ -163,19 +188,55 @@ function supervisorOptions(fx, overrides = {}) {
     getRegistrationToken: async () => 'test-only-registration-token', ...overrides };
 }
 
-test('trusted workflow context is rejected before registration credentials are requested', async () => {
+test('caller-supplied workflow context cannot authorize without Actions runtime context', async () => {
   assert.equal(typeof supervisor.runSupervisedRunner, 'function');
-  for (const context of [workflowContext({ eventName: 'pull_request' }),
-    workflowContext({ ref: 'refs/heads/feature', workflowRef: `${REPOSITORY}/.github/workflows/validate-billing.yml@refs/heads/feature` }),
-    workflowContext({ workflowRef: `${REPOSITORY}/.github/workflows/other.yml@refs/heads/trusted-default` })]) {
-    const fx = await fixture();
-    let tokenRequests = 0;
-    await assert.rejects(supervisor.runSupervisedRunner(supervisorOptions(fx, {
-      workflowContext: context, getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
-    })), { code: 'runner_workflow_context_invalid' });
+  const fx = await fixture();
+  let tokenRequests = 0;
+  try {
+    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
+      workflowContext: workflowContext(),
+      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+    }), {}), { code: 'runner_workflow_context_invalid' });
     assert.equal(tokenRequests, 0);
     assert.deepEqual(fx.state.calls, []);
-    await fx.close();
+    assert.equal(fx.state.displayStarted, false);
+  } finally { await fx.close(); }
+});
+
+test('pull_request_target runtime context is rejected before credentials or process invocation', async () => {
+  const fx = await fixture();
+  let tokenRequests = 0;
+  try {
+    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
+      workflowContext: workflowContext(),
+      getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+    }), { ...TRUSTED_ACTIONS_ENV, GITHUB_EVENT_NAME: 'pull_request_target' }),
+    { code: 'runner_workflow_context_invalid' });
+    assert.equal(tokenRequests, 0);
+    assert.deepEqual(fx.state.calls, []);
+    assert.equal(fx.state.displayStarted, false);
+  } finally { await fx.close(); }
+});
+
+test('supervisor rejects mismatched or unprotected Actions runtime context before credentials', async () => {
+  const rejected = [
+    { ...TRUSTED_ACTIONS_ENV, GITHUB_REPOSITORY: 'untrusted/candidate' },
+    { ...TRUSTED_ACTIONS_ENV, GITHUB_EVENT_NAME: 'pull_request' },
+    { ...TRUSTED_ACTIONS_ENV, GITHUB_REF: 'refs/heads/feature' },
+    { ...TRUSTED_ACTIONS_ENV, GITHUB_WORKFLOW_REF: `${REPOSITORY}/.github/workflows/other.yml@refs/heads/main` },
+    { ...TRUSTED_ACTIONS_ENV, GITHUB_REF_PROTECTED: 'false' },
+  ];
+  for (const environment of rejected) {
+    const fx = await fixture();
+    let tokenRequests = 0;
+    try {
+      await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
+        getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
+      }), environment), { code: 'runner_workflow_context_invalid' });
+      assert.equal(tokenRequests, 0);
+      assert.deepEqual(fx.state.calls, []);
+      assert.equal(fx.state.displayStarted, false);
+    } finally { await fx.close(); }
   }
 });
 
@@ -183,7 +244,7 @@ test('supervisor refuses process boundaries not bound to the isolated Docker con
   const fx = await fixture();
   let tokenRequests = 0;
   try {
-    await assert.rejects(supervisor.runSupervisedRunner(supervisorOptions(fx, {
+    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
       processBoundary: { ...fx.boundary, dockerContext: 'default' },
       getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
     })), { code: 'runner_docker_context_untrusted' });
@@ -196,7 +257,7 @@ test('supervisor creates and inspects isolated networks, proxy, display and one-
   assert.equal(typeof supervisor.runSupervisedRunner, 'function');
   const fx = await fixture();
   try {
-    const result = await supervisor.runSupervisedRunner(supervisorOptions(fx));
+    const result = await invokeSupervisor(supervisorOptions(fx));
     assert.match(result.runnerLabel, /^billing-validation-[0-9a-f]{32}$/u);
     assert.equal(result.exitCode, 0);
     assert.equal(fx.state.runnerStarted, true);
@@ -218,7 +279,7 @@ test('supervisor refuses unsafe inspected network topology without consuming run
   const fx = await fixture({ badInternal: true });
   let tokenRequests = 0;
   try {
-    await assert.rejects(supervisor.runSupervisedRunner(supervisorOptions(fx, {
+    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
       getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
       internalState: { Internal: true, Containers: {} },
     })), { code: 'runner_network_not_internal' });
@@ -232,7 +293,7 @@ test('supervisor refuses unexpected network peers and runner host mounts or exte
   for (const state of [{ unexpectedPeer: true }, { extraRunnerMount: true }, { runnerOnExternal: true }]) {
     const fx = await fixture(state);
     try {
-      await assert.rejects(supervisor.runSupervisedRunner(supervisorOptions(fx)));
+      await assert.rejects(invokeSupervisor(supervisorOptions(fx)));
       assert.equal(fx.state.runnerStarted, false);
       assert.equal(fx.state.networks.size, 0);
       assert.equal(fx.state.containers.size, 0);
@@ -245,7 +306,7 @@ test('runner container receives headed display and Xauthority paths from the ver
   assert.equal(typeof supervisor.runSupervisedRunner, 'function');
   const fx = await fixture();
   try {
-    await supervisor.runSupervisedRunner(supervisorOptions(fx));
+    await invokeSupervisor(supervisorOptions(fx));
     const runnerCreate = fx.state.calls.find(({ group, action, rest }) => group === 'create' && rest.some((arg) => String(arg).endsWith('-runner')));
     assert.ok(runnerCreate);
     assert.ok(runnerCreate.rest.some((arg) => arg === 'DISPLAY=:99'));
@@ -259,7 +320,7 @@ test('timeout and cancellation still attempt runner, proxy, network, display and
     const fx = await fixture({ blockRunnerWait: true });
     const controller = new AbortController();
     try {
-      const run = supervisor.runSupervisedRunner(supervisorOptions(fx, mode === 'cancel'
+      const run = invokeSupervisor(supervisorOptions(fx, mode === 'cancel'
         ? { signal: controller.signal } : { timeoutMs: 250 }));
       await fx.runnerWaitStarted;
       if (mode === 'cancel') controller.abort();
@@ -276,7 +337,7 @@ test('supervisor refuses pre-existing labeled resources without deleting or reus
   const fx = await fixture({ staleContainer: true });
   let tokenRequests = 0;
   try {
-    await assert.rejects(supervisor.runSupervisedRunner(supervisorOptions(fx, {
+    await assert.rejects(invokeSupervisor(supervisorOptions(fx, {
       getRegistrationToken: async () => { tokenRequests += 1; return 'test-only-registration-token'; },
     })), { code: 'runner_stale_resources_present' });
     assert.equal(tokenRequests, 0);
@@ -303,11 +364,11 @@ test('ambiguous cleanup latches the supervisor closed before another attempt can
   assert.equal(typeof supervisor.runSupervisedRunner, 'function');
   const fx = await fixture({ failNetworkRemove: true });
   try {
-    await assert.rejects(supervisor.runSupervisedRunner(supervisorOptions(fx)),
+    await assert.rejects(invokeSupervisor(supervisorOptions(fx)),
       { code: 'runner_cleanup_failed' });
     assert.equal(fx.state.displayStopped, true);
     const callsAfterFailure = fx.state.calls.length;
-    await assert.rejects(supervisor.runSupervisedRunner(supervisorOptions(fx)),
+    await assert.rejects(invokeSupervisor(supervisorOptions(fx)),
       { code: 'runner_cleanup_unverified' });
     assert.equal(fx.state.calls.length, callsAfterFailure);
   } finally { await fx.close(); }

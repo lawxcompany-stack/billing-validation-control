@@ -1,5 +1,6 @@
 export const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
 export const CONTROL_WORKFLOW_PATH = '.github/workflows/validate-billing.yml';
+export const CONTROL_DEFAULT_BRANCH = 'main';
 export const ISOLATED_RUNNER_GROUP = 'billing-validation-isolated';
 
 export class WorkflowContextRefusal extends Error {
@@ -10,26 +11,18 @@ export class WorkflowContextRefusal extends Error {
   }
 }
 
-function validBranch(branch) {
-  if (typeof branch !== 'string' || branch.length < 1 || branch.length > 128 ||
-      !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/u.test(branch) || branch.startsWith('/') ||
-      branch.endsWith('/') || branch.endsWith('.') || branch.includes('..') ||
-      branch.includes('//') || branch.includes('@{')) return false;
-  return branch.split('/').every((part) => part.length > 0 && !part.startsWith('.') &&
-    !part.endsWith('.') && !part.endsWith('.lock'));
-}
-
-export function validateRunnerWorkflowContext(context) {
-  if (!context || typeof context !== 'object' || Array.isArray(context) ||
-      context.repository !== CONTROL_REPOSITORY || context.eventName !== 'workflow_dispatch' ||
-      !validBranch(context.defaultBranch)) throw new WorkflowContextRefusal();
-
-  const expectedRef = `refs/heads/${context.defaultBranch}`;
+export function readTrustedRunnerWorkflowContext() {
+  const environment = process.env;
+  const expectedRef = `refs/heads/${CONTROL_DEFAULT_BRANCH}`;
   const expectedWorkflowRef = `${CONTROL_REPOSITORY}/${CONTROL_WORKFLOW_PATH}@${expectedRef}`;
-  if (context.ref !== expectedRef || context.workflowRef !== expectedWorkflowRef) {
+  if (environment.GITHUB_REPOSITORY !== CONTROL_REPOSITORY ||
+      environment.GITHUB_EVENT_NAME !== 'workflow_dispatch' ||
+      environment.GITHUB_REF !== expectedRef ||
+      environment.GITHUB_WORKFLOW_REF !== expectedWorkflowRef ||
+      environment.GITHUB_REF_PROTECTED !== 'true') {
     throw new WorkflowContextRefusal();
   }
   return Object.freeze({ repository: CONTROL_REPOSITORY, eventName: 'workflow_dispatch',
-    defaultBranch: context.defaultBranch, ref: expectedRef, workflowRef: expectedWorkflowRef,
+    defaultBranch: CONTROL_DEFAULT_BRANCH, ref: expectedRef, workflowRef: expectedWorkflowRef,
     runnerGroup: ISOLATED_RUNNER_GROUP });
 }
