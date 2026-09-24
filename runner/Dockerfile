@@ -21,11 +21,14 @@ RUN set -eu; \
     mkdir -p /opt/actions-runner; \
     tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner; \
     rm -f /tmp/actions-runner.tar.gz; \
+    mkdir -p /run/billing-validation /tmp/.X11-unix /opt/billing-validation; \
+    touch /run/billing-validation/Xauthority; \
     groupadd --gid 10001 billing-runner; \
     useradd --uid 10001 --gid 10001 --create-home --home-dir /home/billing-runner --shell /usr/sbin/nologin billing-runner; \
-    chown -R 10001:10001 /opt/actions-runner /home/billing-runner
+    chown -R 10001:10001 /opt/actions-runner /home/billing-runner /run/billing-validation /opt/billing-validation
 
 COPY --chmod=0555 entrypoint.sh /usr/local/bin/billing-validation-runner
+COPY --chmod=0555 egress-proxy.mjs /opt/billing-validation/egress-proxy.mjs
 
 ENV ACTIONS_RUNNER_HOME=/opt/actions-runner
 WORKDIR /opt/actions-runner

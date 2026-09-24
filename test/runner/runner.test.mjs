@@ -24,8 +24,12 @@ test('runner image pins matching Playwright and checksums the exact ephemeral ru
   assert.match(dockerfile, /sha256sum\s+-c/u);
   assert.match(dockerfile, /USER 10001:10001/u);
   assert.match(dockerfile, /COPY --chmod=0555 entrypoint\.sh/u);
+  assert.match(dockerfile, /COPY --chmod=0555 egress-proxy\.mjs/u);
+  assert.match(dockerfile, /\/run\/billing-validation\/Xauthority/u);
+  assert.match(dockerfile, /\/tmp\/\.X11-unix/u);
   assert.match(dockerignore, /^\*\*$/mu);
   assert.match(dockerignore, /^!entrypoint\.sh$/mu);
+  assert.match(dockerignore, /^!egress-proxy\.mjs$/mu);
   assert.match(dockerignore, /^!Dockerfile$/mu);
   assert.doesNotMatch(dockerfile, /\blatest\b|\/var\/run\/docker\.sock|--network\s+host|\bVOLUME\b/iu);
 });
@@ -38,6 +42,10 @@ test('runner entrypoint requires the unique per-attempt label and configures one
   assert.match(entrypoint, /--disableupdate/u);
   assert.match(entrypoint, /--no-default-labels/u);
   assert.match(entrypoint, /--once/u);
+  assert.match(entrypoint, /--runnergroup/u);
+  assert.match(entrypoint, /CONTROL_EVENT_NAME/u);
+  assert.match(entrypoint, /CONTROL_WORKFLOW_REF/u);
+  assert.match(entrypoint, /CONTROL_DEFAULT_BRANCH/u);
   assert.doesNotMatch(entrypoint, /--replace|--network\s+host|\/var\/run\/docker\.sock/iu);
   assert.match(entrypoint, /unset\s+RUNNER_REGISTRATION_TOKEN/u);
 });
@@ -77,6 +85,11 @@ exit "$BVC_TEST_RUN_STATUS"
   ]));
   const env = { ...process.env, ACTIONS_RUNNER_HOME: runnerHome,
     GITHUB_REPOSITORY: 'lawxcompany-stack/billing-validation-control',
+    CONTROL_REPOSITORY: 'lawxcompany-stack/billing-validation-control',
+    CONTROL_EVENT_NAME: 'workflow_dispatch', CONTROL_DEFAULT_BRANCH: 'main',
+    CONTROL_REF: 'refs/heads/main',
+    CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main',
+    CONTROL_RUNNER_GROUP: 'billing-validation-isolated',
     RUNNER_LABEL: runnerLabel, RUNNER_REGISTRATION_TOKEN: registrationToken,
     BVC_TEST_CONFIG_CAPTURE: capturePath, BVC_TEST_RUNNER_STARTED: path.join(runnerHome, 'runner-started'),
     BVC_TEST_BLOCK_RUNNER: 'no', BVC_TEST_RUN_STATUS: String(runStatus) };
@@ -93,6 +106,7 @@ test('mocked ephemeral runner success and failure scrub credentials and preserve
     assert.match(configArgs, /--ephemeral/u);
     assert.match(configArgs, /--disableupdate/u);
     assert.match(configArgs, /--no-default-labels/u);
+    assert.match(configArgs, /--runnergroup\nbilling-validation-isolated/u);
     assert.match(configArgs, /--labels/u);
     assert.match(configArgs, /\[redacted\]/u);
     assert.doesNotMatch(configArgs, /placeholder-value-not-a-credential/u);
@@ -128,6 +142,24 @@ test('runner entrypoint refuses an unauthorized repository before consuming its 
     await assert.rejects(access(capturePath));
     await assert.rejects(access(path.join(runnerHome, '.credentials')));
   });
+});
+
+test('runner entrypoint refuses PR, non-default-ref, wrong-workflow and wrong-group contexts before registration', async () => {
+  const rejected = [
+    { CONTROL_EVENT_NAME: 'pull_request' },
+    { CONTROL_REF: 'refs/heads/feature', CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/feature' },
+    { CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/other.yml@refs/heads/main' },
+    { CONTROL_RUNNER_GROUP: 'shared-runner-group' },
+  ];
+  for (const override of rejected) {
+    await withFakeRunner(0, async ({ env, runnerHome, capturePath }) => {
+      const result = spawnSync('bash', [entrypointPath], { env: { ...env, ...override }, encoding: 'utf8' });
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(`${result.stdout}${result.stderr}`, /placeholder-value-not-a-credential/u);
+      await assert.rejects(access(capturePath));
+      await assert.rejects(access(path.join(runnerHome, '.credentials')));
+    });
+  }
 });
 
 test('runner entrypoint handles cancellation and removes one-job credentials', async () => {
