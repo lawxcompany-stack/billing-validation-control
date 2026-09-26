@@ -431,29 +431,75 @@ export function parseEvidenceArchive(archive, { digest, expected } = {}) {
   return evidence;
 }
 
-function hasExactOwnKeys(value, keys) {
-  if (!isObject(value)) return false;
-  let ownKeys;
-  try { ownKeys = Reflect.ownKeys(value); } catch { return false; }
-  return ownKeys.length === keys.length && ownKeys.every((key) =>
-    typeof key === 'string' && keys.includes(key));
+function snapshotExactDataRecord(value, keys) {
+  let record;
+  try { record = isObject(value); } catch { return null; }
+  if (!record) return null;
+
+  let descriptors;
+  try { descriptors = Object.getOwnPropertyDescriptors(value); } catch { return null; }
+  const ownKeys = Reflect.ownKeys(descriptors);
+  if (ownKeys.length !== keys.length || ownKeys.some((key) =>
+    typeof key !== 'string' || !keys.includes(key))) return null;
+
+  const snapshot = Object.create(null);
+  for (const key of keys) {
+    const descriptor = descriptors[key];
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) return null;
+    snapshot[key] = descriptor.value;
+  }
+  return Object.freeze(snapshot);
 }
 
 function safeBilling43OpaqueId(value) {
   return typeof value === 'string' && BILLING_43_OPAQUE_ID.test(value) && !SENSITIVE_ID_FRAGMENT.test(value);
 }
 
-function isDenseArray(value) {
-  if (!Array.isArray(value)) return false;
-  let keys;
-  try { keys = Reflect.ownKeys(value); } catch { return false; }
-  return keys.length === value.length + 1 && keys.includes('length') &&
-    keys.every((key) => key === 'length' || (typeof key === 'string' &&
-      /^(?:0|[1-9]\d*)$/u.test(key) && Number(key) < value.length));
+function snapshotDenseArray(value) {
+  let array;
+  try { array = Array.isArray(value); } catch { return null; }
+  if (!array) return null;
+
+  let descriptors;
+  try { descriptors = Object.getOwnPropertyDescriptors(value); } catch { return null; }
+  const keys = Reflect.ownKeys(descriptors);
+  const lengthDescriptor = descriptors.length;
+  if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, 'value')) return null;
+  const length = lengthDescriptor.value;
+  if (!Number.isSafeInteger(length) || length < 0 || keys.length !== length + 1 ||
+      keys.some((key) => key !== 'length' && (typeof key !== 'string' ||
+        !/^(?:0|[1-9]\d*)$/u.test(key) || Number(key) >= length))) return null;
+
+  const snapshot = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) return null;
+    snapshot.push(descriptor.value);
+  }
+  return Object.freeze(snapshot);
+}
+
+function snapshotBilling43Options(options) {
+  let record;
+  try { record = isObject(options); } catch { return null; }
+  if (!record) return null;
+
+  let descriptors;
+  try { descriptors = Object.getOwnPropertyDescriptors(options); } catch { return null; }
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some((key) => key !== 'ownedResourceIds')) return null;
+
+  const snapshot = Object.create(null);
+  if (Object.hasOwn(descriptors, 'ownedResourceIds')) {
+    const descriptor = descriptors.ownedResourceIds;
+    if (!Object.hasOwn(descriptor, 'value')) return null;
+    snapshot.ownedResourceIds = descriptor.value;
+  }
+  return Object.freeze(snapshot);
 }
 
 function validBilling43Evidence(evidence, requiredKinds) {
-  if (!isDenseArray(evidence) || evidence.length !== requiredKinds.length) return false;
+  if (evidence.length !== requiredKinds.length) return false;
   for (let index = 0; index < requiredKinds.length; index += 1) {
     if (evidence[index] !== requiredKinds[index]) return false;
   }
@@ -461,43 +507,55 @@ function validBilling43Evidence(evidence, requiredKinds) {
 }
 
 function validBilling43ResourceIds(resourceIds, ownedResourceIds) {
-  return isDenseArray(resourceIds) && new Set(resourceIds).size === resourceIds.length &&
-    resourceIds.every((id) => safeBilling43OpaqueId(id) && ownedResourceIds.has(id));
+  const seen = new Set();
+  for (const id of resourceIds) {
+    if (!safeBilling43OpaqueId(id) || !ownedResourceIds.has(id) || seen.has(id)) return false;
+    seen.add(id);
+  }
+  return true;
 }
 
 export function validateBilling43Results(results, options = {}) {
-  if (!isDenseArray(results) || results.length !== BILLING_43_IDS.length) {
+  const resultList = snapshotDenseArray(results);
+  if (!resultList || resultList.length !== BILLING_43_IDS.length) {
     refuse('billing_result_invalid');
   }
-  if (!isObject(options)) {
+  const optionSnapshot = snapshotBilling43Options(options);
+  if (!optionSnapshot) {
     refuse('billing_result_invalid');
   }
-  let optionKeys;
-  try { optionKeys = Reflect.ownKeys(options); } catch { refuse('billing_result_invalid'); }
-  if (optionKeys.some((key) => key !== 'ownedResourceIds')) refuse('billing_result_invalid');
-  const ownedResourceIds = options.ownedResourceIds ?? [];
+  const ownedResourceIdsValue = optionSnapshot.ownedResourceIds;
+  const ownedResourceIds = ownedResourceIdsValue == null
+    ? Object.freeze([])
+    : snapshotDenseArray(ownedResourceIdsValue);
 
-  if (!isDenseArray(ownedResourceIds) || new Set(ownedResourceIds).size !== ownedResourceIds.length ||
-      !ownedResourceIds.every(safeBilling43OpaqueId)) {
+  if (!ownedResourceIds) {
     refuse('billing_result_invalid');
   }
-  const ownedIds = new Set(ownedResourceIds);
+  const ownedIds = new Set();
+  for (const id of ownedResourceIds) {
+    if (!safeBilling43OpaqueId(id) || ownedIds.has(id)) refuse('billing_result_invalid');
+    ownedIds.add(id);
+  }
 
   const normalized = [];
   for (let index = 0; index < BILLING_43_IDS.length; index += 1) {
-    const result = results[index];
+    const result = snapshotExactDataRecord(resultList[index], BILLING_43_RESULT_KEYS);
     const id = BILLING_43_IDS[index];
-    if (!hasExactOwnKeys(result, BILLING_43_RESULT_KEYS) || result.id !== id || result.status !== 'passed' ||
-        !validBilling43Evidence(result.evidence, FINANCIAL_EVIDENCE_REQUIREMENTS[id]) ||
-        !validBilling43ResourceIds(result.resourceIds, ownedIds)) {
+    if (!result) refuse('billing_result_invalid');
+    const evidence = snapshotDenseArray(result.evidence);
+    const resourceIds = snapshotDenseArray(result.resourceIds);
+    if (!evidence || !resourceIds || result.id !== id || result.status !== 'passed' ||
+        !validBilling43Evidence(evidence, FINANCIAL_EVIDENCE_REQUIREMENTS[id]) ||
+        !validBilling43ResourceIds(resourceIds, ownedIds)) {
       refuse('billing_result_invalid');
     }
 
     normalized.push(Object.freeze({
       id,
       status: 'passed',
-      evidence: Object.freeze([...result.evidence]),
-      resourceIds: Object.freeze([...result.resourceIds]),
+      evidence,
+      resourceIds,
     }));
   }
   return Object.freeze(normalized);
