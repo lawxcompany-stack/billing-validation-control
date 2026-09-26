@@ -40,14 +40,22 @@ test('local PostgreSQL runner passes credentials only in environment and sends S
   const connectionUrl = 'postgres://tester:private-value@localhost:55432/billing_test';
   const schemaSql = readFileSync(new URL('../../src/attempts/schema.sql', import.meta.url), 'utf8');
   let invocation;
-  runRetentionValidation({ connectionUrl, schemaSql, spawn: (...args) => {
-    invocation = args;
-    return { status: 0, stdout: '', stderr: '' };
-  } });
+  const inheritedService = process.env.PGSERVICE;
+  process.env.PGSERVICE = 'must-not-be-inherited';
+  try {
+    runRetentionValidation({ connectionUrl, schemaSql, spawn: (...args) => {
+      invocation = args;
+      return { status: 0, stdout: '', stderr: '' };
+    } });
+  } finally {
+    if (inheritedService === undefined) delete process.env.PGSERVICE;
+    else process.env.PGSERVICE = inheritedService;
+  }
 
   assert.equal(invocation[0], 'psql');
   assert.equal(invocation[1].includes(connectionUrl), false);
   assert.equal(invocation[1].includes('private-value'), false);
+  assert.equal(Object.hasOwn(invocation[2].env, 'PGSERVICE'), false);
   assert.equal(invocation[2].env.PGHOSTADDR, '127.0.0.1');
   assert.equal(invocation[2].env.PGPORT, '55432');
   assert.equal(invocation[2].env.PGPASSWORD, 'private-value');

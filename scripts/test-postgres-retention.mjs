@@ -82,8 +82,10 @@ ROLLBACK;
 }
 
 function psqlEnvironment(connection) {
+  const environment = { ...process.env };
+  delete environment.PGSERVICE;
   return {
-    ...process.env,
+    ...environment,
     PGHOST: connection.hostAddress,
     PGHOSTADDR: connection.hostAddress,
     PGPORT: connection.port,
@@ -92,7 +94,6 @@ function psqlEnvironment(connection) {
     PGDATABASE: connection.database,
     PGSSLMODE: 'disable',
     PGCONNECT_TIMEOUT: '5',
-    PGSERVICE: '',
     PGSERVICEFILE: '/dev/null',
     PGPASSFILE: '/dev/null',
   };
