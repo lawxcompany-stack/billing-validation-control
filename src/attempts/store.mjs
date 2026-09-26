@@ -33,6 +33,54 @@ function ownDataValue(value, key) {
   } catch { return undefined; }
 }
 
+function exactDataRecord(value, expectedKeys) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  let prototype;
+  let keys;
+  try {
+    prototype = Object.getPrototypeOf(value);
+    keys = Reflect.ownKeys(value);
+  } catch { return null; }
+  if ((prototype !== Object.prototype && prototype !== null) || keys.length !== expectedKeys.length ||
+      keys.some((key) => typeof key !== 'string' || !expectedKeys.includes(key))) return null;
+  const values = Object.create(null);
+  try {
+    for (const key of expectedKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || descriptor.enumerable !== true) return null;
+      values[key] = descriptor.value;
+    }
+  } catch { return null; }
+  return values;
+}
+
+function snapshotEnvironment(value) {
+  const fields = exactDataRecord(value, ['database', 'deployment', 'stripe']);
+  if (!fields) return null;
+  const database = exactDataRecord(fields.database, ['projectRef', 'branchId']);
+  const deployment = exactDataRecord(fields.deployment, ['id', 'origin']);
+  const stripe = exactDataRecord(fields.stripe, ['accountId']);
+  if (!database || !deployment || !stripe) return null;
+  const snapshot = Object.freeze({
+    database: Object.freeze({ projectRef: database.projectRef, branchId: database.branchId }),
+    deployment: Object.freeze({ id: deployment.id, origin: deployment.origin }),
+    stripe: Object.freeze({ accountId: stripe.accountId }),
+  });
+  return isValidExpectedEnvironment(snapshot) ? snapshot : null;
+}
+
+function expectedEnvironmentSnapshot(adapter) {
+  let descriptor;
+  try { descriptor = Object.getOwnPropertyDescriptor(adapter, 'expectedEnvironment'); }
+  catch { refuse('store_client_invalid'); }
+  if (!descriptor) return null;
+  if (!Object.hasOwn(descriptor, 'value')) refuse('store_client_invalid');
+  if (descriptor.value === undefined) return null;
+  const snapshot = snapshotEnvironment(descriptor.value);
+  if (!snapshot) refuse('store_client_invalid');
+  return snapshot;
+}
+
 function snapshotUsage(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   let keys;
@@ -125,20 +173,21 @@ function admissionResult(row, fence, reservation) {
 
 export function createAttemptStore(adapter) {
   if (!adapter || typeof adapter.transaction !== 'function') refuse('store_client_invalid');
+  const expectedEnvironment = expectedEnvironmentSnapshot(adapter);
   return {
     async prepare(input) {
       const retention = validateRetentionConfiguration(ownDataValue(input, 'retentionPolicy'),
         ownDataValue(input, 'projection'));
-      const { attemptId, key, candidateSha, workflow, environment, ttlSeconds } = input ?? {};
+      const attemptId = ownDataValue(input, 'attemptId');
+      const key = ownDataValue(input, 'key');
+      const candidateSha = ownDataValue(input, 'candidateSha');
+      const workflow = ownDataValue(input, 'workflow');
+      const environment = snapshotEnvironment(ownDataValue(input, 'environment'));
+      const ttlSeconds = ownDataValue(input, 'ttlSeconds');
       if (!safeId(attemptId) || !validKey(key) || !/^[a-f0-9]{40}$/.test(candidateSha ?? '') ||
           !validTtl(ttlSeconds) || !validWorkflow(workflow) || !isValidExpectedEnvironment(environment) ||
           key.branchId !== environment.database.branchId ||
-          (adapter.expectedEnvironment && (
-            environment.database.projectRef !== adapter.expectedEnvironment.database.projectRef ||
-            environment.database.branchId !== adapter.expectedEnvironment.database.branchId ||
-            environment.deployment.id !== adapter.expectedEnvironment.deployment.id ||
-            environment.deployment.origin !== adapter.expectedEnvironment.deployment.origin ||
-            environment.stripe.accountId !== adapter.expectedEnvironment.stripe.accountId))) {
+          (expectedEnvironment && !equal(environment, expectedEnvironment))) {
         refuse('attempt_input_invalid');
       }
       return adapter.transaction(async (tx) => {

@@ -21,13 +21,19 @@ const projection = { attempts: 1, databaseRows: 10, authUsers: 1, stripeObjects:
 
 function recordingClient() {
   const calls = [];
+  const transactions = [];
   const client = { calls, async transaction(fn) {
+    const transactionCalls = [];
+    transactions.push(transactionCalls);
     return fn({ async query(sql, values) {
-      calls.push({ sql, values });
+      const call = { sql, values };
+      calls.push(call);
+      transactionCalls.push(call);
       if (/clock_timestamp/.test(sql) && /SELECT/.test(sql)) return { rows: [{ now: 1000 }] };
       return { rows: [], rowCount: 1 };
     } });
   } };
+  client.transactions = transactions;
   return client;
 }
 
@@ -99,10 +105,29 @@ test('schema installer refuses null or coerced child identity fields before DDL'
 test('verified installer issues only the dedicated control schema DDL', async () => {
   const client = recordingClient();
   await installAttemptSchema({ client, preflight, target });
-  assert.equal(client.calls.length, 1);
-  assert.match(client.calls[0].sql, /CREATE SCHEMA IF NOT EXISTS billing_validation_control/);
-  assert.equal([...client.calls[0].sql.matchAll(/CREATE TABLE IF NOT EXISTS ([\w.]+)/g)]
+  assert.equal(client.transactions.length, 1);
+  assert.equal(client.transactions[0][0].sql, 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+  assert.equal(client.transactions[0].length, 2);
+  assert.match(client.transactions[0][1].sql, /CREATE SCHEMA IF NOT EXISTS billing_validation_control/);
+  assert.equal([...client.transactions[0][1].sql.matchAll(/CREATE TABLE IF NOT EXISTS ([\w.]+)/g)]
     .every((match) => match[1].startsWith('billing_validation_control.')), true);
+});
+
+test('every PostgreSQL store transaction starts at READ COMMITTED before its first read or lock', async () => {
+  const client = recordingClient();
+  const store = createPostgresAttemptStore({ client, preflight, target });
+  await store.prepare({ attemptId: 'attempt-a',
+    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-a' },
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+      ref: 'refs/heads/main', runId: '100', runAttempt: 1,
+      runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
+    environment: preflight.expectedEnvironment, ttlSeconds: 60, retentionPolicy, projection });
+  await store.getAttempt('attempt-a');
+
+  assert.equal(client.transactions.length, 2);
+  for (const transaction of client.transactions) {
+    assert.equal(transaction[0].sql, 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+  }
 });
 
 test('schema gives fixture leases the exact shared key and fences owner rows', () => {
@@ -134,6 +159,16 @@ test('schema stores append-only retention reservations and terminal receipts wit
   assert.match(sql, /REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control\.retention_reservations/);
   assert.match(sql, /REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control\.retention_receipts/);
   assert.doesNotMatch(sql, /retention_reservations[\s\S]{0,500}expires_at/);
+});
+
+test('SQL retention validation rejects decimal-formatted integers before counting them', () => {
+  const sql = readFileSync(new URL('../../src/attempts/schema.sql', import.meta.url), 'utf8');
+  const validator = sql.match(/CREATE OR REPLACE FUNCTION billing_validation_control\.valid_retention_usage[\s\S]*?\$\$([\s\S]*?)\$\$;/)?.[1];
+  assert.ok(validator);
+  const canonicalIntegerPattern = validator.match(/item\.value::text !~ '([^']+)'/)?.[1];
+  assert.equal(canonicalIntegerPattern, '^(0|[1-9][0-9]*)$');
+  assert.equal(new RegExp(canonicalIntegerPattern).test('2.0'), false);
+  assert.ok(validator.indexOf("item.value::text !~") < validator.indexOf("units := (item.value #>> '{}')::numeric"));
 });
 
 test('zero-row conflicting attempt insert cannot create an orphan fixture lease', async () => {
@@ -289,6 +324,33 @@ test('PostgreSQL admission refuses projected overflow before persisting an attem
     retentionPolicy: { version: 1, quotas: { attempts: 10, databaseRows: 10, authUsers: 10, stripeObjects: 10 } },
     projection: { attempts: 1, databaseRows: 4, authUsers: 1, stripeObjects: 2 },
   }), { code: 'retention_capacity_exceeded' });
+  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.attempts')), false);
+  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.retention_reservations')), false);
+  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.fixture_leases')), false);
+});
+
+test('PostgreSQL admission refuses decimal-formatted integer usage instead of counting it ambiguously', async () => {
+  const calls = [];
+  const client = { async transaction(fn) {
+    return fn({ async query(sql, values) {
+      calls.push({ sql, values });
+      if (sql.includes('retention_capacity_snapshot')) return { rows: [
+        { bucket: 'committed', quota_key: 'databaseRows', units: '2.0' },
+      ] };
+      if (/clock_timestamp/.test(sql) && /SELECT/.test(sql)) return { rows: [{ now: 1000 }] };
+      return { rows: [], rowCount: 1 };
+    } });
+  } };
+  const store = createPostgresAttemptStore({ client, preflight, target });
+  await assert.rejects(store.prepare({ attemptId: 'attempt-a',
+    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-a' },
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+      ref: 'refs/heads/main', runId: '100', runAttempt: 1,
+      runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
+    environment: preflight.expectedEnvironment, ttlSeconds: 60,
+    retentionPolicy: { version: 1, quotas: { attempts: 10, databaseRows: 10, authUsers: 10, stripeObjects: 10 } },
+    projection: { attempts: 1, databaseRows: 4, authUsers: 1, stripeObjects: 2 },
+  }), { code: 'retention_ledger_invalid' });
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.attempts')), false);
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.retention_reservations')), false);
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.fixture_leases')), false);

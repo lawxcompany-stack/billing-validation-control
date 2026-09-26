@@ -20,7 +20,9 @@ BEGIN
     RETURN false;
   END IF;
   FOR item IN SELECT key, value FROM jsonb_each(document) LOOP
-    IF jsonb_typeof(item.value) <> 'number' THEN RETURN false; END IF;
+    IF jsonb_typeof(item.value) <> 'number' OR item.value::text !~ '^(0|[1-9][0-9]*)$' THEN
+      RETURN false;
+    END IF;
     units := (item.value #>> '{}')::numeric;
     IF units < minimum_units OR trunc(units) <> units OR units > 9007199254740991 THEN
       RETURN false;

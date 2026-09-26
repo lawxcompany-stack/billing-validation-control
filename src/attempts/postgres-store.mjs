@@ -104,6 +104,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
   return { verifyRecovery, verifyCleanup, verifyRetentionReceipt, expectedEnvironment,
     transaction: (fn) => client.transaction(async (queryClient) => {
     if (typeof queryClient?.query !== 'function') refuse('store_client_invalid');
+    await queryClient.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
     const tx = {
       async lockAttempt(attemptId) {
         await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
@@ -287,6 +288,7 @@ export async function installAttemptSchema({ client, preflight, target } = {}) {
   const ddl = await readFile(new URL('./schema.sql', import.meta.url), 'utf8');
   return client.transaction(async (queryClient) => {
     if (typeof queryClient?.query !== 'function') refuse('store_client_invalid');
+    await queryClient.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
     return queryClient.query(ddl);
   });
 }

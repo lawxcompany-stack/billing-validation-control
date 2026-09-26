@@ -40,6 +40,7 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
   let cleanupVerified = true;
   let retentionReconcilerVerified = trustedRetentionReconciler;
   let tail = Promise.resolve();
+  let transactionCount = 0;
   const snapshot = () => ({ attempts: structuredClone(attempts), leases: structuredClone(leases),
     reservations: structuredClone(reservations), receipts: structuredClone(receipts) });
   const sameScope = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -50,6 +51,7 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
   };
   return {
     attempts, leases, reservations, receipts, advance: (seconds) => { clock += seconds; },
+    transactionCount: () => transactionCount,
     setRecovery: (value) => { recovery = value; },
     setCleanupVerified: (value) => { cleanupVerified = value; },
     setRetentionReconcilerVerified: (value) => { retentionReconcilerVerified = value; },
@@ -57,6 +59,7 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
     ...(trustedRecovery ? { verifyRecovery: async () => recovery } : {}),
     verifyRetentionReceipt: async () => retentionReconcilerVerified,
     async transaction(fn) {
+      transactionCount++;
       const previous = tail;
       let unlock;
       tail = new Promise((resolve) => { unlock = resolve; });
@@ -339,6 +342,56 @@ test('prepare refuses untrusted metadata fields and malformed stable identities'
   } }), { code: 'attempt_input_invalid' });
   await assert.rejects(prepareAttempt(store, { ...input(), key: { ...key, suite: 'bad suite' } }),
   { code: 'attempt_input_invalid' });
+});
+
+test('prepare rejects environment accessors without invoking them or entering a write transaction', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  let getterCalls = 0;
+  const stripe = Object.defineProperty({}, 'accountId', {
+    enumerable: true,
+    get() { getterCalls++; return environment.stripe.accountId; },
+  });
+  const unsafeEnvironment = { database: { ...environment.database },
+    deployment: { ...environment.deployment }, stripe };
+
+  await assert.rejects(prepareAttempt(store, { ...input(), environment: unsafeEnvironment }),
+    { code: 'attempt_input_invalid' });
+  assert.equal(getterCalls, 0);
+  assert.equal(adapter.transactionCount(), 0);
+  assert.equal(adapter.attempts.size, 0);
+  assert.equal(adapter.reservations.size, 0);
+  assert.equal(adapter.leases.size, 0);
+});
+
+test('prepare uses one detached environment snapshot for target validation, attempt, and retention scope', async () => {
+  const adapter = fakeAdapter();
+  const expectedEnvironment = structuredClone(environment);
+  adapter.expectedEnvironment = expectedEnvironment;
+  const store = createAttemptStore(adapter);
+  const mutableEnvironment = structuredClone(environment);
+  const pending = prepareAttempt(store, { ...input(), environment: mutableEnvironment });
+  mutableEnvironment.stripe.accountId = 'acct_changedAfterValidation';
+
+  const row = await pending;
+  const reservation = adapter.reservations.get(row.reservationId);
+  assert.deepEqual(row.environment, environment);
+  assert.deepEqual(reservation.scope, {
+    projectRef: environment.database.projectRef,
+    branchId: environment.database.branchId,
+    stripeAccountId: environment.stripe.accountId,
+  });
+});
+
+test('prepare pins the expected environment snapshot when the store is created', async () => {
+  const adapter = fakeAdapter();
+  const expectedEnvironment = structuredClone(environment);
+  adapter.expectedEnvironment = expectedEnvironment;
+  const store = createAttemptStore(adapter);
+  expectedEnvironment.stripe.accountId = 'acct_changedAfterStoreSetup';
+
+  const row = await prepareAttempt(store, input());
+  assert.deepEqual(row.environment, environment);
 });
 
 test('collect transition refuses secret-bearing resources and malformed artifact metadata', async () => {
