@@ -42,27 +42,78 @@ function isPlainRecord(value) {
   return prototype === Object.prototype || prototype === null;
 }
 
-function hasExactContractKeys(value) {
-  if (!isPlainRecord(value)) return false;
-  const keys = Reflect.ownKeys(value);
-  return keys.length === CONTRACT_KEYS.length && keys.every((key) =>
-    typeof key === 'string' && CONTRACT_KEYS.includes(key));
+function snapshotDenseArray(value) {
+  if (!Array.isArray(value)) return null;
+  let descriptors;
+  try { descriptors = Object.getOwnPropertyDescriptors(value); }
+  catch { return null; }
+
+  const keys = Reflect.ownKeys(descriptors);
+  const lengthDescriptor = descriptors.length;
+  if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, 'value')) return null;
+  const length = lengthDescriptor.value;
+  if (!Number.isSafeInteger(length) || length < 0 || keys.length !== length + 1 ||
+      keys.some((key) => key !== 'length' && (typeof key !== 'string' ||
+        !/^(?:0|[1-9]\d*)$/u.test(key) || Number(key) >= length))) return null;
+
+  const snapshot = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) return null;
+    snapshot.push(descriptor.value);
+  }
+  return Object.freeze(snapshot);
 }
 
-function isDenseArray(value) {
-  if (!Array.isArray(value)) return false;
-  const keys = Reflect.ownKeys(value);
-  return keys.length === value.length + 1 && keys.includes('length') &&
-    keys.every((key) => key === 'length' || (typeof key === 'string' &&
-      /^(?:0|[1-9]\d*)$/u.test(key) && Number(key) < value.length));
+function snapshotContract(value) {
+  let plainRecord;
+  try { plainRecord = isPlainRecord(value); }
+  catch { return null; }
+  if (!plainRecord) return null;
+
+  let descriptors;
+  try { descriptors = Object.getOwnPropertyDescriptors(value); }
+  catch { return null; }
+  const keys = Reflect.ownKeys(descriptors);
+  const exactKeys = keys.length === CONTRACT_KEYS.length && keys.every((key) =>
+    typeof key === 'string' && CONTRACT_KEYS.includes(key));
+  if (!exactKeys) {
+    const idDescriptor = descriptors.id;
+    const id = idDescriptor && Object.hasOwn(idDescriptor, 'value') ? idDescriptor.value : undefined;
+    return { id, contract: null };
+  }
+
+  const fields = Object.create(null);
+  let id;
+  for (const key of CONTRACT_KEYS) {
+    const descriptor = descriptors[key];
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) return { id, contract: null };
+    const field = descriptor.value;
+    fields[key] = field;
+    if (key === 'id') id = field;
+  }
+
+  const allowedOperations = snapshotDenseArray(fields.allowedOperations);
+  const requiredEvidence = snapshotDenseArray(fields.requiredEvidence);
+  if (!allowedOperations || !requiredEvidence) return { id, contract: null };
+
+  return {
+    id,
+    contract: Object.freeze({
+      id,
+      domain: fields.domain,
+      maxWrites: fields.maxWrites,
+      allowedOperations,
+      requiredEvidence,
+      run: fields.run,
+    }),
+  };
 }
 
 function validContract(contract) {
-  if (!hasExactContractKeys(contract) || !ID_SET.has(contract.id) ||
-      contract.domain !== contract.id.slice(0, contract.id.indexOf('.')) ||
+  if (contract.domain !== contract.id.slice(0, contract.id.indexOf('.')) ||
       !Number.isFinite(contract.maxWrites) || contract.maxWrites < 0 ||
-      typeof contract.run !== 'function' || !isDenseArray(contract.allowedOperations) ||
-      !isDenseArray(contract.requiredEvidence) || contract.requiredEvidence.length === 0) return false;
+      typeof contract.run !== 'function' || contract.requiredEvidence.length === 0) return false;
 
   const operations = contract.allowedOperations;
   if (new Set(operations).size !== operations.length ||
@@ -74,23 +125,18 @@ function validContract(contract) {
 }
 
 export function assertBilling43ContractsComplete(domainContracts) {
-  if (!Array.isArray(domainContracts)) refuse('billing_contracts_incomplete');
+  const contractList = snapshotDenseArray(domainContracts);
+  if (!contractList) refuse('billing_contracts_incomplete');
 
   const byId = new Map();
-  for (const contract of domainContracts) {
-    if (!isPlainRecord(contract) || typeof contract.id !== 'string' || !ID_SET.has(contract.id)) {
+  for (const candidate of contractList) {
+    const captured = snapshotContract(candidate);
+    if (!captured || typeof captured.id !== 'string' || !ID_SET.has(captured.id)) {
       refuse('billing_contracts_incomplete');
     }
-    if (byId.has(contract.id)) refuse('billing_contracts_incomplete');
-    if (!validContract(contract)) refuse('billing_contract_invalid');
-    byId.set(contract.id, Object.freeze({
-      id: contract.id,
-      domain: contract.domain,
-      maxWrites: contract.maxWrites,
-      allowedOperations: Object.freeze([...contract.allowedOperations]),
-      requiredEvidence: Object.freeze([...contract.requiredEvidence]),
-      run: contract.run,
-    }));
+    if (byId.has(captured.id)) refuse('billing_contracts_incomplete');
+    if (!captured.contract || !validContract(captured.contract)) refuse('billing_contract_invalid');
+    byId.set(captured.id, captured.contract);
   }
 
   if (byId.size !== BILLING_43_IDS.length || BILLING_43_IDS.some((id) => !byId.has(id))) {
@@ -103,19 +149,25 @@ export function assertBilling43ContractsComplete(domainContracts) {
 export function assertCompleteBilling43Contracts(domainContracts) {
   if (!Array.isArray(domainContracts)) {
     if (!isPlainRecord(domainContracts)) refuse('billing_contracts_incomplete');
-    const keys = Reflect.ownKeys(domainContracts);
+    let descriptors;
+    try { descriptors = Object.getOwnPropertyDescriptors(domainContracts); }
+    catch { refuse('billing_contracts_incomplete'); }
+    const keys = Reflect.ownKeys(descriptors);
     if (keys.length !== BILLING_43_IDS.length ||
         keys.some((key) => typeof key !== 'string' || !ID_SET.has(key))) {
       refuse('billing_contracts_incomplete');
     }
 
-    domainContracts = BILLING_43_IDS.map((id) => {
-      const descriptor = Object.getOwnPropertyDescriptor(domainContracts, id);
-      if (!descriptor || !Object.hasOwn(descriptor, 'value') || descriptor.value?.id !== id) {
+    const orderedContracts = BILLING_43_IDS.map((id) => {
+      const descriptor = descriptors[id];
+      if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
         refuse('billing_contracts_incomplete');
       }
       return descriptor.value;
     });
+    const registry = assertBilling43ContractsComplete(orderedContracts);
+    if (BILLING_43_IDS.some((id) => registry[id].id !== id)) refuse('billing_contracts_incomplete');
+    return registry;
   }
   return assertBilling43ContractsComplete(domainContracts);
 }

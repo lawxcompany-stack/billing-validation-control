@@ -66,6 +66,61 @@ test('contract completeness failures occur before fixture creation or contract e
   }
 });
 
+test('contract run accessors are refused before fixture creation or execution', async () => {
+  const ids = needValue(billing43, 'BILLING_43_IDS');
+  const runBilling43Scenario = needExport(billing43, 'runBilling43Scenario');
+  const contracts = completeTestContracts(ids);
+  let getterReads = 0;
+  let fixtureCreations = 0;
+  let providerMutations = 0;
+
+  Object.defineProperty(contracts[0], 'run', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      return async () => { providerMutations += 1; };
+    },
+  });
+
+  await assert.rejects(runBilling43Scenario({
+    id: ids[0], contracts,
+    async createFixture() { fixtureCreations += 1; return {}; },
+  }), { code: 'billing_contract_invalid' });
+  assert.equal(getterReads, 0);
+  assert.equal(fixtureCreations, 0);
+  assert.equal(providerMutations, 0);
+});
+
+test('operation array index accessors are refused before fixture creation or execution', async () => {
+  const ids = needValue(billing43, 'BILLING_43_IDS');
+  const runBilling43Scenario = needExport(billing43, 'runBilling43Scenario');
+  const contracts = completeTestContracts(ids);
+  const allowedOperations = [];
+  let getterReads = 0;
+  let fixtureCreations = 0;
+  let providerMutations = 0;
+
+  Object.defineProperty(allowedOperations, '0', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      return getterReads <= 2 ? 'checkout.replay' : 'unreviewed.provider.mutation';
+    },
+  });
+  contracts[0].allowedOperations = allowedOperations;
+  contracts[0].run = async () => { providerMutations += 1; };
+
+  await assert.rejects(runBilling43Scenario({
+    id: ids[0], contracts,
+    async createFixture() { fixtureCreations += 1; return {}; },
+  }), { code: 'billing_contract_invalid' });
+  assert.equal(getterReads, 0);
+  assert.equal(fixtureCreations, 0);
+  assert.equal(providerMutations, 0);
+});
+
 test('scenario execution gives contracts the frozen validated registry', async () => {
   const ids = needValue(billing43, 'BILLING_43_IDS');
   const runBilling43Scenario = needExport(billing43, 'runBilling43Scenario');
