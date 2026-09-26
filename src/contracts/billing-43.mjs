@@ -101,6 +101,22 @@ export function assertBilling43ContractsComplete(domainContracts) {
 }
 
 export function assertCompleteBilling43Contracts(domainContracts) {
+  if (!Array.isArray(domainContracts)) {
+    if (!isPlainRecord(domainContracts)) refuse('billing_contracts_incomplete');
+    const keys = Reflect.ownKeys(domainContracts);
+    if (keys.length !== BILLING_43_IDS.length ||
+        keys.some((key) => typeof key !== 'string' || !ID_SET.has(key))) {
+      refuse('billing_contracts_incomplete');
+    }
+
+    domainContracts = BILLING_43_IDS.map((id) => {
+      const descriptor = Object.getOwnPropertyDescriptor(domainContracts, id);
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || descriptor.value?.id !== id) {
+        refuse('billing_contracts_incomplete');
+      }
+      return descriptor.value;
+    });
+  }
   return assertBilling43ContractsComplete(domainContracts);
 }
 
@@ -113,6 +129,7 @@ export async function runBilling43Scenario({ id, contracts, createFixture, conte
   const runContext = isPlainRecord(context) ? { ...context } : {};
   runContext.id = id;
   runContext.fixture = fixture;
+  runContext.contracts = registry;
   return contract.run(Object.freeze(runContext));
 }
 

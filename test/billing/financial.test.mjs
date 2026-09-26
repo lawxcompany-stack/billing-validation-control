@@ -5,6 +5,7 @@ import { databaseSnapshot, environment, importIfMissing, makeAttemptParts, makeR
   manualResendCapabilities, expectRefusal } from './support.mjs';
 
 const contracts = await importIfMissing(() => import('../../src/billing/contracts.mjs'));
+const billing43 = await importIfMissing(() => import('../../src/contracts/billing-43.mjs'));
 const financial = await importIfMissing(() => import('../../src/billing/financial.mjs'));
 const fixtures = await importIfMissing(() => import('../../src/billing/fixtures.mjs'));
 
@@ -19,28 +20,46 @@ function completeBilling43Contracts() {
   }));
 }
 
-test('checkout replay refuses an incomplete registry before invoking Stripe', async () => {
+test('checkout replay refuses a missing or incomplete registry before invoking Stripe', async () => {
   const replay = needExport(financial, 'replayCheckoutRequest');
   const parts = makeAttemptParts();
   const context = needExport(contracts, 'createVerifiedContext')(parts);
   const request = Object.freeze({ quoteId: 'quote_task6', idempotencyKey: 'quote-scoped-replay-0001',
     sessionParams: Object.freeze({ mode: 'subscription', currency: 'brl', amount: 2500 }) });
 
-  const outcome = await Promise.allSettled([replay({ context, applicationRequest: request, contracts: [] })]);
-  assert.equal(parts.calls.mutations.length, 0);
-  assert.equal(outcome[0].status, 'rejected');
-  assert.equal(outcome[0].reason.code, 'billing_contracts_incomplete');
+  for (const registry of [{}, { contracts: [] }]) {
+    const outcome = await Promise.allSettled([
+      replay({ context, applicationRequest: request, ...registry }),
+    ]);
+    assert.equal(parts.calls.mutations.length, 0);
+    assert.equal(outcome[0].status, 'rejected');
+    assert.equal(outcome[0].reason.code, 'billing_contracts_incomplete');
+  }
 });
 
-test('replaying an app checkout preserves its persisted quote key while control uses its attempt key', async () => {
+test('replaying an app checkout uses the complete registry from the trusted collector context', async () => {
   const replay = needExport(financial, 'replayCheckoutRequest');
   const parts = makeAttemptParts();
-  const context = needExport(contracts, 'createVerifiedContext')(parts);
+  const domainContracts = completeBilling43Contracts();
+  const scenarioId = domainContracts[0].id;
+  const verifiedContext = needExport(contracts, 'createVerifiedContext')(parts);
   const request = Object.freeze({ quoteId: 'quote_task6', idempotencyKey: 'quote-scoped-replay-0001',
     sessionParams: Object.freeze({ mode: 'subscription', currency: 'brl', amount: 2500 }) });
-  const domainContracts = completeBilling43Contracts();
-  await replay({ context, applicationRequest: request, contracts: domainContracts });
-  await replay({ context, applicationRequest: request, contracts: domainContracts });
+  domainContracts[0] = {
+    ...domainContracts[0],
+    async run(context) {
+      await replay({ context, applicationRequest: request });
+      await replay({ context, applicationRequest: request });
+      return 'replayed';
+    },
+  };
+  const outcome = await needExport(billing43, 'runBilling43Scenario')({
+    id: scenarioId,
+    contracts: domainContracts,
+    async createFixture() { return { fixtureId: 'fixture_task6' }; },
+    context: verifiedContext,
+  });
+  assert.equal(outcome, 'replayed');
   assert.equal(parts.calls.mutations.length, 2);
   assert.equal(parts.calls.mutations[0].input.applicationRequest.idempotencyKey, 'quote-scoped-replay-0001');
   assert.equal(parts.calls.mutations[1].input.applicationRequest.idempotencyKey, 'quote-scoped-replay-0001');

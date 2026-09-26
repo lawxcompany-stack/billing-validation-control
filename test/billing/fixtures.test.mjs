@@ -66,6 +66,26 @@ test('contract completeness failures occur before fixture creation or contract e
   }
 });
 
+test('scenario execution gives contracts the frozen validated registry', async () => {
+  const ids = needValue(billing43, 'BILLING_43_IDS');
+  const runBilling43Scenario = needExport(billing43, 'runBilling43Scenario');
+  let observedContracts;
+  const contracts = completeTestContracts(ids).map((contract) => ({
+    ...contract,
+    async run(context) {
+      observedContracts = context.contracts;
+      return { passed: true };
+    },
+  }));
+
+  await runBilling43Scenario({ id: ids[0], contracts,
+    async createFixture() { return {}; }, context: { attemptId: 'attempt-safe' } });
+
+  assert.deepEqual(Object.keys(observedContracts ?? {}), ids);
+  assert.equal(Object.isFrozen(observedContracts), true);
+  assert.equal(observedContracts[ids[0]].id, ids[0]);
+});
+
 test('contract completeness requires valid evidence, bounded writes, closed operations, and callable run', () => {
   const ids = needValue(billing43, 'BILLING_43_IDS');
   const assertCompleteBilling43Contracts = needExport(billing43, 'assertCompleteBilling43Contracts');

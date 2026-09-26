@@ -28,7 +28,8 @@ export function requiredFinancialEvidence(caseId) {
   return FINANCIAL_EVIDENCE_REQUIREMENTS[caseId];
 }
 
-export async function replayCheckoutRequest({ context, applicationRequest, contracts } = {}) {
+export async function replayCheckoutRequest({ context, applicationRequest,
+  contracts = context?.contracts } = {}) {
   assertCompleteBilling43Contracts(contracts);
   if (!applicationRequest || typeof applicationRequest !== 'object' || Array.isArray(applicationRequest) ||
       Object.keys(applicationRequest).length !== 3 ||
