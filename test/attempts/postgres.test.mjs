@@ -14,6 +14,10 @@ const preflight = { expectedEnvironment: {
   webhookEndpointId: 'we_synthetic123', webhookUrl: 'https://candidate.vercel.app/api/stripe/webhook',
   livemode: false } } };
 const target = { ...database, isDefault: false, status: 'ACTIVE_HEALTHY', isolated: true };
+const retentionPolicy = { version: 1, quotas: {
+  attempts: 50, databaseRows: 500, authUsers: 50, stripeObjects: 500,
+} };
+const projection = { attempts: 1, databaseRows: 10, authUsers: 1, stripeObjects: 10 };
 
 function recordingClient() {
   const calls = [];
@@ -113,6 +117,25 @@ test('schema gives fixture leases the exact shared key and fences owner rows', (
   assert.doesNotMatch(sql, /candidate_sha, suite, fixture_key\)/);
 });
 
+test('schema stores append-only retention reservations and terminal receipts with update/delete denial', () => {
+  const sql = readFileSync(new URL('../../src/attempts/schema.sql', import.meta.url), 'utf8');
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS billing_validation_control\.retention_reservations/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS billing_validation_control\.retention_receipts/);
+  assert.match(sql, /reservation_id text NOT NULL UNIQUE\s+REFERENCES billing_validation_control\.retention_reservations/);
+  assert.match(sql, /projection jsonb NOT NULL/);
+  assert.match(sql, /retained_usage jsonb NOT NULL/);
+  assert.match(sql, /BEFORE UPDATE OR DELETE ON billing_validation_control\.retention_reservations/);
+  assert.match(sql, /BEFORE UPDATE OR DELETE ON billing_validation_control\.retention_receipts/);
+  assert.match(sql, /BEFORE TRUNCATE ON billing_validation_control\.retention_reservations/);
+  assert.match(sql, /BEFORE TRUNCATE ON billing_validation_control\.retention_receipts/);
+  assert.match(sql, /valid_retention_usage\(quota_limits, 1, false\)/);
+  assert.match(sql, /valid_retention_usage\(projection, 0, true\)/);
+  assert.match(sql, /retained_usage ->> quota_key/);
+  assert.match(sql, /REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control\.retention_reservations/);
+  assert.match(sql, /REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control\.retention_receipts/);
+  assert.doesNotMatch(sql, /retention_reservations[\s\S]{0,500}expires_at/);
+});
+
 test('zero-row conflicting attempt insert cannot create an orphan fixture lease', async () => {
   const calls = [];
   const client = { async transaction(fn) {
@@ -129,7 +152,7 @@ test('zero-row conflicting attempt insert cannot create an orphan fixture lease'
     candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
-    environment: preflight.expectedEnvironment, ttlSeconds: 60 }),
+    environment: preflight.expectedEnvironment, ttlSeconds: 60, retentionPolicy, projection }),
   { code: 'attempt_conflict' });
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.fixture_leases')), false);
 });
@@ -140,7 +163,7 @@ test('PostgreSQL adapter accepts an injected transactional client and parameteri
   await store.prepare({ attemptId: 'attempt-a', key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-a' },
     candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1, runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
-    environment: preflight.expectedEnvironment, ttlSeconds: 60 });
+    environment: preflight.expectedEnvironment, ttlSeconds: 60, retentionPolicy, projection });
   const attemptLock = client.calls.findIndex(({ sql, values }) =>
     sql.includes('pg_advisory_xact_lock') && values?.[0] === '["attempt","attempt-a"]');
   const attemptRead = client.calls.findIndex(({ sql }) =>
@@ -149,6 +172,7 @@ test('PostgreSQL adapter accepts an injected transactional client and parameteri
   assert.ok(client.calls.some(({ sql, values }) => /pg_advisory_xact_lock/.test(sql) && values?.[0]?.includes('invoice-a')));
   assert.ok(client.calls.some(({ sql, values }) => /INSERT INTO billing_validation_control\.fixture_leases/.test(sql) &&
     values?.includes('child-validation-1')));
+  assert.ok(client.calls.some(({ sql }) => /INSERT INTO billing_validation_control\.retention_reservations/.test(sql)));
   assert.equal(client.calls.some(({ sql }) => sql.includes('invoice-a') || sql.includes('attempt-a')), false);
 });
 
@@ -195,6 +219,77 @@ test('pinned adapter refuses a different stable environment tuple before SQL', a
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
     environment: { ...preflight.expectedEnvironment, database: {
       projectRef: 'zzzzzzzzzzzzzzzzzzzz', branchId: database.branchId,
-    } }, ttlSeconds: 60 }), { code: 'attempt_input_invalid' });
+    } }, ttlSeconds: 60, retentionPolicy, projection }), { code: 'attempt_input_invalid' });
   assert.equal(client.calls.length, 0);
+});
+
+test('PostgreSQL admission locks and aggregates receipts plus unsettled reservations before inserting the new projection', async () => {
+  const calls = [];
+  const capacityRows = [
+    { bucket: 'committed', quota_key: 'attempts', units: '1' },
+    { bucket: 'reserved', quota_key: 'attempts', units: '2' },
+    { bucket: 'committed', quota_key: 'databaseRows', units: '2' },
+    { bucket: 'reserved', quota_key: 'databaseRows', units: '3' },
+    { bucket: 'committed', quota_key: 'authUsers', units: '1' },
+  ];
+  const client = { async transaction(fn) {
+    return fn({ async query(sql, values) {
+      calls.push({ sql, values });
+      if (sql.includes('retention_capacity_snapshot')) return { rows: capacityRows };
+      if (/clock_timestamp/.test(sql) && /SELECT/.test(sql)) return { rows: [{ now: 1000 }] };
+      return { rows: [], rowCount: 1 };
+    } });
+  } };
+  const store = createPostgresAttemptStore({ client, preflight, target });
+  const result = await store.prepare({ attemptId: 'attempt-a',
+    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-a' },
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+      ref: 'refs/heads/main', runId: '100', runAttempt: 1,
+      runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
+    environment: preflight.expectedEnvironment, ttlSeconds: 60,
+    retentionPolicy: { version: 1, quotas: { attempts: 10, databaseRows: 10, authUsers: 10, stripeObjects: 10 } },
+    projection: { attempts: 1, databaseRows: 5, authUsers: 1, stripeObjects: 2 },
+  });
+  const lockIndex = calls.findIndex(({ sql, values }) => /pg_advisory_xact_lock/.test(sql) &&
+    values?.[0]?.startsWith('["retention"'));
+  const capacityIndex = calls.findIndex(({ sql }) => sql.includes('retention_capacity_snapshot'));
+  const policyIndex = calls.findIndex(({ sql }) => sql.includes('retention_policy_pin'));
+  const reservationIndex = calls.findIndex(({ sql }) => /INSERT INTO billing_validation_control\.retention_reservations/.test(sql));
+  assert.ok(lockIndex >= 0 && capacityIndex > lockIndex && policyIndex > capacityIndex && reservationIndex > policyIndex);
+  assert.match(calls[capacityIndex].sql, /billing_validation_control\.retention_receipts/);
+  assert.match(calls[capacityIndex].sql, /billing_validation_control\.retention_reservations/);
+  assert.match(calls[capacityIndex].sql, /NOT EXISTS/);
+  assert.doesNotMatch(calls[capacityIndex].sql, /billing_validation_control\.attempts/);
+  assert.match(calls[policyIndex].sql, /GROUP BY quota_limits/);
+  assert.equal(result.capacity.projected.attempts, 4);
+  assert.equal(result.capacity.projected.databaseRows, 10);
+  assert.equal(result.capacity.projected.authUsers, 2);
+});
+
+test('PostgreSQL admission refuses projected overflow before persisting an attempt, reservation, or lease', async () => {
+  const calls = [];
+  const client = { async transaction(fn) {
+    return fn({ async query(sql, values) {
+      calls.push({ sql, values });
+      if (sql.includes('retention_capacity_snapshot')) return { rows: [
+        { bucket: 'committed', quota_key: 'databaseRows', units: '4' },
+        { bucket: 'reserved', quota_key: 'databaseRows', units: '3' },
+      ] };
+      if (/clock_timestamp/.test(sql) && /SELECT/.test(sql)) return { rows: [{ now: 1000 }] };
+      return { rows: [], rowCount: 1 };
+    } });
+  } };
+  const store = createPostgresAttemptStore({ client, preflight, target });
+  await assert.rejects(store.prepare({ attemptId: 'attempt-a',
+    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-a' },
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+      ref: 'refs/heads/main', runId: '100', runAttempt: 1,
+      runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
+    environment: preflight.expectedEnvironment, ttlSeconds: 60,
+    retentionPolicy: { version: 1, quotas: { attempts: 10, databaseRows: 10, authUsers: 10, stripeObjects: 10 } },
+    projection: { attempts: 1, databaseRows: 4, authUsers: 1, stripeObjects: 2 },
+  }), { code: 'retention_capacity_exceeded' });
+  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.attempts')), false);
+  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.retention_reservations')), false);
+  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.fixture_leases')), false);
 });

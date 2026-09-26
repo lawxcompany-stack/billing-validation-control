@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { validArtifact, validResourceIds, validWorkflow, verifyRecheckSnapshot } from '../contracts/attempt.mjs';
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
+import { RETENTION_QUOTA_KEYS, validateRetentionConfiguration } from './prepare.mjs';
 
 export class AttemptRefusal extends Error {
   constructor(code) { super(code); this.name = 'AttemptRefusal'; this.code = code; }
@@ -19,15 +20,115 @@ function safeId(value) { return typeof value === 'string' && /^[A-Za-z0-9][A-Za-
 function validKey(key) { return key && ['branchId', 'suite', 'fixtureKey'].every((name) => safeId(key[name])) && Object.keys(key).length === 3; }
 function validTtl(value) { return Number.isInteger(value) && value >= 1 && value <= 3600; }
 
+function retentionScope(environment) {
+  return { projectRef: environment.database.projectRef, branchId: environment.database.branchId,
+    stripeAccountId: environment.stripe.accountId };
+}
+
+function ownDataValue(value, key) {
+  if (value === null || typeof value !== 'object') return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+  } catch { return undefined; }
+}
+
+function snapshotUsage(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  let keys;
+  try { keys = Reflect.ownKeys(value); } catch { return null; }
+  if (keys.length !== RETENTION_QUOTA_KEYS.length ||
+      keys.some((key) => typeof key !== 'string' || !RETENTION_QUOTA_KEYS.includes(key))) return null;
+  const usage = {};
+  for (const key of RETENTION_QUOTA_KEYS) {
+    let descriptor;
+    try { descriptor = Object.getOwnPropertyDescriptor(value, key); } catch { return null; }
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable ||
+        !Number.isSafeInteger(descriptor.value) || descriptor.value < 0) return null;
+    usage[key] = descriptor.value;
+  }
+  return usage;
+}
+
+function sameUsage(left, right) {
+  const a = snapshotUsage(left);
+  const b = snapshotUsage(right);
+  return Boolean(a && b && RETENTION_QUOTA_KEYS.every((key) => a[key] === b[key]));
+}
+
+function retentionCapacity(usage, quotas, projection) {
+  if (!usage || typeof usage !== 'object') refuse('retention_ledger_invalid');
+  let keys;
+  try { keys = Reflect.ownKeys(usage); } catch { refuse('retention_ledger_invalid'); }
+  if (keys.length !== 3 || keys.some((key) => !['committed', 'reserved', 'policyLimits'].includes(key))) {
+    refuse('retention_ledger_invalid');
+  }
+  const committed = snapshotUsage(ownDataValue(usage, 'committed'));
+  const reserved = snapshotUsage(ownDataValue(usage, 'reserved'));
+  if (!committed || !reserved) refuse('retention_ledger_invalid');
+  const priorPolicy = ownDataValue(usage, 'policyLimits');
+  if (priorPolicy !== null) {
+    const pinned = snapshotUsage(priorPolicy);
+    if (!pinned || RETENTION_QUOTA_KEYS.some((key) => pinned[key] < 1)) refuse('retention_ledger_invalid');
+    if (!equal(pinned, quotas)) refuse('retention_policy_mismatch');
+  }
+  const projected = {};
+  const remaining = {};
+  for (const key of RETENTION_QUOTA_KEYS) {
+    const total = committed[key] + reserved[key] + projection[key];
+    if (!Number.isSafeInteger(total)) refuse('retention_ledger_invalid');
+    if (total > quotas[key]) refuse('retention_capacity_exceeded');
+    projected[key] = total;
+    remaining[key] = quotas[key] - total;
+  }
+  return Object.freeze({ quotas, committed: Object.freeze(committed), reserved: Object.freeze(reserved),
+    requested: projection, projected: Object.freeze(projected), remaining: Object.freeze(remaining) });
+}
+
+function terminalRequest(input) {
+  const keys = ['reservationId', 'outcome', 'retained'];
+  if (!input || typeof input !== 'object' || Array.isArray(input)) refuse('retention_receipt_invalid');
+  let ownKeys;
+  try { ownKeys = Reflect.ownKeys(input); } catch { refuse('retention_receipt_invalid'); }
+  if (ownKeys.length !== keys.length || ownKeys.some((key) => typeof key !== 'string' || !keys.includes(key))) {
+    refuse('retention_receipt_invalid');
+  }
+  const values = Object.create(null);
+  try {
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || descriptor.enumerable !== true) {
+        refuse('retention_receipt_invalid');
+      }
+      values[key] = descriptor.value;
+    }
+  } catch { refuse('retention_receipt_invalid'); }
+  const retained = snapshotUsage(values.retained);
+  if (!safeId(values.reservationId) || !['completed', 'failed', 'cancelled', 'timed_out'].includes(values.outcome) ||
+      !retained || retained.attempts !== 1) refuse('retention_receipt_invalid');
+  return { reservationId: values.reservationId, outcome: values.outcome, retained };
+}
+
 function assertOwner(lease, attemptId, fence, now) {
   if (!lease || lease.attemptId !== attemptId || lease.fence !== fence) refuse('lease_fence_lost');
   if (lease.expiresAt <= now) refuse('lease_expired');
+}
+
+function admissionResult(row, fence, reservation) {
+  const result = { ...row, fence };
+  Object.defineProperties(result, {
+    reservationId: { value: reservation.reservationId, enumerable: false },
+    capacity: { value: reservation.capacity, enumerable: false },
+  });
+  return result;
 }
 
 export function createAttemptStore(adapter) {
   if (!adapter || typeof adapter.transaction !== 'function') refuse('store_client_invalid');
   return {
     async prepare(input) {
+      const retention = validateRetentionConfiguration(ownDataValue(input, 'retentionPolicy'),
+        ownDataValue(input, 'projection'));
       const { attemptId, key, candidateSha, workflow, environment, ttlSeconds } = input ?? {};
       if (!safeId(attemptId) || !validKey(key) || !/^[a-f0-9]{40}$/.test(candidateSha ?? '') ||
           !validTtl(ttlSeconds) || !validWorkflow(workflow) || !isValidExpectedEnvironment(environment) ||
@@ -44,16 +145,30 @@ export function createAttemptStore(adapter) {
         await tx.lockAttempt(attemptId);
         const now = await tx.now();
         const existing = await tx.getAttempt(attemptId);
+        if (existing && (!equal(existing.key, key) || existing.candidateSha !== candidateSha ||
+            !equal(existing.workflow, workflow) || !equal(existing.environment, environment))) {
+          refuse('attempt_replay_mismatch');
+        }
+        const scope = retentionScope(environment);
+        if (typeof tx.lockRetention !== 'function' || typeof tx.getRetentionUsage !== 'function' ||
+            typeof tx.getRetentionReservationByAttempt !== 'function' ||
+            typeof tx.getRetentionReceipt !== 'function' || typeof tx.putRetentionReservation !== 'function') {
+          refuse('retention_store_unavailable');
+        }
+        await tx.lockRetention(scope);
         const lease = await tx.getLease(key);
         if (existing) {
-          if (!equal(existing.key, key) || existing.candidateSha !== candidateSha ||
-              !equal(existing.workflow, workflow) || !equal(existing.environment, environment)) refuse('attempt_replay_mismatch');
           if (lease?.attemptId === attemptId && lease.expiresAt > now) {
             if (existing.state !== 'collecting' || lease.candidateSha !== candidateSha ||
                 lease.ownerRepository !== workflow.repository || lease.ownerRef !== workflow.ref ||
                 lease.ownerRunId !== workflow.runId ||
                 lease.ownerRunAttempt !== workflow.runAttempt) refuse('attempt_replay_not_owner');
-            return { ...existing, fence: lease.fence };
+            const reservation = await tx.getRetentionReservationByAttempt(attemptId);
+            if (!reservation) refuse('retention_reservation_missing');
+            if (!sameUsage(reservation.quotas, retention.retentionPolicy.quotas) ||
+                !sameUsage(reservation.projection, retention.projection)) refuse('attempt_replay_mismatch');
+            if (await tx.getRetentionReceipt(reservation.reservationId)) refuse('retention_attempt_settled');
+            return admissionResult(existing, lease.fence, reservation);
           }
           refuse('attempt_replay_expired');
         }
@@ -66,14 +181,55 @@ export function createAttemptStore(adapter) {
               recovery.cleanupComplete !== true) refuse('recovery_unverified');
           await tx.putAttempt({ ...prior, cleanupStatus: 'complete', updatedAt: now });
         }
+        const capacity = retentionCapacity(await tx.getRetentionUsage(scope),
+          retention.retentionPolicy.quotas, retention.projection);
         const fence = randomUUID();
         const row = { attemptId, key, candidateSha, workflow, environment, state: 'collecting',
           cleanupStatus: 'pending', artifact: null, resourceIds: [], createdAt: now, updatedAt: now };
         await tx.putAttempt(row);
+        const reservation = { reservationId: randomUUID(), attemptId, scope,
+          policyVersion: retention.retentionPolicy.version,
+          quotas: retention.retentionPolicy.quotas, projection: retention.projection,
+          capacity, createdAt: now };
+        await tx.putRetentionReservation(reservation);
         await tx.putLease({ key, attemptId, fence, expiresAt: now + ttlSeconds,
           candidateSha, ownerRepository: workflow.repository, ownerRef: workflow.ref,
           ownerRunId: workflow.runId, ownerRunAttempt: workflow.runAttempt }, lease?.fence ?? null);
-        return { ...row, fence };
+        return admissionResult(row, fence, reservation);
+      });
+    },
+    async reconcileReservation(input) {
+      const request = terminalRequest(input);
+      if (typeof adapter.verifyRetentionReceipt !== 'function') refuse('retention_reconciliation_unverified');
+      return adapter.transaction(async (tx) => {
+        if (typeof tx.getRetentionReservation !== 'function' || typeof tx.getRetentionReceipt !== 'function' ||
+            typeof tx.lockRetention !== 'function' || typeof tx.putRetentionReceipt !== 'function') {
+          refuse('retention_store_unavailable');
+        }
+        const reservation = await tx.getRetentionReservation(request.reservationId);
+        if (!reservation) refuse('retention_reservation_missing');
+        await tx.lockRetention(reservation.scope);
+        const existing = await tx.getRetentionReceipt(reservation.reservationId);
+        if (existing) {
+          if (existing.outcome !== request.outcome || !equal(existing.retained, request.retained)) {
+            refuse('retention_already_settled');
+          }
+          return existing;
+        }
+        const projection = snapshotUsage(reservation.projection);
+        if (!projection) refuse('retention_ledger_invalid');
+        for (const key of RETENTION_QUOTA_KEYS) {
+          if (request.retained[key] > projection[key]) refuse('retention_receipt_exceeds_reservation');
+        }
+        const verification = await adapter.verifyRetentionReceipt({ reservation,
+          receipt: { reservationId: request.reservationId, attemptId: reservation.attemptId,
+            outcome: request.outcome, retained: request.retained } });
+        if (verification !== true) refuse('retention_reconciliation_unverified');
+        const receipt = { receiptId: randomUUID(), reservationId: reservation.reservationId,
+          attemptId: reservation.attemptId, scope: reservation.scope, outcome: request.outcome,
+          retained: request.retained, createdAt: await tx.now() };
+        await tx.putRetentionReceipt(receipt);
+        return receipt;
       });
     },
     async getAttempt(attemptId) { return adapter.transaction((tx) => tx.getAttempt(attemptId)); },

@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { createAttemptStore, refuse } from './store.mjs';
+import { RETENTION_QUOTA_KEYS } from './prepare.mjs';
 
 const PRODUCTION_LABEL = /(?:^|[-_.])(?:main|master|prod|production|primary|default)(?:$|[-_.])/i;
 const PROJECT_REF = /^[a-z0-9]{20}$/;
@@ -65,14 +66,52 @@ function rowFromDb(db) {
   };
 }
 
-function transactionAdapter(client, verifyRecovery, verifyCleanup, expectedEnvironment) {
-  return { verifyRecovery, verifyCleanup, expectedEnvironment,
+function jsonValue(value) {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { refuse('retention_ledger_invalid'); }
+}
+
+function retentionReservationFromDb(db) {
+  if (!db) return null;
+  return {
+    reservationId: db.reservation_id,
+    attemptId: db.attempt_id,
+    scope: { projectRef: db.project_ref.trim(), branchId: db.branch_id,
+      stripeAccountId: db.stripe_account_id },
+    policyVersion: db.policy_version,
+    quotas: jsonValue(db.quota_limits),
+    projection: jsonValue(db.projection),
+    capacity: jsonValue(db.capacity_snapshot),
+    createdAt: Number(db.created_at_epoch),
+  };
+}
+
+function retentionReceiptFromDb(db) {
+  if (!db) return null;
+  return {
+    receiptId: db.receipt_id,
+    reservationId: db.reservation_id,
+    attemptId: db.attempt_id,
+    scope: { projectRef: db.project_ref.trim(), branchId: db.branch_id,
+      stripeAccountId: db.stripe_account_id },
+    outcome: db.outcome,
+    retained: jsonValue(db.retained_usage),
+    createdAt: Number(db.created_at_epoch),
+  };
+}
+
+function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetentionReceipt, expectedEnvironment) {
+  return { verifyRecovery, verifyCleanup, verifyRetentionReceipt, expectedEnvironment,
     transaction: (fn) => client.transaction(async (queryClient) => {
     if (typeof queryClient?.query !== 'function') refuse('store_client_invalid');
     const tx = {
       async lockAttempt(attemptId) {
         await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
           [JSON.stringify(['attempt', attemptId])]);
+      },
+      async lockRetention(scope) {
+        await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+          [JSON.stringify(['retention', scope.projectRef, scope.branchId, scope.stripeAccountId])]);
       },
       async now() {
         const result = await queryClient.query('SELECT extract(epoch FROM clock_timestamp()) AS now', []);
@@ -106,6 +145,92 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, expectedEnvir
             AND billing_validation_control.attempts.suite = EXCLUDED.suite
             AND billing_validation_control.attempts.fixture_key = EXCLUDED.fixture_key`, values);
         if (result.rowCount !== 1) refuse('attempt_conflict');
+      },
+      async getRetentionUsage(scope) {
+        const result = await queryClient.query(`/* retention_capacity_snapshot */
+          SELECT bucket, quota_key, SUM(units)::text AS units
+          FROM (
+            SELECT 'committed'::text AS bucket, usage.key AS quota_key,
+              usage.value::numeric AS units
+            FROM billing_validation_control.retention_receipts AS receipt
+            CROSS JOIN LATERAL jsonb_each_text(receipt.retained_usage) AS usage(key, value)
+            WHERE receipt.project_ref = $1 AND receipt.branch_id = $2 AND receipt.stripe_account_id = $3
+            UNION ALL
+            SELECT 'reserved'::text AS bucket, usage.key AS quota_key,
+              usage.value::numeric AS units
+            FROM billing_validation_control.retention_reservations AS reservation
+            CROSS JOIN LATERAL jsonb_each_text(reservation.projection) AS usage(key, value)
+            WHERE reservation.project_ref = $1 AND reservation.branch_id = $2 AND reservation.stripe_account_id = $3
+              AND NOT EXISTS (
+                SELECT 1 FROM billing_validation_control.retention_receipts AS settled
+                WHERE settled.reservation_id = reservation.reservation_id
+              )
+          ) AS ledger
+          GROUP BY bucket, quota_key`, [scope.projectRef, scope.branchId, scope.stripeAccountId]);
+        const policies = await queryClient.query(`/* retention_policy_pin */
+          SELECT quota_limits
+          FROM billing_validation_control.retention_reservations
+          WHERE project_ref = $1 AND branch_id = $2 AND stripe_account_id = $3
+          GROUP BY quota_limits LIMIT 2`, [scope.projectRef, scope.branchId, scope.stripeAccountId]);
+        if ((policies.rows ?? []).length > 1) refuse('retention_ledger_invalid');
+        const committed = Object.fromEntries(RETENTION_QUOTA_KEYS.map((key) => [key, 0]));
+        const reserved = Object.fromEntries(RETENTION_QUOTA_KEYS.map((key) => [key, 0]));
+        const seen = new Set();
+        for (const row of result.rows ?? []) {
+          const target = row.bucket === 'committed' ? committed : row.bucket === 'reserved' ? reserved : null;
+          const value = typeof row.units === 'string' && /^(0|[1-9][0-9]*)$/.test(row.units)
+            ? Number(row.units) : Number.NaN;
+          const identity = `${row.bucket}:${row.quota_key}`;
+          if (!target || !Object.hasOwn(target, row.quota_key) || seen.has(identity) || !Number.isSafeInteger(value)) {
+            refuse('retention_ledger_invalid');
+          }
+          seen.add(identity);
+          target[row.quota_key] = value;
+        }
+        return { committed, reserved,
+          policyLimits: policies.rows?.[0] ? jsonValue(policies.rows[0].quota_limits) : null };
+      },
+      async getRetentionReservationByAttempt(attemptId) {
+        const result = await queryClient.query(`SELECT reservation_id, attempt_id, project_ref, branch_id,
+          stripe_account_id, policy_version, quota_limits, projection, capacity_snapshot,
+          extract(epoch FROM created_at) AS created_at_epoch
+          FROM billing_validation_control.retention_reservations WHERE attempt_id = $1`, [attemptId]);
+        return retentionReservationFromDb(result.rows[0]);
+      },
+      async getRetentionReservation(reservationId) {
+        const result = await queryClient.query(`SELECT reservation_id, attempt_id, project_ref, branch_id,
+          stripe_account_id, policy_version, quota_limits, projection, capacity_snapshot,
+          extract(epoch FROM created_at) AS created_at_epoch
+          FROM billing_validation_control.retention_reservations WHERE reservation_id = $1`, [reservationId]);
+        return retentionReservationFromDb(result.rows[0]);
+      },
+      async getRetentionReceipt(reservationId) {
+        const result = await queryClient.query(`SELECT receipt_id, reservation_id, attempt_id, project_ref,
+          branch_id, stripe_account_id, outcome, retained_usage,
+          extract(epoch FROM created_at) AS created_at_epoch
+          FROM billing_validation_control.retention_receipts WHERE reservation_id = $1`, [reservationId]);
+        return retentionReceiptFromDb(result.rows[0]);
+      },
+      async putRetentionReservation(reservation) {
+        const result = await queryClient.query(`INSERT INTO billing_validation_control.retention_reservations
+          (reservation_id, attempt_id, project_ref, branch_id, stripe_account_id, policy_version,
+           quota_limits, projection, capacity_snapshot, created_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,to_timestamp($10))`,
+        [reservation.reservationId, reservation.attemptId, reservation.scope.projectRef,
+          reservation.scope.branchId, reservation.scope.stripeAccountId, reservation.policyVersion,
+          JSON.stringify(reservation.quotas), JSON.stringify(reservation.projection),
+          JSON.stringify(reservation.capacity), reservation.createdAt]);
+        if (result.rowCount !== 1) refuse('retention_reservation_conflict');
+      },
+      async putRetentionReceipt(receipt) {
+        const result = await queryClient.query(`INSERT INTO billing_validation_control.retention_receipts
+          (receipt_id, reservation_id, attempt_id, project_ref, branch_id, stripe_account_id,
+           outcome, retained_usage, created_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,to_timestamp($9))`,
+        [receipt.receiptId, receipt.reservationId, receipt.attemptId, receipt.scope.projectRef,
+          receipt.scope.branchId, receipt.scope.stripeAccountId, receipt.outcome,
+          JSON.stringify(receipt.retained), receipt.createdAt]);
+        if (result.rowCount !== 1) refuse('retention_receipt_conflict');
       },
       async getLease(key) {
         // This lock serializes even the first insert for an absent key. Hash collisions only reduce concurrency.
@@ -150,9 +275,10 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, expectedEnvir
   }) };
 }
 
-export function createPostgresAttemptStore({ client, preflight, target, verifyRecovery, verifyCleanup } = {}) {
+export function createPostgresAttemptStore({ client, preflight, target, verifyRecovery, verifyCleanup,
+  verifyRetentionReceipt } = {}) {
   assertWiring({ client, preflight, target });
-  return createAttemptStore(transactionAdapter(client, verifyRecovery, verifyCleanup,
+  return createAttemptStore(transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetentionReceipt,
     preflight.expectedEnvironment));
 }
 

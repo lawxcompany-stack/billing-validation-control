@@ -16,6 +16,10 @@ const environment = {
 const key = { branchId: 'validation-child-1', suite: 'billing', fixtureKey: 'invoice-a' };
 const shaA = 'a'.repeat(40);
 const shaB = 'b'.repeat(40);
+const retentionPolicy = { version: 1, quotas: {
+  attempts: 20, databaseRows: 200, authUsers: 20, stripeObjects: 200,
+} };
+const projection = { attempts: 1, databaseRows: 10, authUsers: 1, stripeObjects: 10 };
 const recheckRun = { repository: 'lawxcompany-stack/billing-validation-control',
   ref: 'refs/heads/main', runId: '200', runAttempt: 1 };
 
@@ -23,23 +27,35 @@ function input(attemptId = 'attempt-a', candidateSha = shaA, fixtureKey = 'invoi
   return { attemptId, key: { ...key, fixtureKey }, candidateSha, workflow: {
     repository: 'lawxcompany-stack/billing-validation-control', ref: 'refs/heads/main',
     runId: '100', runAttempt: 1, runnerLabel: `billing-validation-${'a'.repeat(32)}`,
-  }, environment, ttlSeconds: 60 };
+  }, environment, ttlSeconds: 60, retentionPolicy, projection };
 }
 
-function fakeAdapter({ trustedRecovery = true } = {}) {
+function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true } = {}) {
   const attempts = new Map();
   const leases = new Map();
+  const reservations = new Map();
+  const receipts = new Map();
   let clock = 1000;
   let recovery = { runTerminal: true, runnerRemoved: true, cleanupComplete: true };
   let cleanupVerified = true;
+  let retentionReconcilerVerified = trustedRetentionReconciler;
   let tail = Promise.resolve();
-  const snapshot = () => ({ attempts: structuredClone(attempts), leases: structuredClone(leases) });
+  const snapshot = () => ({ attempts: structuredClone(attempts), leases: structuredClone(leases),
+    reservations: structuredClone(reservations), receipts: structuredClone(receipts) });
+  const sameScope = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const sumUsage = (rows, field) => {
+    const total = { attempts: 0, databaseRows: 0, authUsers: 0, stripeObjects: 0 };
+    for (const row of rows) for (const key of Object.keys(total)) total[key] += row[field][key];
+    return total;
+  };
   return {
-    attempts, leases, advance: (seconds) => { clock += seconds; },
+    attempts, leases, reservations, receipts, advance: (seconds) => { clock += seconds; },
     setRecovery: (value) => { recovery = value; },
     setCleanupVerified: (value) => { cleanupVerified = value; },
+    setRetentionReconcilerVerified: (value) => { retentionReconcilerVerified = value; },
     verifyCleanup: async () => cleanupVerified,
     ...(trustedRecovery ? { verifyRecovery: async () => recovery } : {}),
+    verifyRetentionReceipt: async () => retentionReconcilerVerified,
     async transaction(fn) {
       const previous = tail;
       let unlock;
@@ -48,19 +64,48 @@ function fakeAdapter({ trustedRecovery = true } = {}) {
       const before = snapshot();
       const tx = {
         lockAttempt: async () => {},
+        lockRetention: async () => {},
         now: () => clock,
         getAttempt: async (id) => structuredClone(attempts.get(id) ?? null),
         putAttempt: async (row) => attempts.set(row.attemptId, structuredClone(row)),
         getLease: async (k) => structuredClone(leases.get(JSON.stringify(k)) ?? null),
         putLease: async (row) => leases.set(JSON.stringify(row.key), structuredClone(row)),
         deleteLease: async (k) => leases.delete(JSON.stringify(k)),
+        async getRetentionUsage(scope) {
+          const allReservations = [...reservations.values()].filter((row) => sameScope(row.scope, scope));
+          const settled = allReservations.filter((row) => receipts.has(row.reservationId));
+          const outstanding = allReservations.filter((row) => !receipts.has(row.reservationId));
+          const settledReceipts = settled.map((row) => receipts.get(row.reservationId));
+          return { committed: sumUsage(settledReceipts, 'retained'),
+            reserved: sumUsage(outstanding, 'projection'),
+            policyLimits: allReservations[0]?.quotas ?? null };
+        },
+        async getRetentionReservationByAttempt(id) {
+          return structuredClone([...reservations.values()].find((row) => row.attemptId === id) ?? null);
+        },
+        async getRetentionReservation(id) { return structuredClone(reservations.get(id) ?? null); },
+        async getRetentionReceipt(id) { return structuredClone(receipts.get(id) ?? null); },
+        async putRetentionReservation(row) {
+          if (reservations.has(row.reservationId) || [...reservations.values()].some((item) => item.attemptId === row.attemptId)) {
+            throw Object.assign(new Error('reservation_conflict'), { code: 'retention_reservation_conflict' });
+          }
+          reservations.set(row.reservationId, structuredClone(row));
+        },
+        async putRetentionReceipt(row) {
+          if (!reservations.has(row.reservationId) || receipts.has(row.reservationId)) {
+            throw Object.assign(new Error('receipt_conflict'), { code: 'retention_receipt_conflict' });
+          }
+          receipts.set(row.reservationId, structuredClone(row));
+        },
         fixtureMutation: async (f) => f(),
       };
       try { return await fn(tx); }
       catch (error) {
-        attempts.clear(); leases.clear();
+        attempts.clear(); leases.clear(); reservations.clear(); receipts.clear();
         for (const [k, v] of before.attempts) attempts.set(k, v);
         for (const [k, v] of before.leases) leases.set(k, v);
+        for (const [k, v] of before.reservations) reservations.set(k, v);
+        for (const [k, v] of before.receipts) receipts.set(k, v);
         throw error;
       } finally { unlock(); }
     },
@@ -479,4 +524,100 @@ test('collected attempt cannot release its lease before recheck or cancellation'
     from: 'collecting', to: 'collected', artifact });
   await assert.rejects(cleanupAttempt(store, { attemptId: row.attemptId,
     fence: row.fence, verified: true }), { code: 'cleanup_not_terminal' });
+});
+
+test('admission refuses missing, unbounded, zero, negative, fractional, or unknown retention quotas before writes', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const invalid = [
+    { retentionPolicy: undefined },
+    { retentionPolicy: { version: 1, quotas: { ...retentionPolicy.quotas, stripeObjects: undefined } } },
+    { retentionPolicy: { version: 1, quotas: { ...retentionPolicy.quotas, attempts: 0 } } },
+    { retentionPolicy: { version: 1, quotas: { ...retentionPolicy.quotas, attempts: -1 } } },
+    { retentionPolicy: { version: 1, quotas: { ...retentionPolicy.quotas, attempts: Number.POSITIVE_INFINITY } } },
+    { retentionPolicy: { version: 1, quotas: { ...retentionPolicy.quotas, attempts: 1.5 } } },
+    { retentionPolicy: { version: 1, quotas: { ...retentionPolicy.quotas, unknown: 1 } } },
+    { projection: { ...projection, databaseRows: -1 } },
+    { projection: { ...projection, extraRows: 1 } },
+  ];
+  for (const [index, overrides] of invalid.entries()) {
+    await assert.rejects(prepareAttempt(store, { ...input(`invalid-${index}`), ...overrides }),
+      { code: 'retention_policy_invalid' });
+  }
+  assert.equal(adapter.attempts.size, 0);
+  assert.equal(adapter.leases.size, 0);
+  assert.equal(adapter.reservations.size, 0);
+});
+
+test('reservation succeeds exactly at every configured finite quota and refuses projected overflow', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const policy = { version: 1, quotas: { attempts: 2, databaseRows: 8, authUsers: 2, stripeObjects: 6 } };
+  const writes = { attempts: 1, databaseRows: 4, authUsers: 1, stripeObjects: 3 };
+  const first = await prepareAttempt(store, { ...input(), retentionPolicy: policy, projection: writes });
+  const second = await prepareAttempt(store, { ...input('attempt-b', shaB, 'invoice-b'),
+    retentionPolicy: policy, projection: writes });
+  assert.deepEqual(second.capacity.projected, policy.quotas);
+  assert.deepEqual(second.capacity.remaining, { attempts: 0, databaseRows: 0, authUsers: 0, stripeObjects: 0 });
+  await assert.rejects(prepareAttempt(store, { ...input('attempt-c', shaA, 'invoice-c'),
+    retentionPolicy: policy, projection: { ...writes, databaseRows: 1 } }),
+  { code: 'retention_capacity_exceeded' });
+  assert.equal(adapter.reservations.size, 2);
+  assert.equal(first.capacity.projected.databaseRows, 4);
+});
+
+test('retention limits are pinned to the first immutable reservation in a branch/account scope', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const firstPolicy = { version: 1, quotas: { attempts: 5, databaseRows: 20, authUsers: 5, stripeObjects: 20 } };
+  await prepareAttempt(store, { ...input(), retentionPolicy: firstPolicy });
+  const changedPolicy = { version: 1, quotas: { ...firstPolicy.quotas, databaseRows: 1000 } };
+  await assert.rejects(prepareAttempt(store, { ...input('attempt-b', shaB, 'invoice-b'),
+    retentionPolicy: changedPolicy }), { code: 'retention_policy_mismatch' });
+  assert.equal(adapter.reservations.size, 1);
+});
+
+test('a post-reservation failure and elapsed lease do not release ambiguous capacity before reconciler receipt', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const policy = { version: 1, quotas: { attempts: 3, databaseRows: 5, authUsers: 3, stripeObjects: 6 } };
+  const writes = { attempts: 1, databaseRows: 4, authUsers: 1, stripeObjects: 2 };
+  const owner = await prepareAttempt(store, { ...input(), retentionPolicy: policy, projection: writes });
+  let providerAttempts = 0;
+  await assert.rejects(store.fixtureMutation(owner, async () => {
+    providerAttempts++;
+    throw new Error('ambiguous_result');
+  }), { message: 'ambiguous_result' });
+  assert.equal(providerAttempts, 1);
+  adapter.advance(61);
+  await assert.rejects(prepareAttempt(store, { ...input('attempt-b', shaB, 'invoice-b'),
+    retentionPolicy: policy, projection: writes }), { code: 'retention_capacity_exceeded' });
+  assert.equal(adapter.receipts.size, 0);
+
+  adapter.setRetentionReconcilerVerified(false);
+  await assert.rejects(store.reconcileReservation({ reservationId: owner.reservationId,
+    outcome: 'failed', retained: { attempts: 1, databaseRows: 0, authUsers: 0, stripeObjects: 0 } }),
+  { code: 'retention_reconciliation_unverified' });
+  assert.equal(adapter.receipts.size, 0);
+
+  adapter.setRetentionReconcilerVerified(true);
+  await store.reconcileReservation({ reservationId: owner.reservationId, outcome: 'failed',
+    retained: { attempts: 1, databaseRows: 1, authUsers: 0, stripeObjects: 1 } });
+  const admitted = await prepareAttempt(store, { ...input('attempt-b', shaB, 'invoice-b'),
+    retentionPolicy: policy, projection: writes });
+  assert.equal(admitted.capacity.projected.databaseRows, policy.quotas.databaseRows);
+  assert.equal(admitted.capacity.projected.stripeObjects, 3);
+});
+
+test('retained historical attempt receipts consume quota independently of mutable attempt rows', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const policy = { version: 1, quotas: { attempts: 1, databaseRows: 20, authUsers: 5, stripeObjects: 20 } };
+  const writes = { attempts: 1, databaseRows: 2, authUsers: 1, stripeObjects: 2 };
+  const owner = await prepareAttempt(store, { ...input(), retentionPolicy: policy, projection: writes });
+  await store.reconcileReservation({ reservationId: owner.reservationId, outcome: 'completed', retained: writes });
+  adapter.attempts.delete(owner.attemptId);
+  await assert.rejects(prepareAttempt(store, { ...input('attempt-b', shaB, 'invoice-b'),
+    retentionPolicy: policy, projection: writes }), { code: 'retention_capacity_exceeded' });
+  assert.equal(adapter.receipts.size, 1);
 });

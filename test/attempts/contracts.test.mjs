@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createSnapshot, verifyRecheckSnapshot } from '../../src/contracts/attempt.mjs';
+import { createAttemptStore } from '../../src/attempts/store.mjs';
 
 const row = {
   attemptId: 'attempt-123', key: { branchId: 'child-123', suite: 'billing', fixtureKey: 'invoice-a' },
@@ -78,4 +79,45 @@ test('Stripe client secrets cannot be copied into public resource IDs', () => {
   }
   assert.deepEqual(createSnapshot({ ...row, resourceIds: ['pi_123', 'seti_123'] },
     'artifact-321').snapshot.resourceIds, ['pi_123', 'seti_123']);
+});
+
+test('retention admission contract rejects accessors and malformed quota/projection shapes without invoking getters', async () => {
+  let transactions = 0;
+  const store = createAttemptStore({ async transaction() { transactions++; } });
+  const validInput = {
+    attemptId: 'attempt-retention', key: { branchId: 'child-123', suite: 'billing', fixtureKey: 'invoice-a' },
+    candidateSha: 'a'.repeat(40), workflow: row.workflow, environment: row.environment, ttlSeconds: 60,
+    retentionPolicy: { version: 1, quotas: {
+      attempts: 10, databaseRows: 100, authUsers: 10, stripeObjects: 100,
+    } },
+    projection: { attempts: 1, databaseRows: 4, authUsers: 1, stripeObjects: 4 },
+  };
+  const malformed = [
+    { retentionPolicy: { ...validInput.retentionPolicy, version: 2 } },
+    { retentionPolicy: { version: 1, quotas: { ...validInput.retentionPolicy.quotas, unknown: 1 } } },
+    { retentionPolicy: { version: 1, quotas: { ...validInput.retentionPolicy.quotas, attempts: 0 } } },
+    { projection: { ...validInput.projection, databaseRows: 1.25 } },
+    { projection: { ...validInput.projection, attempts: 2 } },
+    { projection: { ...validInput.projection, stripeObjects: -1 } },
+    { projection: { ...validInput.projection, ignored: 1 } },
+  ];
+  for (const override of malformed) {
+    await assert.rejects(store.prepare({ ...validInput, ...override }), { code: 'retention_policy_invalid' });
+  }
+
+  let getterReads = 0;
+  const quotasWithGetter = { ...validInput.retentionPolicy.quotas };
+  Object.defineProperty(quotasWithGetter, 'databaseRows', { enumerable: true,
+    get() { getterReads++; return 100; } });
+  await assert.rejects(store.prepare({ ...validInput, retentionPolicy: { version: 1, quotas: quotasWithGetter } }),
+    { code: 'retention_policy_invalid' });
+  assert.equal(getterReads, 0);
+
+  let inputGetterReads = 0;
+  const inputWithGetter = { ...validInput };
+  Object.defineProperty(inputWithGetter, 'retentionPolicy', { enumerable: true,
+    get() { inputGetterReads++; return validInput.retentionPolicy; } });
+  await assert.rejects(store.prepare(inputWithGetter), { code: 'retention_policy_invalid' });
+  assert.equal(inputGetterReads, 0);
+  assert.equal(transactions, 0);
 });
