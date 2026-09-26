@@ -73,7 +73,20 @@ function expectedEnvironmentSnapshot(adapter) {
   let descriptor;
   try { descriptor = Object.getOwnPropertyDescriptor(adapter, 'expectedEnvironment'); }
   catch { refuse('store_client_invalid'); }
-  if (!descriptor) return null;
+  if (!descriptor) {
+    let prototype;
+    try { prototype = Object.getPrototypeOf(adapter); }
+    catch { refuse('store_client_invalid'); }
+    while (prototype !== null) {
+      let inherited;
+      try { inherited = Object.getOwnPropertyDescriptor(prototype, 'expectedEnvironment'); }
+      catch { refuse('store_client_invalid'); }
+      if (inherited) refuse('store_client_invalid');
+      try { prototype = Object.getPrototypeOf(prototype); }
+      catch { refuse('store_client_invalid'); }
+    }
+    return null;
+  }
   if (!Object.hasOwn(descriptor, 'value')) refuse('store_client_invalid');
   if (descriptor.value === undefined) return null;
   const snapshot = snapshotEnvironment(descriptor.value);

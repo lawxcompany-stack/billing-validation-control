@@ -394,6 +394,24 @@ test('prepare pins the expected environment snapshot when the store is created',
   assert.deepEqual(row.environment, environment);
 });
 
+test('store rejects inherited expected-environment bindings without invoking accessors', () => {
+  let getterCalls = 0;
+  const inheritedGetter = Object.create(null);
+  Object.defineProperty(inheritedGetter, 'expectedEnvironment', {
+    enumerable: true,
+    get() { getterCalls++; return environment; },
+  });
+  const inheritedData = Object.create(null, {
+    expectedEnvironment: { enumerable: true, value: structuredClone(environment) },
+  });
+
+  for (const prototype of [inheritedGetter, inheritedData]) {
+    const adapter = Object.assign(Object.create(prototype), fakeAdapter());
+    assert.throws(() => createAttemptStore(adapter), { code: 'store_client_invalid' });
+  }
+  assert.equal(getterCalls, 0);
+});
+
 test('collect transition refuses secret-bearing resources and malformed artifact metadata', async () => {
   const store = createAttemptStore(fakeAdapter());
   const row = await prepareAttempt(store, input());
