@@ -1,5 +1,6 @@
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { providerIdempotencyKey } from '../attempts/prepare.mjs';
+import { runStripeMutation, stripeRequestDigest } from '../runtime/stripe.mjs';
 
 export class BillingControlRefusal extends Error {
   constructor(code) { super(code); this.name = 'BillingControlRefusal'; this.code = code; }
@@ -70,16 +71,43 @@ export async function mutateProvider(context, { provider = 'stripe', action, ope
       typeof operation !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(operation) ||
       !input || typeof input !== 'object' || Array.isArray(input)) refuse('billing_mutation_invalid');
 
-  const { owner, preflight } = context;
+  const { owner, attempts } = context;
+  if (provider === 'supabase' && (typeof attempts?.fixtureMutation !== 'function' ||
+      typeof context.mutationAdapter?.mutateInTransaction !== 'function')) {
+    refuse('supabase_transaction_adapter_unavailable');
+  }
   const idempotencyKey = providerIdempotencyKey(owner.attemptId, provider, operation);
-  await assertCurrentAttempt(context);
+  const current = await assertCurrentAttempt(context);
+  if (provider === 'stripe' && typeof attempts.beginStripeIntent !== 'function') {
+    refuse('stripe_intent_store_unavailable');
+  }
+  const requestDigest = provider === 'stripe' ? stripeRequestDigest({ action, operation, input }) : undefined;
+  const request = { attemptId: owner.attemptId, fence: owner.fence,
+    candidateSha: current.candidateSha, workflow: current.workflow,
+    environment: current.environment, provider, action, operation, idempotencyKey,
+    ...(requestDigest ? { requestDigest } : {}), input: structuredClone(input) };
 
   try {
-    await context.mutationAdapter.mutate({ attemptId: owner.attemptId, fence: owner.fence,
-      environment: preflight.expectedEnvironment, provider, action, operation, idempotencyKey,
-      input: structuredClone(input) });
-  } catch {
+    if (provider === 'stripe') {
+      const stripeOwner = { attemptId: owner.attemptId, fence: owner.fence,
+        candidateSha: current.candidateSha, workflow: current.workflow,
+        environment: current.environment };
+      const result = await runStripeMutation({ attempts, owner: stripeOwner, action, operation,
+        input, idempotencyKey, adapter: context.mutationAdapter });
+      return Object.freeze({ operation, idempotencyKey, dispatched: true,
+        intentId: result.intentId, requestDigest: result.requestDigest, state: result.state });
+    }
+    await attempts.fixtureMutation({ attemptId: owner.attemptId, fence: owner.fence },
+      (tx) => context.mutationAdapter.mutateInTransaction(request, tx));
+  } catch (error) {
+    if (['lease_fence_lost', 'lease_expired'].includes(error?.code) ||
+        (provider === 'stripe' && ['stripe_mutation_ambiguous', 'stripe_intent_unresolved',
+          'stripe_intent_already_reconciled'].includes(error?.code))) {
+      throw error;
+    }
     refuse('provider_mutation_failed');
   }
   return Object.freeze({ operation, idempotencyKey, dispatched: true });
 }
+
+export { stripeRequestDigest };

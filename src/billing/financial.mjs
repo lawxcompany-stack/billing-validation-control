@@ -5,6 +5,7 @@ import { databaseSnapshotDigest, databaseSnapshotsEqual, expectedGrantCount, mat
   hasVerifiedDeclineState, isTrustedFinancialObservation, isValidExpectedAccess,
   observeFinancialEvidence } from './observations.mjs';
 import { verifyChallengeCapability, verifyOpaqueCapability } from './witnesses.mjs';
+import { reconcileStripeIntent } from '../runtime/stripe.mjs';
 
 export { FINANCIAL_EVIDENCE_REQUIREMENTS };
 
@@ -28,7 +29,7 @@ export function requiredFinancialEvidence(caseId) {
   return FINANCIAL_EVIDENCE_REQUIREMENTS[caseId];
 }
 
-export async function replayCheckoutRequest({ context, applicationRequest,
+export async function replayCheckoutRequest({ context, applicationRequest, readStripeIntentObservation,
   contracts = context?.contracts } = {}) {
   assertCompleteBilling43Contracts(contracts);
   if (!applicationRequest || typeof applicationRequest !== 'object' || Array.isArray(applicationRequest) ||
@@ -37,9 +38,23 @@ export async function replayCheckoutRequest({ context, applicationRequest,
       !/^[A-Za-z0-9_-]{16,128}$/u.test(applicationRequest.idempotencyKey) ||
       !applicationRequest.sessionParams || typeof applicationRequest.sessionParams !== 'object' ||
       Array.isArray(applicationRequest.sessionParams)) refuse('checkout_replay_request_invalid');
-  await mutateProvider(context, { provider: 'stripe', action: 'checkout.replay',
+  if (typeof readStripeIntentObservation !== 'function') refuse('checkout_replay_reconciliation_unavailable');
+  const request = structuredClone(applicationRequest);
+  const mutation = await mutateProvider(context, { provider: 'stripe', action: 'checkout.replay',
     operation: `checkout-replay:${applicationRequest.quoteId}`,
-    input: { applicationRequest: structuredClone(applicationRequest) } });
+    input: { applicationRequest: request } });
+  if (!mutation || typeof mutation.intentId !== 'string' || typeof mutation.operation !== 'string') {
+    refuse('checkout_replay_intent_unavailable');
+  }
+  const receipt = await reconcileStripeIntent({ attempts: context.attempts, owner: context.owner,
+    intentId: mutation.intentId,
+    readObservation: (intent) => readStripeIntentObservation({ intent, applicationRequest: request,
+      attemptId: context.owner.attemptId, fence: context.owner.fence,
+      environment: context.preflight.expectedEnvironment }) });
+  if (!receipt || typeof receipt.receiptId !== 'string') refuse('checkout_replay_reconciliation_failed');
+  return Object.freeze({ intentId: mutation.intentId, operation: mutation.operation,
+    requestDigest: mutation.requestDigest, idempotencyKey: mutation.idempotencyKey,
+    state: 'reconciled', receiptId: receipt.receiptId });
 }
 
 function replayStateValid(state, event, context) {

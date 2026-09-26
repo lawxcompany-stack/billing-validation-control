@@ -1,5 +1,35 @@
 export function withFixtureMutation(store, owner, mutation) { return store.fixtureMutation(owner, mutation); }
 
+export async function withStripeIntent(attempts, owner, intent, invokeAdapter) {
+  if (typeof attempts?.beginStripeIntent !== 'function' ||
+      typeof owner?.attemptId !== 'string' || typeof owner?.fence !== 'string' ||
+      typeof owner?.candidateSha !== 'string' || !owner.workflow || !owner.environment ||
+      typeof intent?.action !== 'string' || typeof intent?.operation !== 'string' ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/.test(intent.operation) ||
+      typeof intent?.requestDigest !== 'string' || !/^[a-f0-9]{64}$/.test(intent.requestDigest) ||
+      typeof intent?.idempotencyKey !== 'string' || !/^billing-validation-[a-f0-9]{64}$/.test(intent.idempotencyKey) ||
+      typeof invokeAdapter !== 'function') {
+    throw Object.assign(new Error('stripe_intent_invalid'), { code: 'stripe_intent_invalid' });
+  }
+
+  const stored = await attempts.beginStripeIntent({ attemptId: owner.attemptId, fence: owner.fence,
+    candidateSha: owner.candidateSha, workflow: owner.workflow, environment: owner.environment,
+    action: intent.action, operation: intent.operation, requestDigest: intent.requestDigest,
+    idempotencyKey: intent.idempotencyKey });
+  if (!stored || stored.state !== 'in_flight' || typeof stored.intentId !== 'string') {
+    throw Object.assign(new Error('stripe_intent_persistence_unverified'), {
+      code: 'stripe_intent_persistence_unverified',
+    });
+  }
+  try {
+    await invokeAdapter(stored);
+  } catch {
+    throw Object.assign(new Error('stripe_mutation_ambiguous'), { code: 'stripe_mutation_ambiguous' });
+  }
+  return Object.freeze({ intentId: stored.intentId, operation: stored.operation,
+    requestDigest: stored.requestDigest, idempotencyKey: stored.idempotencyKey, state: 'in_flight' });
+}
+
 export async function withExternalFence(store, owner, mutation) {
   await store.assertFence(owner);
   return mutation();

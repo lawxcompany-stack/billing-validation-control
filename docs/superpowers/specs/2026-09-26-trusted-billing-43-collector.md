@@ -1,6 +1,6 @@
 # Trusted Billing 43 collector — implementation contract
 
-**Status:** locally approved on 2026-09-26. This copy travels with the control-repository implementation plan. The fuller approved design is in the app worktree at docs/superpowers/specs/2026-09-26-trusted-billing-43-collector-design.md.
+**Status:** locally approved on 2026-09-26. This copy travels with the control-repository implementation plan. The fuller approved design currently exists in the sibling local worktree `trusted-billing-control-plane-design` and is not yet portable in this repository; Task 11 must include the complete operator-facing design/contracts here before the collector is considered fully documented.
 
 ## Goal and authority
 
@@ -29,6 +29,7 @@ signup.advbox and payment.3ds are supervised workflows outside this suite and ca
 - Do not expose provider/control credentials to candidate-controlled jobs. The Preview candidate may read all its runtime variables, so its values must be disposable and branch/account scoped. Never pass control-schema credentials, GitHub App keys, activation challenges, runner tokens, Postgres-wide passwords, or production secrets to Preview or browser code.
 - The collector is append-only for historical financial rows, Auth users, and Stripe objects. It may reverse only allowlisted reversible resources (expire open Checkout Sessions and cancel owned test subscriptions); it never deletes history, users, Stripe customers, payment intents, events, or Test Clocks.
 - Capacity reservation, a global Supabase-branch and Stripe-account lock, attemptId, fixtureRunId, and fencing token are required before writes. Expired lease alone never permits takeover. Ambiguous provider intents retain lock and capacity until independent reconciliation.
+- A successful Stripe mutation is not returned as complete until a separate read-only observation is independently verified and recorded in an append-only receipt. The observer must not treat the mutation response or candidate-supplied values as proof. Missing readers fail before dispatch; observation or receipt failures preserve the unresolved intent and lock for recovery.
 - Stripe idempotency keys may be pruned by Stripe after at least 24 hours. Never retry an ambiguous mutation merely because the same key was persisted. Reconcile first; otherwise block. If a Test Clock reaches deletes_after before terminal reconciliation, do not delete or infer cleanup; retain the lock and require manual recovery.
 - Retention policy must be finite, valid, and sufficient before the first fixture write. Missing/unbounded/exceeded capacity blocks. No automated database/branch rotation.
 - Successful cleanup means ownership and projected state are reconciled, no active grants/contracts remain, reversible resources are closed, an append-only receipt is persisted, and lease/capacity may be released. It explicitly reports databaseBaselineRestored=false and fixtureReusable=false.

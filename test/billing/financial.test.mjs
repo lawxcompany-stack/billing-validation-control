@@ -5,7 +5,6 @@ import { databaseSnapshot, environment, importIfMissing, makeAttemptParts, makeR
   manualResendCapabilities, expectRefusal } from './support.mjs';
 
 const contracts = await importIfMissing(() => import('../../src/billing/contracts.mjs'));
-const billing43 = await importIfMissing(() => import('../../src/contracts/billing-43.mjs'));
 const financial = await importIfMissing(() => import('../../src/billing/financial.mjs'));
 const fixtures = await importIfMissing(() => import('../../src/billing/fixtures.mjs'));
 
@@ -37,35 +36,86 @@ test('checkout replay refuses a missing or incomplete registry before invoking S
   }
 });
 
-test('replaying an app checkout uses the complete registry from the trusted collector context', async () => {
+test('checkout replay retains an unresolved intent after observation failure and blocks retries', async () => {
   const replay = needExport(financial, 'replayCheckoutRequest');
   const parts = makeAttemptParts();
   const domainContracts = completeBilling43Contracts();
-  const scenarioId = domainContracts[0].id;
   const verifiedContext = needExport(contracts, 'createVerifiedContext')(parts);
   const request = Object.freeze({ quoteId: 'quote_task6', idempotencyKey: 'quote-scoped-replay-0001',
     sessionParams: Object.freeze({ mode: 'subscription', currency: 'brl', amount: 2500 }) });
-  domainContracts[0] = {
-    ...domainContracts[0],
-    async run(context) {
-      await replay({ context, applicationRequest: request });
-      await replay({ context, applicationRequest: request });
-      return 'replayed';
-    },
-  };
-  const outcome = await needExport(billing43, 'runBilling43Scenario')({
-    id: scenarioId,
-    contracts: domainContracts,
-    async createFixture() { return { fixtureId: 'fixture_task6' }; },
-    context: verifiedContext,
-  });
-  assert.equal(outcome, 'replayed');
-  assert.equal(parts.calls.mutations.length, 2);
+  await assert.rejects(replay({ context: verifiedContext, applicationRequest: request,
+    contracts: domainContracts, readStripeIntentObservation: async () => {
+      throw new Error('independent read unavailable');
+    } }), { code: 'stripe_observation_unavailable' });
+  await assert.rejects(replay({ context: verifiedContext, applicationRequest: request,
+    contracts: domainContracts, readStripeIntentObservation: async () => ({}) }),
+  { code: 'stripe_intent_unresolved' });
+  assert.equal(parts.calls.mutations.length, 1);
   assert.equal(parts.calls.mutations[0].input.applicationRequest.idempotencyKey, 'quote-scoped-replay-0001');
-  assert.equal(parts.calls.mutations[1].input.applicationRequest.idempotencyKey, 'quote-scoped-replay-0001');
-  assert.equal(parts.calls.mutations[0].idempotencyKey, parts.calls.mutations[1].idempotencyKey);
-  assert.notEqual(parts.calls.mutations[0].idempotencyKey, request.idempotencyKey);
   assert.equal(parts.calls.mutations[0].attemptId, parts.owner.attemptId);
+  assert.equal(parts.calls.intentBegins.length, 1);
+});
+
+test('checkout replay independently reconciles a successful dispatch before returning', async () => {
+  const replay = needExport(financial, 'replayCheckoutRequest');
+  const parts = makeAttemptParts();
+  const domainContracts = completeBilling43Contracts();
+  const context = needExport(contracts, 'createVerifiedContext')(parts);
+  const request = Object.freeze({ quoteId: 'quote_task6', idempotencyKey: 'quote-scoped-replay-0001',
+    sessionParams: Object.freeze({ mode: 'subscription', currency: 'brl', amount: 2500 }) });
+  let observed;
+
+  const result = await replay({ context, applicationRequest: request, contracts: domainContracts,
+    readStripeIntentObservation: async (input) => {
+      observed = input;
+      return { accountId: environment.stripe.accountId, livemode: false,
+        operation: 'checkout-replay:quote_task6', requestDigest: input.intent.requestDigest,
+        idempotencyKey: input.intent.idempotencyKey,
+        resourceIds: ['cs_task6created'] };
+    } });
+
+  assert.equal(result.state, 'reconciled');
+  assert.equal(typeof result.receiptId, 'string');
+  assert.equal(observed.intent.intentId, result.intentId);
+  assert.equal(observed.attemptId, parts.owner.attemptId);
+  assert.equal(observed.fence, parts.owner.fence);
+  assert.equal(observed.applicationRequest.quoteId, 'quote_task6');
+  assert.equal(parts.calls.reconciliations.length, 1);
+  assert.deepEqual(await parts.attempts.listPendingStripeIntents({
+    attemptId: parts.owner.attemptId, fence: parts.owner.fence,
+  }), []);
+  assert.equal(JSON.stringify(result).includes('client_secret'), false);
+});
+
+test('checkout replay requires an independent reader before dispatching Stripe', async () => {
+  const replay = needExport(financial, 'replayCheckoutRequest');
+  const parts = makeAttemptParts();
+  const context = needExport(contracts, 'createVerifiedContext')(parts);
+  const request = Object.freeze({ quoteId: 'quote_task6', idempotencyKey: 'quote-scoped-replay-0001',
+    sessionParams: Object.freeze({ mode: 'subscription', currency: 'brl', amount: 2500 }) });
+
+  await expectRefusal(replay({ context, applicationRequest: request,
+    contracts: completeBilling43Contracts() }), 'checkout_replay_reconciliation_unavailable');
+  assert.equal(parts.calls.mutations.length, 0);
+  assert.equal(parts.calls.intentBegins.length, 0);
+});
+
+test('failed independent checkout observation retains the intent and blocks cleanup', async () => {
+  const replay = needExport(financial, 'replayCheckoutRequest');
+  const parts = makeAttemptParts();
+  const context = needExport(contracts, 'createVerifiedContext')(parts);
+  const request = Object.freeze({ quoteId: 'quote_task6', idempotencyKey: 'quote-scoped-replay-0001',
+    sessionParams: Object.freeze({ mode: 'subscription', currency: 'brl', amount: 2500 }) });
+
+  await assert.rejects(replay({ context, applicationRequest: request,
+    contracts: completeBilling43Contracts(),
+    readStripeIntentObservation: async () => { throw new Error('independent read unavailable'); } }),
+  { code: 'stripe_observation_unavailable' });
+  assert.equal(parts.calls.mutations.length, 1);
+  assert.equal(parts.calls.reconciliations.length, 0);
+  assert.equal((await parts.attempts.listPendingStripeIntents({
+    attemptId: parts.owner.attemptId, fence: parts.owner.fence,
+  })).length, 1);
 });
 
 test('financial success is withheld until payment, processed webhook and DB settlement all reconcile', async () => {

@@ -58,6 +58,63 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.attempts (
   UNIQUE (attempt_id, branch_id, suite, fixture_key)
 );
 
+CREATE TABLE IF NOT EXISTS billing_validation_control.resource_locks (
+  resource_type text NOT NULL CHECK (resource_type IN ('supabase_branch', 'stripe_account')),
+  resource_id text NOT NULL,
+  owner_attempt_id text NOT NULL REFERENCES billing_validation_control.attempts(attempt_id),
+  fence uuid NOT NULL,
+  candidate_sha char(40) NOT NULL,
+  workflow_repository text NOT NULL,
+  workflow_ref text NOT NULL,
+  workflow_run_id text NOT NULL,
+  workflow_run_attempt integer NOT NULL CHECK (workflow_run_attempt > 0),
+  runner_label text NOT NULL,
+  environment_identity jsonb NOT NULL CHECK (jsonb_typeof(environment_identity) = 'object'),
+  expires_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (resource_type, resource_id)
+);
+CREATE INDEX IF NOT EXISTS billing_validation_resource_owner
+  ON billing_validation_control.resource_locks (owner_attempt_id, fence);
+
+CREATE TABLE IF NOT EXISTS billing_validation_control.stripe_intents (
+  intent_id text PRIMARY KEY,
+  attempt_id text NOT NULL REFERENCES billing_validation_control.attempts(attempt_id),
+  owner_fence uuid NOT NULL,
+  account_id text NOT NULL,
+  candidate_sha char(40) NOT NULL,
+  workflow_repository text NOT NULL,
+  workflow_ref text NOT NULL,
+  workflow_run_id text NOT NULL,
+  workflow_run_attempt integer NOT NULL CHECK (workflow_run_attempt > 0),
+  runner_label text NOT NULL,
+  environment_identity jsonb NOT NULL CHECK (jsonb_typeof(environment_identity) = 'object'),
+  action text NOT NULL,
+  operation text NOT NULL,
+  request_digest char(64) NOT NULL,
+  idempotency_key text NOT NULL,
+  state text NOT NULL CHECK (state = 'in_flight'),
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  UNIQUE (attempt_id, operation),
+  UNIQUE (account_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS billing_validation_stripe_intent_attempt
+  ON billing_validation_control.stripe_intents (attempt_id, created_at);
+
+CREATE TABLE IF NOT EXISTS billing_validation_control.stripe_receipts (
+  receipt_id text PRIMARY KEY,
+  intent_id text NOT NULL UNIQUE REFERENCES billing_validation_control.stripe_intents(intent_id),
+  attempt_id text NOT NULL REFERENCES billing_validation_control.attempts(attempt_id),
+  owner_fence uuid NOT NULL,
+  account_id text NOT NULL,
+  operation text NOT NULL,
+  request_digest char(64) NOT NULL,
+  idempotency_key text NOT NULL,
+  observation_digest char(64) NOT NULL,
+  resource_ids jsonb NOT NULL CHECK (jsonb_typeof(resource_ids) = 'array'),
+  observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
 CREATE TABLE IF NOT EXISTS billing_validation_control.retention_reservations (
   reservation_id text PRIMARY KEY,
   attempt_id text NOT NULL UNIQUE
@@ -161,6 +218,27 @@ CREATE TRIGGER billing_validation_receipt_no_truncate
   BEFORE TRUNCATE ON billing_validation_control.retention_receipts
   FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
 
+DROP TRIGGER IF EXISTS billing_validation_stripe_intent_immutable
+  ON billing_validation_control.stripe_intents;
+CREATE TRIGGER billing_validation_stripe_intent_immutable
+  BEFORE UPDATE OR DELETE ON billing_validation_control.stripe_intents
+  FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
+DROP TRIGGER IF EXISTS billing_validation_stripe_intent_no_truncate
+  ON billing_validation_control.stripe_intents;
+CREATE TRIGGER billing_validation_stripe_intent_no_truncate
+  BEFORE TRUNCATE ON billing_validation_control.stripe_intents
+  FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
+DROP TRIGGER IF EXISTS billing_validation_stripe_receipt_immutable
+  ON billing_validation_control.stripe_receipts;
+CREATE TRIGGER billing_validation_stripe_receipt_immutable
+  BEFORE UPDATE OR DELETE ON billing_validation_control.stripe_receipts
+  FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
+DROP TRIGGER IF EXISTS billing_validation_stripe_receipt_no_truncate
+  ON billing_validation_control.stripe_receipts;
+CREATE TRIGGER billing_validation_stripe_receipt_no_truncate
+  BEFORE TRUNCATE ON billing_validation_control.stripe_receipts
+  FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
+
 CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_leases (
   branch_id text NOT NULL,
   suite text NOT NULL,
@@ -183,5 +261,9 @@ REVOKE ALL ON ALL TABLES IN SCHEMA billing_validation_control FROM PUBLIC, anon,
 REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control.retention_reservations
   FROM PUBLIC, anon, authenticated;
 REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control.retention_receipts
+  FROM PUBLIC, anon, authenticated;
+REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control.stripe_intents
+  FROM PUBLIC, anon, authenticated;
+REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control.stripe_receipts
   FROM PUBLIC, anon, authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA billing_validation_control REVOKE ALL ON TABLES FROM PUBLIC, anon, authenticated;

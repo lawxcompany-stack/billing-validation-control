@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { verifyStripeEnvironment } from '../../src/runtime/stripe.mjs';
 import * as stripeModule from '../../src/runtime/stripe.mjs';
+import { providerIdempotencyKey } from '../../src/attempts/prepare.mjs';
 import { deployment, policy } from './fixture.mjs';
 
 const key = 'sk_test_synthetic123';
@@ -49,7 +50,8 @@ test('binds the exact account, enabled TEST webhook and immutable Preview URL wi
 });
 
 test('exposes no mutation operation and refuses absent, Live, restricted, or malformed keys before requests', async () => {
-  assert.deepEqual(Object.keys(stripeModule).sort(), ['StripeRefusal', 'verifyStripeEnvironment']);
+  assert.deepEqual(Object.keys(stripeModule).sort(), ['StripeRefusal', 'reconcileStripeIntent',
+    'runStripeMutation', 'stripeRequestDigest', 'verifyStripeEnvironment']);
   for (const badKey of [undefined, 'sk_live_synthetic123', 'rk_test_synthetic123', 'sk_test_', 'sk_test_bad\nheader']) {
     const network = fixture();
     await assert.rejects(verifyStripeEnvironment({ policy, deployment, key: badKey, fetchImpl: network.fetchImpl }), {
@@ -146,4 +148,190 @@ test('rejects an oversized webhook response after a valid account read', async (
     code: 'stripe_response_invalid',
   });
   assert.equal(calls, 2);
+});
+
+const owner = Object.freeze({ attemptId: 'attempt-stripe-local',
+  fence: '11111111-1111-4111-8111-111111111111', candidateSha: 'c'.repeat(40),
+  workflow: Object.freeze({ repository: 'lawxcompany-stack/billing-validation-control',
+    ref: 'refs/heads/main', runId: '123456', runAttempt: 2,
+    runnerLabel: `billing-validation-${'f'.repeat(32)}` }),
+  environment: Object.freeze({ database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst',
+    branchId: 'validation-branch-1' }),
+  deployment: Object.freeze({ id: 'dpl_candidate123', origin: 'https://candidate.vercel.app' }),
+  stripe: Object.freeze({ accountId: policy.stripe.accountId }) }) });
+const operation = 'checkout:create:local-session';
+const action = 'checkout.replay';
+const mutationInput = Object.freeze({ amount: 2500, currency: 'usd',
+  metadata: Object.freeze({ attemptId: owner.attemptId }) });
+const idempotencyKey = providerIdempotencyKey(owner.attemptId, 'stripe', operation);
+
+function localIntentStore({ currentFence = owner.fence } = {}) {
+  const intents = new Map();
+  const receipts = [];
+  const pendingQueries = [];
+  const reconciled = new Set();
+  const calls = [];
+  return {
+    intents, receipts, calls, pendingQueries,
+    async assertFence(input) {
+      if (input.attemptId !== owner.attemptId || input.fence !== currentFence) {
+        throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
+      }
+      return { ...owner };
+    },
+    async beginStripeIntent(input) {
+      calls.push('begin');
+      if (input.fence !== currentFence) throw Object.assign(new Error('lease_fence_lost'), {
+        code: 'lease_fence_lost',
+      });
+      const key = `${input.attemptId}:${input.operation}`;
+      if (intents.has(key)) throw Object.assign(new Error('stripe_intent_unresolved'), {
+        code: 'stripe_intent_unresolved',
+      });
+      const intent = { intentId: 'intent_stripe_local_1', ...structuredClone(input),
+        accountId: input.environment.stripe.accountId, state: 'in_flight' };
+      intents.set(key, intent);
+      return intent;
+    },
+    async getStripeIntent(intentId) {
+      calls.push('read_intent');
+      return [...intents.values()].find((intent) => intent.intentId === intentId) ?? null;
+    },
+    async listPendingStripeIntents(input) {
+      calls.push('list_pending');
+      pendingQueries.push(structuredClone(input));
+      if (input.attemptId !== owner.attemptId || input.fence !== currentFence) {
+        throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
+      }
+      return [...intents.values()].filter((intent) => intent.attemptId === input.attemptId &&
+        !reconciled.has(intent.intentId)).map((intent) => structuredClone(intent));
+    },
+    async reconcileStripeIntent(input) {
+      calls.push('reconcile');
+      if (input.fence !== currentFence || input.attemptId !== owner.attemptId) {
+        throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
+      }
+      receipts.push(structuredClone(input));
+      reconciled.add(input.intentId);
+      return { intentId: input.intentId, state: 'reconciled', observationDigest: '2'.repeat(64) };
+    },
+  };
+}
+
+function stripeIntentInput(attempts, adapter) {
+  return { attempts, owner, action, operation, input: mutationInput, idempotencyKey, adapter };
+}
+
+test('persists an immutable in_flight TEST intent before adapter invocation and withholds its raw response', async () => {
+  const run = stripeModule.runStripeMutation;
+  assert.equal(typeof run, 'function');
+  const attempts = localIntentStore();
+  const events = [];
+  const result = await run(stripeIntentInput(attempts, { async mutate(request) {
+    events.push('adapter');
+    assert.equal(attempts.calls[0], 'begin');
+    const intent = attempts.intents.get(`${owner.attemptId}:${operation}`);
+    assert.equal(intent.state, 'in_flight');
+    assert.equal(request.accountId, policy.stripe.accountId);
+    assert.equal(request.livemode, false);
+    return { id: 'cs_synthetic123', client_secret: 'sk_test_private_payload' };
+  } }));
+
+  const intent = attempts.intents.get(`${owner.attemptId}:${operation}`);
+  assert.deepEqual(events, ['adapter']);
+  assert.equal(intent.attemptId, owner.attemptId);
+  assert.equal(intent.fence, owner.fence);
+  assert.equal(intent.candidateSha, owner.candidateSha);
+  assert.deepEqual(intent.workflow, owner.workflow);
+  assert.deepEqual(intent.environment, owner.environment);
+  assert.equal(intent.operation, operation);
+  assert.equal(intent.idempotencyKey, idempotencyKey);
+  assert.equal(intent.requestDigest, stripeModule.stripeRequestDigest({ action, operation, input: mutationInput }));
+  assert.deepEqual(result, { intentId: 'intent_stripe_local_1', operation,
+    requestDigest: intent.requestDigest, idempotencyKey, state: 'in_flight' });
+  assert.equal(JSON.stringify(result).includes('sk_test_private_payload'), false);
+  assert.equal(attempts.receipts.length, 0);
+});
+
+test('ambiguous Stripe failure retains the unresolved intent and never retries it after idempotency aging', async () => {
+  const run = stripeModule.runStripeMutation;
+  assert.equal(typeof run, 'function');
+  const attempts = localIntentStore();
+  let invocations = 0;
+  const args = stripeIntentInput(attempts, { async mutate() {
+    invocations++;
+    throw new Error('network timed out after dispatch');
+  } });
+
+  await assert.rejects(run(args), { code: 'stripe_mutation_ambiguous' });
+  assert.equal(attempts.intents.get(`${owner.attemptId}:${operation}`).state, 'in_flight');
+  await assert.rejects(run({ ...args, nowSeconds: 1_800_000_000 }), { code: 'stripe_intent_unresolved' });
+  await assert.rejects(run({ ...args, input: { ...mutationInput, amount: 2600 } }),
+    { code: 'stripe_intent_unresolved' });
+  await assert.rejects(run({ ...args, idempotencyKey: 'billing-validation-' + '9'.repeat(64) }),
+    { code: 'stripe_mutation_invalid' });
+  assert.equal(invocations, 1);
+  assert.equal(attempts.receipts.length, 0);
+});
+
+test('independent exact TEST observation is required before an intent can be reconciled', async () => {
+  const reconcile = stripeModule.reconcileStripeIntent;
+  assert.equal(typeof reconcile, 'function');
+  const attempts = localIntentStore();
+  const run = stripeModule.runStripeMutation;
+  await run(stripeIntentInput(attempts, { async mutate() {
+    return { id: 'cs_synthetic123', status: 'open' };
+  } }));
+  const intent = attempts.intents.get(`${owner.attemptId}:${operation}`);
+  const observation = {
+    accountId: policy.stripe.accountId, livemode: false, operation,
+    requestDigest: intent.requestDigest, idempotencyKey,
+    resourceIds: ['cs_synthetic123'],
+  };
+  let observedIntent;
+  const result = await reconcile({ attempts, owner, intentId: intent.intentId,
+    readObservation: async (storedIntent) => { observedIntent = storedIntent; return observation; } });
+  assert.equal(observedIntent.intentId, intent.intentId);
+  assert.deepEqual(attempts.receipts, [{ attemptId: owner.attemptId, fence: owner.fence,
+    intentId: intent.intentId, observation }]);
+  assert.deepEqual(attempts.pendingQueries, [{ attemptId: owner.attemptId, fence: owner.fence }]);
+  assert.equal(result.state, 'reconciled');
+});
+
+test('mismatched or Live observation and an expired Test Clock cannot settle an ambiguous intent', async () => {
+  const reconcile = stripeModule.reconcileStripeIntent;
+  const run = stripeModule.runStripeMutation;
+  assert.equal(typeof reconcile, 'function');
+  const cases = [
+    { accountId: 'acct_other123' },
+    { livemode: true },
+    { operation: 'subscription.cancel:other' },
+    { requestDigest: '9'.repeat(64) },
+    { idempotencyKey: 'billing-validation-other' },
+    { testClock: { id: 'clock_expired123', deletes_after: 999 } },
+  ];
+  for (const change of cases) {
+    const attempts = localIntentStore();
+    await run(stripeIntentInput(attempts, { async mutate() { return { id: 'cs_synthetic123' }; } }));
+    const intent = attempts.intents.get(`${owner.attemptId}:${operation}`);
+    const observation = { accountId: policy.stripe.accountId, livemode: false, operation,
+      requestDigest: intent.requestDigest, idempotencyKey, resourceIds: ['cs_synthetic123'], ...change };
+    await assert.rejects(reconcile({ attempts, owner, intentId: intent.intentId,
+      readObservation: async () => observation, nowSeconds: 1_000 }),
+    { code: change.testClock ? 'stripe_reconciliation_window_expired' : 'stripe_observation_mismatch' });
+    assert.equal(attempts.receipts.length, 0);
+    assert.equal(intent.state, 'in_flight');
+  }
+});
+
+test('Test Clock deletion is outside the Stripe mutation allowlist', async () => {
+  const run = stripeModule.runStripeMutation;
+  assert.equal(typeof run, 'function');
+  const attempts = localIntentStore();
+  let invoked = false;
+  await assert.rejects(run({ ...stripeIntentInput(attempts, { async mutate() { invoked = true; } }),
+    action: 'test_clock.delete', operation: 'clock-delete:clock_expired123' }),
+  { code: 'stripe_mutation_invalid' });
+  assert.equal(invoked, false);
+  assert.equal(attempts.intents.size, 0);
 });

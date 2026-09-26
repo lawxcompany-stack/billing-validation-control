@@ -96,7 +96,7 @@ test('paid challenge succeeds with null Stripe flow only after the bound opaque 
   assert.equal(result.evidence.provider.authenticationFlow, null);
   assert.deepEqual(capability.calls.map((call) => call.kind), ['obtain', 'verify']);
   assert.deepEqual(capability.calls[0].binding, { attemptId: 'attempt-task6',
-    fence: 'fence-task6', caseId: 'initial.challenge.success', paymentIntentId: 'pi_task6' });
+    fence: '11111111-1111-4111-8111-111111111111', caseId: 'initial.challenge.success', paymentIntentId: 'pi_task6' });
 });
 
 test('operator acknowledgement, a boolean, or a JSON witness cannot establish a challenge', async () => {
@@ -151,7 +151,7 @@ test('a challenge witness bound to a previous Task 5 fence cannot pass', async (
   const result = await evaluate(input);
   assert.equal(result.passed, false);
   assert.ok(result.failures.includes('challenge_witness_unverified'));
-  assert.equal(capability.calls[0].binding.fence, 'fence-task6');
+  assert.equal(capability.calls[0].binding.fence, '11111111-1111-4111-8111-111111111111');
 });
 
 test('positive challenge requires Stripe authenticationResult authenticated, even with a valid witness', async () => {
@@ -359,7 +359,7 @@ test('delayed and replay cases bind Task7 checkpoint and require a fresh receipt
     const result = await evaluate(input);
     assert.equal(result.passed, true);
     assert.equal(result.webhookReplay.passed, true);
-    assert.deepEqual(checkpoint.calls[0].binding, { attemptId: 'attempt-task6', fence: 'fence-task6',
+    assert.deepEqual(checkpoint.calls[0].binding, { attemptId: 'attempt-task6', fence: '11111111-1111-4111-8111-111111111111',
       caseId, eventId: 'evt_task6' });
     assert.equal(parts.calls.mutations.length, 0, 'manual resend never uses a provider mutation adapter');
     const freshReceipt = afterReplay.receipts.find(({ id }) => id === 'receipt_task6_replay');

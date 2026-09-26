@@ -57,13 +57,13 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - Test: test/contracts/evidence.test.mjs
 - Modify: package.json
 
-- [ ] Test that BILLING_43_IDS equals the 43 Spec IDs in exact order, with no duplicate or missing ID and excluding signup.advbox and payment.3ds.
-- [ ] Test the contract completeness guard refuses missing, duplicate, or unknown domain contracts before creating a fixture or invoking a provider; test any present contract must have non-empty evidence, finite non-negative maxWrites, closed allowedOperations, and callable run.
-- [ ] Test canonical result validation rejects skipped/neutral/unknown/duplicate/additional result, extra keys, unrecognized evidence, PII-like fields, and a scenario success copied from an app HTTP body.
-- [ ] Add a repository .gitignore containing node_modules/ so the local dependency link/install is not staged as source.
-- [ ] Implement the frozen ID tuple and exact-schema result validator; remove the previous 45-case acceptance from the trusted 43 aggregate while retaining supervised 3DS as an explicitly separate suite.
-- [ ] Run focused node:test files and the full npm test suite.
-- [ ] Commit as feat(billing): define exact 43 scenario result contract.
+- [x] Test that BILLING_43_IDS equals the 43 Spec IDs in exact order, with no duplicate or missing ID and excluding signup.advbox and payment.3ds.
+- [x] Test the contract completeness guard refuses missing, duplicate, or unknown domain contracts before creating a fixture or invoking a provider; test any present contract must have non-empty evidence, finite non-negative maxWrites, closed allowedOperations, and callable run.
+- [x] Test canonical result validation rejects skipped/neutral/unknown/duplicate/additional result, extra keys, unrecognized evidence, PII-like fields, and a scenario success copied from an app HTTP body.
+- [x] Add a repository .gitignore containing node_modules/ so the local dependency link/install is not staged as source.
+- [x] Implement the frozen ID tuple and exact-schema result validator; remove the previous 45-case acceptance from the trusted 43 aggregate while retaining supervised 3DS as an explicitly separate suite.
+- [x] Run focused node:test files and the full npm test suite.
+- [x] Commit as feat(billing): define exact 43 scenario result contract.
 
 ### Task 2: Append-only retention reservations and finite admission policy
 
@@ -77,31 +77,41 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - Test: test/attempts/concurrency.test.mjs
 - Test: test/attempts/contracts.test.mjs
 
-- [ ] Add failure tests for missing/unbounded/zero-invalid/negative quotas, exact-limit success, projected-over-limit refusal, concurrent reservations, append-only receipt update/delete denial, failure after reservation, and retained historical attempt counts.
-- [ ] Implement transactionally inserted immutable reservation and settlement rows. Capacity equals committed append-only receipts plus outstanding reservations plus the new projection; no source may read only mutable attempts for retention accounting.
-- [ ] Reject unknown quota keys and non-integer/negative values; use an explicit configuration object and exact scenario write projection; reserve before fixture creation.
-- [ ] Ensure ambiguous failure retains the full reservation until a reconciler writes a terminal receipt; expiry alone never releases capacity.
-- [ ] Run focused attempts tests and full npm test.
-- [ ] Commit as feat(attempts): reserve bounded append-only billing retention.
+- [x] Add failure tests for missing/unbounded/zero-invalid/negative quotas, exact-limit success, projected-over-limit refusal, concurrent reservations, append-only receipt update/delete denial, failure after reservation, and retained historical attempt counts.
+- [x] Implement transactionally inserted immutable reservation and settlement rows. Capacity equals committed append-only receipts plus outstanding reservations plus the new projection; no source may read only mutable attempts for retention accounting.
+- [x] Reject unknown quota keys and non-integer/negative values; use an explicit configuration object and exact scenario write projection; reserve before fixture creation.
+- [x] Ensure ambiguous failure retains the full reservation until a reconciler writes a terminal receipt; expiry alone never releases capacity.
+- [x] Run focused attempts tests and full npm test.
+- [x] Commit as feat(attempts): reserve bounded append-only billing retention.
 
 ### Task 3: Global resource locks and fenced provider mutation intents
 
 **Files:**
 - Modify: src/attempts/schema.sql
 - Modify: src/attempts/postgres-store.mjs
+- Modify: src/attempts/store.mjs
 - Modify: src/attempts/lock.mjs
 - Modify: src/billing/contracts.mjs
+- Modify: src/billing/cleanup.mjs
+- Modify: src/billing/financial.mjs
 - Modify: src/runtime/stripe.mjs
 - Test: test/attempts/concurrency.test.mjs
+- Test: test/attempts/attempts.test.mjs
 - Test: test/attempts/postgres.test.mjs
+- Test: test/billing/cleanup.test.mjs
+- Test: test/billing/financial.test.mjs
 - Test: test/billing/contracts.test.mjs
 - Test: test/runtime/stripe.test.mjs
+- Modify: test/billing/support.mjs
 
 - [ ] Test that distinct suite/fixture keys for the same Supabase branch or Stripe account conflict on a global resource lock; disjoint resources can proceed independently.
 - [ ] Test old fences cannot reserve, mutate, renew, reconcile as owner, cleanup, or release after takeover; expired lease does not enable takeover.
 - [ ] Test that a durable in_flight intent is written before Stripe invocation, operation/request digest/idempotency key cannot be changed, and timeout/cancel/network ambiguity keeps lock and reservation.
 - [ ] Test same-key retry is refused for unresolved intent; only an independent matching provider observation can settle it. Test that expired idempotency evidence/Test Clock deletes_after blocks instead of retrying/deleting.
 - [ ] Implement global branch/account lock rows and fenced state transitions; include run, attempt, SHA and environment identity in uniqueness and ownership checks.
+- [ ] Require Supabase mutation adapters to execute inside the same fenced child-database transaction; reject plain/unfenced mutate callbacks.
+- [ ] Preserve the Stripe intent handle through app replay/cleanup call sites; `replayCheckoutRequest` requires an independent read-only observer before dispatch and records an append-only receipt for a successful dispatch before returning. A missing observer blocks before mutation; failed observation/receipt retains the unresolved intent. Cleanup independently reconciles every successful cleanup mutation before any lease release, and tests refuse release while any intent is unresolved.
+- [ ] Provide a recovery-only handoff for orphaned intents after the prior run is terminal and its runner removed; rotate the fence, expose pending intents by attempt, permit read-only reconciliation only, and retain resource locks/reservation until separate cleanup verification.
 - [ ] Run focused concurrency/provider tests and full npm test.
 - [ ] Commit as feat(billing): fence shared resources and provider intents.
 

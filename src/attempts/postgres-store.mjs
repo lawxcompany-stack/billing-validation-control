@@ -161,8 +161,46 @@ function retentionReceiptFromDb(db) {
   };
 }
 
-function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetentionReceipt, expectedEnvironment) {
-  return { verifyRecovery, verifyCleanup, verifyRetentionReceipt, expectedEnvironment,
+function resourceLockFromDb(db) {
+  if (!db) return null;
+  return { resourceType: db.resource_type, resourceId: db.resource_id,
+    attemptId: db.owner_attempt_id, fence: db.fence, candidateSha: db.candidate_sha.trim(),
+    workflow: { repository: db.workflow_repository, ref: db.workflow_ref,
+      runId: db.workflow_run_id, runAttempt: db.workflow_run_attempt, runnerLabel: db.runner_label },
+    environment: jsonValue(db.environment_identity), expiresAt: Number(db.expires_at_epoch) };
+}
+
+function stripeIntentFromDb(db) {
+  if (!db) return null;
+  return { intentId: db.intent_id, attemptId: db.attempt_id, fence: db.owner_fence,
+    accountId: db.account_id, candidateSha: db.candidate_sha.trim(),
+    workflow: { repository: db.workflow_repository, ref: db.workflow_ref,
+      runId: db.workflow_run_id, runAttempt: db.workflow_run_attempt, runnerLabel: db.runner_label },
+    environment: jsonValue(db.environment_identity), action: db.action, operation: db.operation,
+    requestDigest: db.request_digest.trim(), idempotencyKey: db.idempotency_key,
+    state: db.state, createdAt: Number(db.created_at_epoch) };
+}
+
+function stripeReceiptFromDb(db) {
+  if (!db) return null;
+  return { receiptId: db.receipt_id, intentId: db.intent_id, attemptId: db.attempt_id,
+    fence: db.owner_fence, accountId: db.account_id, operation: db.operation,
+    requestDigest: db.request_digest.trim(), idempotencyKey: db.idempotency_key,
+    observationDigest: db.observation_digest.trim(), resourceIds: jsonValue(db.resource_ids),
+    observedAt: Number(db.observed_at_epoch) };
+}
+
+function resourceKeys(environment) {
+  return [
+    { resourceType: 'supabase_branch', resourceId:
+      `${environment.database.projectRef}:${environment.database.branchId}` },
+    { resourceType: 'stripe_account', resourceId: environment.stripe.accountId },
+  ].sort((a, b) => `${a.resourceType}:${a.resourceId}`.localeCompare(`${b.resourceType}:${b.resourceId}`));
+}
+
+function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetentionReceipt,
+  verifyProviderObservation, expectedEnvironment) {
+  return { verifyRecovery, verifyCleanup, verifyRetentionReceipt, verifyProviderObservation, expectedEnvironment,
     transaction: (fn) => client.transaction(async (queryClient) => {
     if (typeof queryClient?.query !== 'function') refuse('store_client_invalid');
     await queryClient.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
@@ -174,6 +212,71 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
       async lockRetention(scope) {
         await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
           [JSON.stringify(['retention', scope.projectRef, scope.branchId, scope.stripeAccountId])]);
+      },
+      async lockResourceLocks(environment) {
+        for (const resource of resourceKeys(environment)) {
+          await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+            [JSON.stringify(['resource', resource.resourceType, resource.resourceId])]);
+        }
+      },
+      async getResourceLocks(environment) {
+        const resources = resourceKeys(environment);
+        const values = resources.flatMap(({ resourceType, resourceId }) => [resourceType, resourceId]);
+        const result = await queryClient.query(`SELECT resource_type, resource_id, owner_attempt_id, fence,
+          candidate_sha, workflow_repository, workflow_ref, workflow_run_id, workflow_run_attempt,
+          runner_label, environment_identity, extract(epoch FROM expires_at) AS expires_at_epoch
+          FROM billing_validation_control.resource_locks
+          WHERE (resource_type = $1 AND resource_id = $2)
+             OR (resource_type = $3 AND resource_id = $4)
+          ORDER BY resource_type, resource_id FOR UPDATE`, values);
+        return (result.rows ?? []).map(resourceLockFromDb);
+      },
+      async putResourceLocks(owner, previous) {
+        if (!Array.isArray(previous)) refuse('resource_lock_ledger_invalid');
+        for (const resource of resourceKeys(owner.environment)) {
+          const old = previous.find((candidate) => candidate.resourceType === resource.resourceType &&
+            candidate.resourceId === resource.resourceId);
+          const values = [resource.resourceType, resource.resourceId, owner.attemptId, owner.fence,
+            owner.candidateSha, owner.workflow.repository, owner.workflow.ref, owner.workflow.runId,
+            owner.workflow.runAttempt, owner.workflow.runnerLabel, JSON.stringify(owner.environment),
+            owner.expiresAt];
+          let result;
+          if (!old) {
+            result = await queryClient.query(`INSERT INTO billing_validation_control.resource_locks
+              (resource_type, resource_id, owner_attempt_id, fence, candidate_sha, workflow_repository,
+               workflow_ref, workflow_run_id, workflow_run_attempt, runner_label, environment_identity,
+               expires_at)
+              VALUES ($1,$2,$3,$4::uuid,$5,$6,$7,$8,$9,$10,$11::jsonb,to_timestamp($12))
+              ON CONFLICT (resource_type, resource_id) DO NOTHING`, values);
+          } else {
+            result = await queryClient.query(`UPDATE billing_validation_control.resource_locks
+              SET owner_attempt_id = $3, fence = $4::uuid, candidate_sha = $5,
+                  workflow_repository = $6, workflow_ref = $7, workflow_run_id = $8,
+                  workflow_run_attempt = $9, runner_label = $10, environment_identity = $11::jsonb,
+                  expires_at = to_timestamp($12), updated_at = clock_timestamp()
+              WHERE resource_type = $1 AND resource_id = $2 AND owner_attempt_id = $13
+                AND fence = $14::uuid`, [...values, old.attemptId, old.fence]);
+          }
+          if (result.rowCount !== 1) refuse('resource_lock_held');
+        }
+      },
+      async deleteResourceLocks(owner) {
+        for (const resource of resourceKeys(owner.environment)) {
+          const result = await queryClient.query(`DELETE FROM billing_validation_control.resource_locks
+            WHERE resource_type = $1 AND resource_id = $2 AND owner_attempt_id = $3
+              AND fence = $4::uuid AND expires_at > clock_timestamp()`,
+          [resource.resourceType, resource.resourceId, owner.attemptId, owner.fence]);
+          if (result.rowCount !== 1) refuse('lease_fence_lost');
+        }
+      },
+      async hasInFlightStripeIntent(attemptId) {
+        const result = await queryClient.query(`SELECT EXISTS (
+          SELECT 1 FROM billing_validation_control.stripe_intents AS intent
+          WHERE intent.attempt_id = $1 AND NOT EXISTS (
+            SELECT 1 FROM billing_validation_control.stripe_receipts AS receipt
+            WHERE receipt.intent_id = intent.intent_id
+          )) AS in_flight`, [attemptId]);
+        return result.rows?.[0]?.in_flight === true;
       },
       async now() {
         const result = await queryClient.query('SELECT extract(epoch FROM clock_timestamp()) AS now', []);
@@ -294,6 +397,56 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
           JSON.stringify(receipt.retained), receipt.createdAt]);
         if (result.rowCount !== 1) refuse('retention_receipt_conflict');
       },
+      async getStripeIntentByOperation(attemptId, operation) {
+        const result = await queryClient.query(`SELECT *, extract(epoch FROM created_at) AS created_at_epoch
+          FROM billing_validation_control.stripe_intents
+          WHERE attempt_id = $1 AND operation = $2 FOR UPDATE`, [attemptId, operation]);
+        return stripeIntentFromDb(result.rows?.[0]);
+      },
+      async getStripeIntent(intentId) {
+        const result = await queryClient.query(`SELECT *, extract(epoch FROM created_at) AS created_at_epoch
+          FROM billing_validation_control.stripe_intents WHERE intent_id = $1 FOR UPDATE`, [intentId]);
+        return stripeIntentFromDb(result.rows?.[0]);
+      },
+      async listPendingStripeIntents(attemptId) {
+        const result = await queryClient.query(`SELECT intent.*,
+          extract(epoch FROM intent.created_at) AS created_at_epoch
+          FROM billing_validation_control.stripe_intents AS intent
+          WHERE intent.attempt_id = $1 AND NOT EXISTS (
+            SELECT 1 FROM billing_validation_control.stripe_receipts AS receipt
+            WHERE receipt.intent_id = intent.intent_id
+          )
+          ORDER BY intent.created_at, intent.intent_id FOR UPDATE OF intent`, [attemptId]);
+        return (result.rows ?? []).map(stripeIntentFromDb);
+      },
+      async insertStripeIntent(intent) {
+        const result = await queryClient.query(`INSERT INTO billing_validation_control.stripe_intents
+          (intent_id, attempt_id, owner_fence, account_id, candidate_sha, workflow_repository,
+           workflow_ref, workflow_run_id, workflow_run_attempt, runner_label, environment_identity, action,
+           operation, request_digest, idempotency_key, state, created_at)
+          VALUES ($1,$2,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,to_timestamp($17))`,
+        [intent.intentId, intent.attemptId, intent.fence, intent.accountId, intent.candidateSha,
+          intent.workflow.repository, intent.workflow.ref, intent.workflow.runId,
+          intent.workflow.runAttempt, intent.workflow.runnerLabel, JSON.stringify(intent.environment),
+          intent.action, intent.operation, intent.requestDigest, intent.idempotencyKey,
+          intent.state, intent.createdAt]);
+        if (result.rowCount !== 1) refuse('stripe_intent_conflict');
+      },
+      async getStripeReceipt(intentId) {
+        const result = await queryClient.query(`SELECT *, extract(epoch FROM observed_at) AS observed_at_epoch
+          FROM billing_validation_control.stripe_receipts WHERE intent_id = $1 FOR UPDATE`, [intentId]);
+        return stripeReceiptFromDb(result.rows?.[0]);
+      },
+      async putStripeReceipt(receipt) {
+        const result = await queryClient.query(`INSERT INTO billing_validation_control.stripe_receipts
+          (receipt_id, intent_id, attempt_id, owner_fence, account_id, operation, request_digest,
+           idempotency_key, observation_digest, resource_ids, observed_at)
+          VALUES ($1,$2,$3,$4::uuid,$5,$6,$7,$8,$9,$10::jsonb,to_timestamp($11))`,
+        [receipt.receiptId, receipt.intentId, receipt.attemptId, receipt.fence, receipt.accountId,
+          receipt.operation, receipt.requestDigest, receipt.idempotencyKey, receipt.observationDigest,
+          JSON.stringify(receipt.resourceIds), receipt.observedAt]);
+        if (result.rowCount !== 1) refuse('stripe_receipt_conflict');
+      },
       async getLease(key) {
         // This lock serializes even the first insert for an absent key. Hash collisions only reduce concurrency.
         await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [JSON.stringify(keyValues(key))]);
@@ -338,10 +491,10 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
 }
 
 export function createPostgresAttemptStore({ client, preflight, target, verifyRecovery, verifyCleanup,
-  verifyRetentionReceipt } = {}) {
+  verifyRetentionReceipt, verifyProviderObservation } = {}) {
   const verified = assertWiring({ client, preflight, target });
   return createAttemptStore(transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetentionReceipt,
-    verified.preflight.expectedEnvironment));
+    verifyProviderObservation, verified.preflight.expectedEnvironment));
 }
 
 export async function installAttemptSchema({ client, preflight, target } = {}) {

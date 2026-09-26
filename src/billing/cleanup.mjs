@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { assertCurrentAttempt, mutateProvider, BillingControlRefusal } from './contracts.mjs';
 import { databaseSnapshotDigest, databaseSnapshotsEqual, sanitizeDatabaseSnapshot } from './observations.mjs';
+import { reconcileStripeIntent } from '../runtime/stripe.mjs';
 
 export class BillingCleanupRefusal extends Error {
   constructor(code, details = {}) { super(code); this.name = 'BillingCleanupRefusal'; this.code = code;
@@ -193,8 +194,17 @@ export async function cleanupOwnedResources({ context, adapter } = {}) {
   let initial;
   let initialDatabaseRows;
   let beforeDatabase;
+  let pendingStripeIntents;
   try {
     await assertCurrentAttempt(context);
+    if (typeof context.attempts.listPendingStripeIntents !== 'function') {
+      refuse('cleanup_intent_inventory_unavailable');
+    }
+    pendingStripeIntents = await context.attempts.listPendingStripeIntents({
+      attemptId: context.owner.attemptId, fence: context.owner.fence,
+    });
+    if (!Array.isArray(pendingStripeIntents)) refuse('cleanup_intent_inventory_unavailable');
+    if (pendingStripeIntents.length) refuse('stripe_intent_unresolved');
     baseline = sanitizeDatabaseSnapshot(await adapter.readDatabaseBaseline({ attemptId: context.owner.attemptId,
       fence: context.owner.fence, environment: context.preflight.expectedEnvironment }));
     initial = inventory(await adapter.listOwnedResources({ attemptId: context.owner.attemptId,
@@ -221,16 +231,33 @@ export async function cleanupOwnedResources({ context, adapter } = {}) {
   const retainedObjects = summarizedRetained(initial);
   const retainedDatabaseResources = [];
   const toActOn = initial.filter((resource) => providerAction(resource).action !== null).reverse();
+  if (toActOn.length && typeof adapter.readStripeIntentObservation !== 'function') {
+    refuse('cleanup_reconciliation_unavailable');
+  }
   const mutatedResourceIds = [];
   for (const resource of toActOn) {
     const plan = providerAction(resource);
+    let mutation;
     try {
-      await mutateProvider(context, { provider: 'stripe', action: plan.action,
+      mutation = await mutateProvider(context, { provider: 'stripe', action: plan.action,
         operation: `cleanup:${resource.id}`,
         input: { resourceId: resource.id, resourceType: resource.type } });
-      mutatedResourceIds.push(resource.id);
     } catch {
       refuse('cleanup_mutation_failed');
+    }
+    if (!mutation || typeof mutation.intentId !== 'string' || typeof mutation.operation !== 'string') {
+      refuse('cleanup_reconciliation_failed');
+    }
+    try {
+      await reconcileStripeIntent({ attempts: context.attempts, owner: context.owner,
+        intentId: mutation.intentId,
+        readObservation: (intent) => adapter.readStripeIntentObservation({ intent, resource,
+          expectedStatus: plan.retainedAfter, attemptId: context.owner.attemptId,
+          fence: context.owner.fence, environment: context.preflight.expectedEnvironment }),
+      });
+      mutatedResourceIds.push(resource.id);
+    } catch {
+      refuse('cleanup_reconciliation_failed');
     }
   }
 
