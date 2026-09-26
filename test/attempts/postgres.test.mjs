@@ -37,6 +37,12 @@ function recordingClient() {
   return client;
 }
 
+function withGetter(source, key, getter) {
+  const copy = { ...source };
+  Object.defineProperty(copy, key, { configurable: true, enumerable: true, get: getter });
+  return copy;
+}
+
 test('wrong, default, parent, or unhealthy schema target refuses before issuing DDL', async () => {
   const variants = [
     { ...target, branchId: 'other-branch' },
@@ -100,6 +106,127 @@ test('schema installer refuses null or coerced child identity fields before DDL'
     }), { code: 'schema_target_unverified' });
     assert.equal(client.calls.length, 0);
   }
+});
+
+test('changing expected-environment getter is refused without reading it or opening a transaction', async () => {
+  const otherEnvironment = {
+    database: { projectRef: 'mnopqrstabcdefghijkl', branchId: 'child-validation-2' },
+    deployment: { id: 'dpl_candidate456', origin: 'https://other-candidate.vercel.app' },
+    stripe: { accountId: 'acct_other123' },
+  };
+  let reads = 0;
+  const unstablePreflight = withGetter(preflight, 'expectedEnvironment', () => {
+    reads++;
+    return reads === 1 ? preflight.expectedEnvironment : otherEnvironment;
+  });
+  const client = recordingClient();
+
+  assert.throws(() => createPostgresAttemptStore({ client, preflight: unstablePreflight, target }),
+    { code: 'schema_target_unverified' });
+  await assert.rejects(installAttemptSchema({ client, preflight: unstablePreflight, target }),
+    { code: 'schema_target_unverified' });
+  assert.equal(reads, 0);
+  assert.equal(client.transactions.length, 0);
+  assert.equal(client.calls.length, 0);
+});
+
+test('preflight verification and target accessors are rejected without invoking them', () => {
+  const cases = [
+    (counter) => ({
+      preflight: { ...preflight, providerVerification: withGetter(preflight.providerVerification,
+        'supabase', () => { counter.count++; return preflight.providerVerification.supabase; }) }, target,
+    }),
+    (counter) => ({
+      preflight: { ...preflight, expectedEnvironment: { ...preflight.expectedEnvironment,
+        database: withGetter(preflight.expectedEnvironment.database, 'branchId', () => {
+          counter.count++; return database.branchId;
+        }) } }, target,
+    }),
+    (counter) => ({
+      preflight: { ...preflight, expectedEnvironment: { ...preflight.expectedEnvironment,
+        deployment: withGetter(preflight.expectedEnvironment.deployment, 'origin', () => {
+          counter.count++; return 'https://candidate.vercel.app';
+        }) } }, target,
+    }),
+    (counter) => ({
+      preflight: { ...preflight, expectedEnvironment: { ...preflight.expectedEnvironment,
+        stripe: withGetter(preflight.expectedEnvironment.stripe, 'accountId', () => {
+          counter.count++; return 'acct_synthetic123';
+        }) } }, target,
+    }),
+    (counter) => ({
+      preflight: { ...preflight, providerVerification: { ...preflight.providerVerification,
+        supabase: withGetter(preflight.providerVerification.supabase, 'projectRef', () => {
+          counter.count++; return database.projectRef;
+        }) } }, target,
+    }),
+    (counter) => ({
+      preflight: { ...preflight, providerVerification: { ...preflight.providerVerification,
+        stripe: withGetter(preflight.providerVerification.stripe, 'accountId', () => {
+          counter.count++; return 'acct_synthetic123';
+        }) } }, target,
+    }),
+    (counter) => ({
+      preflight: { ...preflight, providerVerification: { ...preflight.providerVerification,
+        stripe: withGetter(preflight.providerVerification.stripe, 'webhookEndpointId', () => {
+          counter.count++; return 'we_synthetic123';
+        }) } }, target,
+    }),
+    (counter) => ({
+      preflight, target: withGetter(target, 'branchId', () => {
+        counter.count++; return database.branchId;
+      }),
+    }),
+  ];
+  for (const field of ['projectRef', 'parentProjectRef', 'branchId', 'branchName', 'isDefault', 'status', 'isolated']) {
+    cases.push((counter) => ({
+      preflight, target: withGetter(target, field, () => {
+        counter.count++; return target[field];
+      }),
+    }));
+  }
+
+  for (const makeCase of cases) {
+    const counter = { count: 0 };
+    const client = recordingClient();
+    assert.throws(() => createPostgresAttemptStore({ client, ...makeCase(counter) }),
+      { code: 'schema_target_unverified' });
+    assert.equal(counter.count, 0);
+    assert.equal(client.transactions.length, 0);
+    assert.equal(client.calls.length, 0);
+  }
+});
+
+test('store remains pinned to a detached environment snapshot after source objects change', async () => {
+  const sourcePreflight = structuredClone(preflight);
+  const sourceTarget = structuredClone(target);
+  const stableEnvironment = structuredClone(sourcePreflight.expectedEnvironment);
+  const client = recordingClient();
+  const store = createPostgresAttemptStore({ client, preflight: sourcePreflight, target: sourceTarget });
+
+  sourcePreflight.expectedEnvironment.database.projectRef = 'mnopqrstabcdefghijkl';
+  sourcePreflight.expectedEnvironment.database.branchId = 'other-validation-2';
+  sourcePreflight.expectedEnvironment.deployment.id = 'dpl_other456';
+  sourcePreflight.expectedEnvironment.deployment.origin = 'https://other-candidate.vercel.app';
+  sourcePreflight.expectedEnvironment.stripe.accountId = 'acct_other123';
+  sourcePreflight.providerVerification.supabase.projectRef = 'mnopqrstabcdefghijkl';
+  sourcePreflight.providerVerification.supabase.branchId = 'other-validation-2';
+  sourcePreflight.providerVerification.stripe.accountId = 'acct_other123';
+  sourceTarget.branchId = 'other-validation-2';
+
+  await store.prepare({ attemptId: 'attempt-stable-snapshot',
+    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-snapshot' },
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+      ref: 'refs/heads/main', runId: '100', runAttempt: 1,
+      runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
+    environment: stableEnvironment, ttlSeconds: 60, retentionPolicy, projection });
+
+  const insert = client.calls.find(({ sql }) => sql.includes('INSERT INTO billing_validation_control.attempts'));
+  assert.ok(insert);
+  assert.equal(insert.values[10], stableEnvironment.database.projectRef);
+  assert.equal(insert.values[11], stableEnvironment.deployment.id);
+  assert.equal(insert.values[12], stableEnvironment.deployment.origin);
+  assert.equal(insert.values[13], stableEnvironment.stripe.accountId);
 });
 
 test('verified installer issues only the dedicated control schema DDL', async () => {

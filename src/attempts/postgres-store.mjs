@@ -13,19 +13,76 @@ function exactKeys(value, keys) {
     Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 }
 
+function snapshotDataRecord(value, fields, { exact = true } = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  let prototype;
+  let ownKeys;
+  try {
+    prototype = Object.getPrototypeOf(value);
+    ownKeys = Reflect.ownKeys(value);
+  } catch { return null; }
+  if ((prototype !== Object.prototype && prototype !== null) ||
+      (exact && (ownKeys.length !== fields.length ||
+        ownKeys.some((key) => typeof key !== 'string' || !fields.includes(key))))) return null;
+  const snapshot = Object.create(null);
+  try {
+    for (const field of fields) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, field);
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || descriptor.enumerable !== true) return null;
+      snapshot[field] = descriptor.value;
+    }
+  } catch { return null; }
+  return snapshot;
+}
+
+function snapshotEnvironment(value) {
+  const fields = snapshotDataRecord(value, ['database', 'deployment', 'stripe']);
+  if (!fields) return null;
+  const database = snapshotDataRecord(fields.database, ['projectRef', 'branchId']);
+  const deployment = snapshotDataRecord(fields.deployment, ['id', 'origin']);
+  const stripe = snapshotDataRecord(fields.stripe, ['accountId']);
+  if (!database || !deployment || !stripe) return null;
+  return Object.freeze({
+    database: Object.freeze({ projectRef: database.projectRef, branchId: database.branchId }),
+    deployment: Object.freeze({ id: deployment.id, origin: deployment.origin }),
+    stripe: Object.freeze({ accountId: stripe.accountId }),
+  });
+}
+
+function snapshotPreflight(value) {
+  const fields = snapshotDataRecord(value, ['expectedEnvironment', 'providerVerification'], { exact: false });
+  if (!fields) return null;
+  const expectedEnvironment = snapshotEnvironment(fields.expectedEnvironment);
+  const provider = snapshotDataRecord(fields.providerVerification, ['supabase', 'stripe']);
+  if (!expectedEnvironment || !provider) return null;
+  const supabase = snapshotDataRecord(provider.supabase, ['projectRef', 'parentProjectRef', 'branchId',
+    'branchName', 'schemaFingerprintSha256', 'migrationHistorySha256']);
+  const stripe = snapshotDataRecord(provider.stripe, ['accountId', 'webhookEndpointId', 'webhookUrl', 'livemode']);
+  if (!supabase || !stripe) return null;
+  return Object.freeze({ expectedEnvironment,
+    providerVerification: Object.freeze({ supabase: Object.freeze(supabase), stripe: Object.freeze(stripe) }) });
+}
+
+function snapshotTarget(value) {
+  const fields = snapshotDataRecord(value, ['projectRef', 'parentProjectRef', 'branchId', 'branchName',
+    'isDefault', 'status', 'isolated'], { exact: false });
+  return fields ? Object.freeze(fields) : null;
+}
+
 function verifiedTarget(preflight, target) {
-  const expected = preflight?.expectedEnvironment?.database;
+  const expectedEnvironment = preflight?.expectedEnvironment;
+  const expected = expectedEnvironment?.database;
   const verified = preflight?.providerVerification?.supabase;
   const stripe = preflight?.providerVerification?.stripe;
-  return isValidExpectedEnvironment(preflight?.expectedEnvironment) &&
+  return isValidExpectedEnvironment(expectedEnvironment) &&
     exactKeys(preflight?.providerVerification, ['supabase', 'stripe']) &&
     exactKeys(verified, ['projectRef', 'parentProjectRef', 'branchId', 'branchName',
       'schemaFingerprintSha256', 'migrationHistorySha256']) &&
     exactKeys(stripe, ['accountId', 'webhookEndpointId', 'webhookUrl', 'livemode']) &&
     typeof stripe.accountId === 'string' && typeof stripe.webhookUrl === 'string' &&
-    stripe.accountId === preflight.expectedEnvironment.stripe.accountId && stripe.livemode === false &&
+    stripe.accountId === expectedEnvironment.stripe.accountId && stripe.livemode === false &&
     stringMatches(stripe.webhookEndpointId, /^we_[A-Za-z0-9]+$/) &&
-    stripe.webhookUrl === `${preflight.expectedEnvironment.deployment.origin}/api/stripe/webhook` &&
+    stripe.webhookUrl === `${expectedEnvironment.deployment.origin}/api/stripe/webhook` &&
     target &&
     stringMatches(verified.projectRef, PROJECT_REF) && stringMatches(verified.parentProjectRef, PROJECT_REF) &&
     stringMatches(verified.branchId, BRANCH) && stringMatches(verified.branchName, BRANCH) &&
@@ -43,7 +100,11 @@ function verifiedTarget(preflight, target) {
 }
 
 function assertWiring({ client, preflight, target }) {
-  if (!verifiedTarget(preflight, target) || typeof client?.transaction !== 'function') refuse('schema_target_unverified');
+  const preflightSnapshot = snapshotPreflight(preflight);
+  const targetSnapshot = snapshotTarget(target);
+  if (!preflightSnapshot || !targetSnapshot || !verifiedTarget(preflightSnapshot, targetSnapshot) ||
+      typeof client?.transaction !== 'function') refuse('schema_target_unverified');
+  return { preflight: preflightSnapshot, target: targetSnapshot };
 }
 
 function keyValues(key) { return [key.branchId, key.suite, key.fixtureKey]; }
@@ -278,9 +339,9 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
 
 export function createPostgresAttemptStore({ client, preflight, target, verifyRecovery, verifyCleanup,
   verifyRetentionReceipt } = {}) {
-  assertWiring({ client, preflight, target });
+  const verified = assertWiring({ client, preflight, target });
   return createAttemptStore(transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetentionReceipt,
-    preflight.expectedEnvironment));
+    verified.preflight.expectedEnvironment));
 }
 
 export async function installAttemptSchema({ client, preflight, target } = {}) {
