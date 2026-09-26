@@ -1,4 +1,5 @@
-import { FINANCIAL_EVIDENCE_REQUIREMENTS, FINANCIAL_SCENARIOS, FINANCIAL_SCENARIO_CONTRACTS } from './fixtures.mjs';
+import { FINANCIAL_EVIDENCE_REQUIREMENTS, FINANCIAL_SCENARIO_CONTRACTS } from './fixtures.mjs';
+import { BILLING_43_IDS, assertCompleteBilling43Contracts } from '../contracts/billing-43.mjs';
 import { assertCurrentAttempt, mutateProvider, BillingControlRefusal } from './contracts.mjs';
 import { databaseSnapshotDigest, databaseSnapshotsEqual, expectedGrantCount, matchingSettlementCount,
   hasVerifiedDeclineState, isTrustedFinancialObservation, isValidExpectedAccess,
@@ -21,13 +22,14 @@ function timestampMs(value) {
 }
 
 export function requiredFinancialEvidence(caseId) {
-  if (!FINANCIAL_SCENARIOS.includes(caseId) || !Object.hasOwn(FINANCIAL_EVIDENCE_REQUIREMENTS, caseId)) {
+  if (!BILLING_43_IDS.includes(caseId) || !Object.hasOwn(FINANCIAL_EVIDENCE_REQUIREMENTS, caseId)) {
     refuse('financial_scenario_unsupported');
   }
   return FINANCIAL_EVIDENCE_REQUIREMENTS[caseId];
 }
 
-export async function replayCheckoutRequest({ context, applicationRequest } = {}) {
+export async function replayCheckoutRequest({ context, applicationRequest, contracts } = {}) {
+  assertCompleteBilling43Contracts(contracts);
   if (!applicationRequest || typeof applicationRequest !== 'object' || Array.isArray(applicationRequest) ||
       Object.keys(applicationRequest).length !== 3 ||
       !safeId(applicationRequest.quoteId) || typeof applicationRequest.idempotencyKey !== 'string' ||
@@ -312,7 +314,7 @@ export async function verifyDelayedWebhookDelivery({ context, caseId, identity, 
 export async function reconcileFinancialCase({ context, caseId, expectedOutcome, expectedAccess,
   identity, readers, startedAt, challengeWitnessProvider, challengeVerifier } = {}) {
   const contract = FINANCIAL_SCENARIO_CONTRACTS[caseId];
-  if (!FINANCIAL_SCENARIOS.includes(caseId) || !contract || !['paid', 'unpaid', 'settled'].includes(contract.outcome)) {
+  if (!BILLING_43_IDS.includes(caseId) || !contract || !['paid', 'unpaid', 'settled'].includes(contract.outcome)) {
     refuse('financial_scenario_unsupported');
   }
   if (expectedOutcome !== undefined && expectedOutcome !== contract.outcome) refuse('financial_outcome_mismatch');

@@ -2,12 +2,22 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { parseEvidenceArchive } from '../../src/contracts/evidence.mjs';
+import { importIfMissing, needExport, needValue } from '../billing/support.mjs';
 import {
   acceptanceDocument,
   expectedAcceptanceIdentity,
   finalAcceptanceDocument,
   makeZip,
 } from '../github/zip-fixture.mjs';
+
+const evidenceContracts = await importIfMissing(() => import('../../src/contracts/evidence.mjs'));
+const billing43 = await importIfMissing(() => import('../../src/contracts/billing-43.mjs'));
+const fixtures = await importIfMissing(() => import('../../src/billing/fixtures.mjs'));
+function canonicalResults() {
+  const ids = needValue(billing43, 'BILLING_43_IDS');
+  const requirements = needValue(fixtures, 'FINANCIAL_EVIDENCE_REQUIREMENTS');
+  return ids.map((id) => ({ id, status: 'passed', evidence: [...requirements[id]], resourceIds: [] }));
+}
 
 function archiveFor(entries, options) {
   return makeZip(entries, options);
@@ -53,6 +63,68 @@ function reverseObjectKeys(value) {
   }
   return value;
 }
+
+test('canonical result validation accepts exactly the ordered 43 passed results', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const results = canonicalResults();
+  const accepted = validate(results);
+  assert.equal(accepted.length, 43);
+  assert.deepEqual(accepted, results);
+  assert.equal(Object.isFrozen(accepted), true);
+});
+
+test('canonical result validation rejects skipped, neutral, unknown, duplicate, and additional results', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const cases = [
+    (results) => { results[0].status = 'skipped'; },
+    (results) => { results[0].status = 'neutral'; },
+    (results) => { results[0].id = 'unknown.scenario'; },
+    (results) => { results[0].id = results[1].id; },
+    (results) => { results.push(structuredClone(results[0])); },
+  ];
+  for (const mutate of cases) {
+    const results = canonicalResults();
+    mutate(results);
+    assert.throws(() => validate(results), { code: 'billing_result_invalid' });
+  }
+});
+
+test('canonical result validation rejects extra keys, unknown evidence, and PII-like fields', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const cases = [
+    (results) => { results[0].email = 'person@example.invalid'; },
+    (results) => { results[0].evidence.push('raw-provider-payload'); },
+    (results) => { results[0].resourceIds.push('person@example.invalid'); },
+    (results) => { results[0].status = 200; },
+    (results) => { results[0].appResponse = { status: 200, body: { success: true } }; },
+  ];
+  for (const mutate of cases) {
+    const results = canonicalResults();
+    mutate(results);
+    assert.throws(() => validate(results), { code: 'billing_result_invalid' });
+  }
+});
+
+test('an application HTTP response cannot provide a canonical scenario pass', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const httpOnly = canonicalResults();
+  httpOnly[0].evidence = ['http'];
+  assert.throws(() => validate(httpOnly), { code: 'billing_result_invalid' });
+
+  const copiedHttpBody = canonicalResults();
+  copiedHttpBody[0] = { id: 'payment.approved', status: 200, evidence: ['http'], resourceIds: [] };
+  assert.throws(() => validate(copiedHttpBody), { code: 'billing_result_invalid' });
+});
+
+test('resource IDs must be supplied by the trusted owner allowlist', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const results = canonicalResults();
+  results[0].resourceIds = ['cus_task6'];
+  const ownerResultIds = ['cus_task6'];
+  const accepted = validate(results, { ownedResourceIds: ownerResultIds });
+  assert.equal(accepted[0].resourceIds[0], 'cus_task6');
+  assert.throws(() => validate(results), { code: 'billing_result_invalid' });
+});
 
 test('parses the sealed final producer manifest into a minimal projection', () => {
   const document = finalAcceptanceDocument();

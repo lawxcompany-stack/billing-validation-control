@@ -1,13 +1,8 @@
-export const FINANCIAL_SCENARIOS = Object.freeze([
-  'signup.native', 'signup.join', 'signup.advbox', 'signup.expired-intent', 'signup.tampered-intent', 'signup.replay',
-  'pricing.base-agents', 'pricing.progressive', 'pricing.combo', 'pricing.coupon-allowed', 'pricing.coupon-rejected', 'pricing.zero-total',
-  'payment.approved', 'payment.declined', 'payment.3ds', 'payment.abandoned', 'payment.timeout', 'payment.refresh', 'payment.two-tabs',
-  'zero.authorized', 'zero.replay',
-  'subscription.add-area', 'subscription.upgrade', 'subscription.downgrade', 'subscription.proration', 'subscription.renewal', 'subscription.cancellation',
-  'finance.delinquency', 'finance.recovery', 'finance.partial-refund', 'finance.partial-credit', 'finance.concurrent-adjustment',
-  'access.contracted', 'access.uncontracted', 'access.other-team', 'access.extras-preprocedural', 'access.hub-blocked', 'access.custom-blocked',
-  'webhook.invalid-signature', 'webhook.wrong-account', 'webhook.wrong-mode', 'webhook.replay', 'webhook.reverse-order', 'webhook.retry', 'webhook.takeover',
-]);
+import { BILLING_43_IDS } from '../contracts/billing-43.mjs';
+
+export const FINANCIAL_SCENARIOS = BILLING_43_IDS;
+
+export const SUPERVISED_FINANCIAL_SCENARIOS = Object.freeze(['signup.advbox', 'payment.3ds']);
 
 export const THREE_DS_SCENARIOS = Object.freeze([
   'initial.challenge.success', 'initial.challenge.cancel', 'initial.challenge.failure',
@@ -57,11 +52,11 @@ const settlement = Object.freeze([...read, 'stripe', 'webhook', 'worker']);
 const negativeWebhook = Object.freeze([...read, 'webhook']);
 
 export const FINANCIAL_EVIDENCE_REQUIREMENTS = Object.freeze({
-  'signup.native': read, 'signup.join': read, 'signup.advbox': Object.freeze([...read, 'browser']),
+  'signup.native': read, 'signup.join': read,
   'signup.expired-intent': read, 'signup.tampered-intent': read, 'signup.replay': read,
   'pricing.base-agents': read, 'pricing.progressive': read, 'pricing.combo': read,
   'pricing.coupon-allowed': read, 'pricing.coupon-rejected': read, 'pricing.zero-total': read,
-  'payment.approved': payment, 'payment.declined': rejectedPayment, 'payment.3ds': payment,
+  'payment.approved': payment, 'payment.declined': rejectedPayment,
   'payment.abandoned': rejectedPayment, 'payment.timeout': rejectedPayment,
   'payment.refresh': payment, 'payment.two-tabs': payment,
   'zero.authorized': read, 'zero.replay': read,
@@ -82,7 +77,6 @@ const scenarioContract = (outcome) => Object.freeze({ outcome });
 export const FINANCIAL_SCENARIO_CONTRACTS = Object.freeze({
   'payment.approved': Object.freeze({ ...scenarioContract('paid'), contextCount: 1 }),
   'payment.declined': Object.freeze({ ...scenarioContract('unpaid'), negativeState: 'declined' }),
-  'payment.3ds': Object.freeze({ ...scenarioContract('paid'), contextCount: 1, challenge: true }),
   'payment.refresh': Object.freeze({ ...scenarioContract('paid'), contextCount: 1, singleEffect: true }),
   'payment.two-tabs': Object.freeze({ ...scenarioContract('paid'), contextCount: 1, singleEffect: true }),
 });

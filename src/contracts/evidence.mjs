@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { inflateRawSync } from 'node:zlib';
+import { FINANCIAL_EVIDENCE_REQUIREMENTS } from '../billing/fixtures.mjs';
+import { BILLING_43_IDS } from './billing-43.mjs';
 
 export const EVIDENCE_ARCHIVE_LIMITS = Object.freeze({
   archiveBytes: 8 * 1024 * 1024,
@@ -31,6 +33,9 @@ const DEPLOYMENT_HOSTNAME = /^[a-z0-9-]+\.vercel\.app$/u;
 const STRIPE_ACCOUNT_ID = /^acct_[A-Za-z0-9_]+$/u;
 const FULL_SHA = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
+const BILLING_43_RESULT_KEYS = Object.freeze(['id', 'status', 'evidence', 'resourceIds']);
+const BILLING_43_OPAQUE_ID = /^[A-Za-z][A-Za-z0-9]{0,15}_[A-Za-z0-9][A-Za-z0-9._:-]{1,111}$/u;
+const SENSITIVE_ID_FRAGMENT = /(?:email|phone|cookie|secret|token|session|payload|password)/iu;
 
 function canonicalJson(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -424,4 +429,76 @@ export function parseEvidenceArchive(archive, { digest, expected } = {}) {
   }
   const evidence = parseDocument(decodeEntry(archive, entries[0]), expected);
   return evidence;
+}
+
+function hasExactOwnKeys(value, keys) {
+  if (!isObject(value)) return false;
+  let ownKeys;
+  try { ownKeys = Reflect.ownKeys(value); } catch { return false; }
+  return ownKeys.length === keys.length && ownKeys.every((key) =>
+    typeof key === 'string' && keys.includes(key));
+}
+
+function safeBilling43OpaqueId(value) {
+  return typeof value === 'string' && BILLING_43_OPAQUE_ID.test(value) && !SENSITIVE_ID_FRAGMENT.test(value);
+}
+
+function isDenseArray(value) {
+  if (!Array.isArray(value)) return false;
+  let keys;
+  try { keys = Reflect.ownKeys(value); } catch { return false; }
+  return keys.length === value.length + 1 && keys.includes('length') &&
+    keys.every((key) => key === 'length' || (typeof key === 'string' &&
+      /^(?:0|[1-9]\d*)$/u.test(key) && Number(key) < value.length));
+}
+
+function validBilling43Evidence(evidence, requiredKinds) {
+  if (!isDenseArray(evidence) || evidence.length !== requiredKinds.length) return false;
+  for (let index = 0; index < requiredKinds.length; index += 1) {
+    if (evidence[index] !== requiredKinds[index]) return false;
+  }
+  return true;
+}
+
+function validBilling43ResourceIds(resourceIds, ownedResourceIds) {
+  return isDenseArray(resourceIds) && new Set(resourceIds).size === resourceIds.length &&
+    resourceIds.every((id) => safeBilling43OpaqueId(id) && ownedResourceIds.has(id));
+}
+
+export function validateBilling43Results(results, options = {}) {
+  if (!isDenseArray(results) || results.length !== BILLING_43_IDS.length) {
+    refuse('billing_result_invalid');
+  }
+  if (!isObject(options)) {
+    refuse('billing_result_invalid');
+  }
+  let optionKeys;
+  try { optionKeys = Reflect.ownKeys(options); } catch { refuse('billing_result_invalid'); }
+  if (optionKeys.some((key) => key !== 'ownedResourceIds')) refuse('billing_result_invalid');
+  const ownedResourceIds = options.ownedResourceIds ?? [];
+
+  if (!isDenseArray(ownedResourceIds) || new Set(ownedResourceIds).size !== ownedResourceIds.length ||
+      !ownedResourceIds.every(safeBilling43OpaqueId)) {
+    refuse('billing_result_invalid');
+  }
+  const ownedIds = new Set(ownedResourceIds);
+
+  const normalized = [];
+  for (let index = 0; index < BILLING_43_IDS.length; index += 1) {
+    const result = results[index];
+    const id = BILLING_43_IDS[index];
+    if (!hasExactOwnKeys(result, BILLING_43_RESULT_KEYS) || result.id !== id || result.status !== 'passed' ||
+        !validBilling43Evidence(result.evidence, FINANCIAL_EVIDENCE_REQUIREMENTS[id]) ||
+        !validBilling43ResourceIds(result.resourceIds, ownedIds)) {
+      refuse('billing_result_invalid');
+    }
+
+    normalized.push(Object.freeze({
+      id,
+      status: 'passed',
+      evidence: Object.freeze([...result.evidence]),
+      resourceIds: Object.freeze([...result.resourceIds]),
+    }));
+  }
+  return Object.freeze(normalized);
 }

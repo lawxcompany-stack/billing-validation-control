@@ -1,11 +1,36 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { challengeCapabilities, databaseSnapshot, environment, importIfMissing, makeAttemptParts, makeReaders, needExport,
+import { databaseSnapshot, environment, importIfMissing, makeAttemptParts, makeReaders, needExport,
   needValue, paidDatabaseSnapshot, paidProviderState, paymentIdentity, startedAt, webhookReplayStates,
   manualResendCapabilities, expectRefusal } from './support.mjs';
 
 const contracts = await importIfMissing(() => import('../../src/billing/contracts.mjs'));
 const financial = await importIfMissing(() => import('../../src/billing/financial.mjs'));
+const fixtures = await importIfMissing(() => import('../../src/billing/fixtures.mjs'));
+
+function completeBilling43Contracts() {
+  return fixtures.FINANCIAL_SCENARIOS.map((id) => ({
+    id,
+    domain: id.split('.')[0],
+    maxWrites: 0,
+    allowedOperations: [],
+    requiredEvidence: ['database'],
+    async run() {},
+  }));
+}
+
+test('checkout replay refuses an incomplete registry before invoking Stripe', async () => {
+  const replay = needExport(financial, 'replayCheckoutRequest');
+  const parts = makeAttemptParts();
+  const context = needExport(contracts, 'createVerifiedContext')(parts);
+  const request = Object.freeze({ quoteId: 'quote_task6', idempotencyKey: 'quote-scoped-replay-0001',
+    sessionParams: Object.freeze({ mode: 'subscription', currency: 'brl', amount: 2500 }) });
+
+  const outcome = await Promise.allSettled([replay({ context, applicationRequest: request, contracts: [] })]);
+  assert.equal(parts.calls.mutations.length, 0);
+  assert.equal(outcome[0].status, 'rejected');
+  assert.equal(outcome[0].reason.code, 'billing_contracts_incomplete');
+});
 
 test('replaying an app checkout preserves its persisted quote key while control uses its attempt key', async () => {
   const replay = needExport(financial, 'replayCheckoutRequest');
@@ -13,8 +38,9 @@ test('replaying an app checkout preserves its persisted quote key while control 
   const context = needExport(contracts, 'createVerifiedContext')(parts);
   const request = Object.freeze({ quoteId: 'quote_task6', idempotencyKey: 'quote-scoped-replay-0001',
     sessionParams: Object.freeze({ mode: 'subscription', currency: 'brl', amount: 2500 }) });
-  await replay({ context, applicationRequest: request });
-  await replay({ context, applicationRequest: request });
+  const domainContracts = completeBilling43Contracts();
+  await replay({ context, applicationRequest: request, contracts: domainContracts });
+  await replay({ context, applicationRequest: request, contracts: domainContracts });
   assert.equal(parts.calls.mutations.length, 2);
   assert.equal(parts.calls.mutations[0].input.applicationRequest.idempotencyKey, 'quote-scoped-replay-0001');
   assert.equal(parts.calls.mutations[1].input.applicationRequest.idempotencyKey, 'quote-scoped-replay-0001');
@@ -78,24 +104,16 @@ test('declined payment requires an explicit failed-payment state and rejects unk
   assert.ok(result.failures.includes('declined_status_unverified'));
 });
 
-test('payment.3ds requires authenticated Stripe result and the bound Task7 capability', async () => {
+test('payment.3ds is excluded from the canonical 43 and remains in the supervised suite', async () => {
   const reconcile = needExport(financial, 'reconcileFinancialCase');
-  const capability = challengeCapabilities();
   const parts = makeAttemptParts();
-  const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(parts),
+  const readers = makeReaders();
+  await expectRefusal(reconcile({ context: needExport(contracts, 'createVerifiedContext')(parts),
     caseId: 'payment.3ds', expectedOutcome: 'paid',
     expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
-    readers: makeReaders({ current: paidDatabaseSnapshot() }), startedAt,
-    challengeWitnessProvider: capability.provider, challengeVerifier: capability.verifier });
-  assert.equal(result.passed, true);
-  assert.equal(capability.calls[0].binding.fence, parts.owner.fence);
-
-  const missing = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
-    caseId: 'payment.3ds', expectedOutcome: 'paid',
-    expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
-    readers: makeReaders({ current: paidDatabaseSnapshot() }), startedAt });
-  assert.equal(missing.passed, false);
-  assert.ok(missing.failures.includes('challenge_witness_unverified'));
+    readers, startedAt }), 'financial_scenario_unsupported');
+  assert.equal(readers.calls.length, 0);
+  assert.equal(parts.calls.assertions.length, 0);
 });
 
 test('payment refresh and two-tabs require exactly one completion context', async () => {
@@ -186,18 +204,21 @@ test('no entitlement may appear before authoritative provider reconciliation', a
     intent: { status: 'requires_action', amount_received: 0, latest_charge: null }, charge: null, event: null, receipts: [],
     inbox: null });
   const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(parts),
-    caseId: 'payment.3ds', expectedOutcome: 'paid',
+    caseId: 'payment.approved', expectedOutcome: 'paid',
     expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
     readers: makeReaders({ provider: unpaidProvider, current: paidDatabaseSnapshot() }), startedAt });
   assert.equal(result.passed, false);
   assert.ok(result.failures.includes('entitlement_before_payment'));
 });
 
-test('all financial scenarios have fixed evidence requirements and no environment deferral API', () => {
+test('trusted financial requirements cover only canonical billing IDs', () => {
   const requirements = needValue(financial, 'FINANCIAL_EVIDENCE_REQUIREMENTS');
   assert.deepEqual(requirements['payment.approved'], ['http', 'database', 'stripe', 'webhook', 'worker', 'browser']);
   assert.deepEqual(requirements['webhook.invalid-signature'], ['http', 'database', 'webhook']);
-  assert.equal(Object.keys(requirements).length, 45);
+  assert.equal(Object.keys(requirements).length, 43);
+  assert.equal(Object.hasOwn(requirements, 'signup.advbox'), false);
+  assert.equal(Object.hasOwn(requirements, 'payment.3ds'), false);
+  assert.deepEqual(needValue(fixtures, 'SUPERVISED_FINANCIAL_SCENARIOS'), ['signup.advbox', 'payment.3ds']);
   assert.equal(typeof financial.getFinancialValidationScenarios, 'undefined');
 });
 
