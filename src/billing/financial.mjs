@@ -1,4 +1,5 @@
-import { FINANCIAL_EVIDENCE_REQUIREMENTS, FINANCIAL_SCENARIO_CONTRACTS } from './fixtures.mjs';
+import { FINANCIAL_EVIDENCE_REQUIREMENTS, FINANCIAL_SCENARIO_CONTRACTS,
+  TASK5_BLOCKED_SCENARIO_CONTRACTS } from './fixtures.mjs';
 import { BILLING_43_IDS, assertCompleteBilling43Contracts } from '../contracts/billing-43.mjs';
 import { assertCurrentAttempt, mutateProvider, BillingControlRefusal } from './contracts.mjs';
 import { databaseSnapshotDigest, databaseSnapshotsEqual, expectedGrantCount, matchingSettlementCount,
@@ -329,6 +330,8 @@ export async function verifyDelayedWebhookDelivery({ context, caseId, identity, 
 
 export async function reconcileFinancialCase({ context, caseId, expectedOutcome, expectedAccess,
   identity, readers, startedAt, challengeWitnessProvider, challengeVerifier } = {}) {
+  const blockedContract = TASK5_BLOCKED_SCENARIO_CONTRACTS[caseId];
+  if (blockedContract) refuse(blockedContract.reasonCode);
   const contract = FINANCIAL_SCENARIO_CONTRACTS[caseId];
   if (!BILLING_43_IDS.includes(caseId) || !contract || !['paid', 'unpaid', 'settled'].includes(contract.outcome)) {
     refuse('financial_scenario_unsupported');

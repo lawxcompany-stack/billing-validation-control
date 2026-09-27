@@ -432,9 +432,8 @@ test('observations fence the Task 5 attempt before reads and again after all rea
   }
 });
 
-test('duplicate deliveries remain one processed event and one settlement in the exact snapshot', async () => {
-  const reconcile = needExport(await importIfMissing(() => import('../../src/billing/financial.mjs')),
-    'reconcileFinancialCase');
+test('read-only observation counts duplicate deliveries without asserting Task 5 scenario acceptance', async () => {
+  const observe = needExport(observations, 'observeFinancialEvidence');
   const parts = makeAttemptParts();
   const provider = (await import('./support.mjs')).paidProviderState({
     receipts: [
@@ -444,10 +443,10 @@ test('duplicate deliveries remain one processed event and one settlement in the 
         accountId: 'acct_task6test123', livemode: false, apiVersion: '2026-01-01', receivedAt: '2026-09-23T09:10:03.000Z' },
     ],
   });
-  const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(parts),
-    caseId: 'payment.approved', expectedOutcome: 'paid', expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] },
-    identity: paymentIdentity, readers: makeReaders({ provider, current: paidDatabaseSnapshot() }), startedAt });
-  assert.equal(result.passed, true);
-  assert.equal(result.evidence.webhook.receiptCount, 2);
-  assert.equal(result.evidence.database.settlementCount, 1);
+  const result = await observe({ context: needExport(contracts, 'createVerifiedContext')(parts),
+    caseId: 'payment.approved', identity: paymentIdentity,
+    readers: makeReaders({ provider, current: paidDatabaseSnapshot() }), startedAt });
+  assert.equal(result.webhook.receiptCount, 2);
+  assert.equal(result.database.settlementCount, 1);
+  assert.equal('passed' in result, false);
 });

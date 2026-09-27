@@ -1,4 +1,4 @@
-import { BILLING_43_IDS } from '../contracts/billing-43.mjs';
+import { BILLING_43_IDS, BILLING_43_TASK5_IDS } from '../contracts/billing-43.mjs';
 import { SIGNUP_SCENARIOS } from './scenarios/signup.mjs';
 import { PRICING_SCENARIOS } from './scenarios/pricing.mjs';
 import { PAYMENT_SCENARIOS } from './scenarios/payment.mjs';
@@ -14,7 +14,10 @@ for (const contract of task5Entries) {
   task5ById[contract.id] = contract;
 }
 const task5Ids = BILLING_43_IDS.filter((id) => Object.hasOwn(task5ById, id));
-if (task5Entries.length !== 19 || task5Ids.length !== 19) throw new Error('billing_task5_registry_invalid');
+if (task5Entries.length !== BILLING_43_TASK5_IDS.length ||
+    task5Ids.some((id, index) => id !== BILLING_43_TASK5_IDS[index])) {
+  throw new Error('billing_task5_registry_invalid');
+}
 
 export const TASK5_BLOCKED_SCENARIO_CONTRACTS = Object.freeze(Object.fromEntries(
   task5Ids.map((id) => [id, task5ById[id]])));

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { databaseSnapshot, environment, importIfMissing, makeAttemptParts, makeReaders, needExport,
-  needValue, paidDatabaseSnapshot, paidProviderState, paymentIdentity, startedAt, webhookReplayStates,
+import { environment, importIfMissing, makeAttemptParts, makeReaders, needExport,
+  needValue, paymentIdentity, startedAt, webhookReplayStates,
   manualResendCapabilities, expectRefusal } from './support.mjs';
 
 const contracts = await importIfMissing(() => import('../../src/billing/contracts.mjs'));
@@ -118,61 +118,6 @@ test('failed independent checkout observation retains the intent and blocks clea
   })).length, 1);
 });
 
-test('financial success is withheld until payment, processed webhook and DB settlement all reconcile', async () => {
-  const reconcile = needExport(financial, 'reconcileFinancialCase');
-  const parts = makeAttemptParts();
-  const incompleteWebhook = paidProviderState({ receipts: [], inbox: { status: 'pending', processedAt: null } });
-  const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(parts),
-    caseId: 'payment.approved', expectedOutcome: 'paid', expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] },
-    identity: paymentIdentity, readers: makeReaders({ provider: incompleteWebhook, current: paidDatabaseSnapshot() }), startedAt });
-  assert.equal(result.passed, false);
-  assert.ok(result.failures.includes('webhook_unprocessed'));
-});
-
-test('an inherently unpaid scenario cannot be relabelled as paid by the caller', async () => {
-  const reconcile = needExport(financial, 'reconcileFinancialCase');
-  const parts = makeAttemptParts();
-  const readers = makeReaders();
-  await expectRefusal(reconcile({ context: needExport(contracts, 'createVerifiedContext')(parts),
-    caseId: 'payment.declined', expectedOutcome: 'paid',
-    expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
-    readers, startedAt }), 'financial_outcome_mismatch');
-  assert.equal(readers.calls.length, 0);
-});
-
-test('paid reconciliation rejects absent or empty expected access before provider reads', async () => {
-  const reconcile = needExport(financial, 'reconcileFinancialCase');
-  for (const expectedAccess of [undefined, { contractId: 'contract_task6', areas: [] }]) {
-    const parts = makeAttemptParts();
-    const readers = makeReaders();
-    await expectRefusal(reconcile({ context: needExport(contracts, 'createVerifiedContext')(parts),
-      caseId: 'payment.approved', expectedAccess, identity: paymentIdentity, readers, startedAt }),
-    'financial_expected_access_invalid');
-    assert.equal(readers.calls.length, 0);
-  }
-});
-
-test('declined payment requires an explicit failed-payment state and rejects unknown status', async () => {
-  const reconcile = needExport(financial, 'reconcileFinancialCase');
-  const rejected = paidProviderState({ invoice: { status: 'open', amount_paid: 0, amount_remaining: 2500 },
-    intent: { status: 'requires_payment_method', amount_received: 0,
-      last_payment_error: { code: 'card_declined', decline_code: 'do_not_honor' } },
-    charge: { paid: false, amount_captured: 0 } });
-  const accepted = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
-    caseId: 'payment.declined', expectedOutcome: 'unpaid', identity: paymentIdentity,
-    readers: makeReaders({ provider: rejected, baseline: databaseSnapshot(), current: databaseSnapshot() }), startedAt });
-  assert.equal(accepted.passed, true);
-
-  const unknown = paidProviderState({ intent: { status: 'processing', amount_received: 0, latest_charge: null,
-    last_payment_error: null }, invoice: { status: 'open', amount_paid: 0, amount_remaining: 2500 },
-    charge: null, event: null, inbox: null, receipts: [] });
-  const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
-    caseId: 'payment.declined', expectedOutcome: 'unpaid', identity: paymentIdentity,
-    readers: makeReaders({ provider: unknown, baseline: databaseSnapshot(), current: databaseSnapshot() }), startedAt });
-  assert.equal(result.passed, false);
-  assert.ok(result.failures.includes('declined_status_unverified'));
-});
-
 test('payment.3ds is excluded from the canonical 43 and remains in the supervised suite', async () => {
   const reconcile = needExport(financial, 'reconcileFinancialCase');
   const parts = makeAttemptParts();
@@ -185,22 +130,9 @@ test('payment.3ds is excluded from the canonical 43 and remains in the supervise
   assert.equal(parts.calls.assertions.length, 0);
 });
 
-test('payment refresh and two-tabs require exactly one completion context', async () => {
-  const reconcile = needExport(financial, 'reconcileFinancialCase');
-  for (const caseId of ['payment.refresh', 'payment.two-tabs']) {
-    const current = paidDatabaseSnapshot();
-    current.contexts.push({ sessionId: 'cs_duplicate_task6', attemptId: 'attempt-task6', status: 'complete' });
-    const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
-      caseId, expectedOutcome: 'paid', expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] },
-      identity: paymentIdentity, readers: makeReaders({ current }), startedAt });
-    assert.equal(result.passed, false);
-    assert.ok(result.failures.includes('single_effect_not_unique'));
-  }
-});
-
 test('unsupported generic unpaid and settled categories fail closed before any reads', async () => {
   const reconcile = needExport(financial, 'reconcileFinancialCase');
-  for (const caseId of ['payment.abandoned', 'payment.timeout', 'webhook.invalid-signature',
+  for (const caseId of ['webhook.invalid-signature',
     'webhook.wrong-account', 'webhook.wrong-mode', 'subscription.add-area', 'finance.delinquency']) {
     const readers = makeReaders();
     await expectRefusal(reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
@@ -209,75 +141,17 @@ test('unsupported generic unpaid and settled categories fail closed before any r
   }
 });
 
-test('paid reconciliation rejects extra and duplicate active area grants', async () => {
+test('financial reconciliation refuses all blocked Task 5 cases before invoking any evidence reader', async () => {
   const reconcile = needExport(financial, 'reconcileFinancialCase');
-  for (const additionalGrant of [
-    { id: 'grant_extra', contractId: 'contract_task6', area: 'unexpected_area', status: 'active' },
-    { id: 'grant_duplicate', contractId: 'contract_task6', area: 'area_task6', status: 'active' },
-    { id: 'grant_other_contract', contractId: 'contract_other', area: 'unexpected_area', status: 'active' },
-  ]) {
+  const blocked = needValue(fixtures, 'TASK5_BLOCKED_SCENARIO_CONTRACTS');
+  for (const [caseId, contract] of Object.entries(blocked)) {
     const parts = makeAttemptParts();
-    const current = paidDatabaseSnapshot();
-    current.grants.push(additionalGrant);
-    const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(parts),
-      caseId: 'payment.approved', expectedOutcome: 'paid',
-      expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
-      readers: makeReaders({ current }), startedAt });
-    assert.equal(result.passed, false);
-    assert.ok(result.failures.includes('entitlement_mismatch'));
+    const readers = makeReaders();
+    await expectRefusal(reconcile({ context: needExport(contracts, 'createVerifiedContext')(parts),
+      caseId, expectedOutcome: 'paid', expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] },
+      identity: paymentIdentity, readers, startedAt }), contract.reasonCode);
+    assert.equal(readers.calls.length, 0, `${caseId} must not inspect financial evidence`);
   }
-});
-
-test('paid reconciliation requires the new settlement to belong to the expected contract', async () => {
-  const reconcile = needExport(financial, 'reconcileFinancialCase');
-  const current = paidDatabaseSnapshot();
-  current.settlements[0].contractId = 'contract_other';
-  const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
-    caseId: 'payment.approved', expectedOutcome: 'paid',
-    expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
-    readers: makeReaders({ current }), startedAt });
-  assert.equal(result.passed, false);
-  assert.ok(result.failures.includes('settlement_not_unique'));
-});
-
-test('a grant already present in the database baseline cannot prove new paid entitlement', async () => {
-  const reconcile = needExport(financial, 'reconcileFinancialCase');
-  const current = paidDatabaseSnapshot();
-  const baseline = databaseSnapshot();
-  baseline.grants = structuredClone(current.grants);
-  const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
-    caseId: 'payment.approved', expectedOutcome: 'paid',
-    expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
-    readers: makeReaders({ baseline, current }), startedAt });
-  assert.equal(result.passed, false);
-  assert.ok(result.failures.includes('entitlement_mismatch'));
-});
-
-test('an inactive baseline grant that becomes active is not a newly created entitlement', async () => {
-  const reconcile = needExport(financial, 'reconcileFinancialCase');
-  const baseline = databaseSnapshot();
-  baseline.grants = [{ id: 'grant_task6', contractId: 'contract_task6', area: 'area_task6', status: 'inactive' }];
-  const current = paidDatabaseSnapshot();
-  const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
-    caseId: 'payment.approved', expectedOutcome: 'paid',
-    expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
-    readers: makeReaders({ baseline, current }), startedAt });
-  assert.equal(result.passed, false);
-  assert.ok(result.failures.includes('entitlement_mismatch'));
-});
-
-test('no entitlement may appear before authoritative provider reconciliation', async () => {
-  const reconcile = needExport(financial, 'reconcileFinancialCase');
-  const parts = makeAttemptParts();
-  const unpaidProvider = paidProviderState({ invoice: { status: 'open', amount_paid: 0, amount_remaining: 2500 },
-    intent: { status: 'requires_action', amount_received: 0, latest_charge: null }, charge: null, event: null, receipts: [],
-    inbox: null });
-  const result = await reconcile({ context: needExport(contracts, 'createVerifiedContext')(parts),
-    caseId: 'payment.approved', expectedOutcome: 'paid',
-    expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, identity: paymentIdentity,
-    readers: makeReaders({ provider: unpaidProvider, current: paidDatabaseSnapshot() }), startedAt });
-  assert.equal(result.passed, false);
-  assert.ok(result.failures.includes('entitlement_before_payment'));
 });
 
 test('trusted financial requirements cover only canonical billing IDs', () => {

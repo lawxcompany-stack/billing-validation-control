@@ -9,6 +9,13 @@ export const BILLING_43_IDS = Object.freeze([
   'webhook.invalid-signature', 'webhook.wrong-account', 'webhook.wrong-mode', 'webhook.replay', 'webhook.reverse-order', 'webhook.retry', 'webhook.takeover',
 ]);
 
+export const BILLING_43_TASK5_IDS = Object.freeze([
+  'signup.native', 'signup.join', 'signup.expired-intent', 'signup.tampered-intent', 'signup.replay',
+  'pricing.base-agents', 'pricing.progressive', 'pricing.combo', 'pricing.coupon-allowed', 'pricing.coupon-rejected', 'pricing.zero-total',
+  'payment.approved', 'payment.declined', 'payment.abandoned', 'payment.timeout', 'payment.refresh', 'payment.two-tabs',
+  'zero.authorized', 'zero.replay',
+]);
+
 export const BILLING_43_EVIDENCE_KINDS = Object.freeze([
   'http', 'database', 'stripe', 'webhook', 'worker', 'browser',
 ]);
@@ -18,6 +25,7 @@ export const BILLING_43_ALLOWED_OPERATIONS = Object.freeze([
 ]);
 
 const ID_SET = new Set(BILLING_43_IDS);
+const TASK5_BLOCKED_ID_SET = new Set(BILLING_43_TASK5_IDS);
 const EVIDENCE_SET = new Set(BILLING_43_EVIDENCE_KINDS);
 const OPERATION_SET = new Set(BILLING_43_ALLOWED_OPERATIONS);
 const CONTRACT_KEYS = Object.freeze([
@@ -175,6 +183,7 @@ export function assertCompleteBilling43Contracts(domainContracts) {
 export async function runBilling43Scenario({ id, contracts, createFixture, context } = {}) {
   const registry = assertCompleteBilling43Contracts(contracts);
   if (!ID_SET.has(id) || typeof createFixture !== 'function') refuse('billing_contract_invalid');
+  if (TASK5_BLOCKED_ID_SET.has(id)) refuse('billing_scenario_blocked');
 
   const contract = registry[id];
   const fixture = await createFixture({ id, contract });

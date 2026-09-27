@@ -159,7 +159,9 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 
 **Progress (2026-09-27):** Read-only source mapping found that the existing signup harness uses prohibited Auth-admin/caller-signed-cookie/direct-SQL shortcuts and sends CRM/Mailchimp side effects; no safe inbox/finalizer/cleanup adapter exists. Pricing fixtures do not cover progressive/combo/coupon/zero inputs. Paid checkout has no approved independent cleanup/readback path; decline/abandon lack terminal application states, timeout is ambiguous, and two-tab coverage has no concurrency barrier. The current Preview transport allows only `GET /`. Implement only case paths with a fixed reviewed route/action, bounded effects, independent stored/provider oracle, and safe ownership/retention. Every other case must fail closed as blocked and cannot produce a passed result. Do not alter signed cookies, use Auth admin/direct SQL to create identities, call CRM/Mailchimp, or treat HTTP/UI/app output as evidence. The application repository's 45-entry acceptance validator is a separate integration gate; this control suite remains exactly 43.
 
-**Initial implementation (2026-09-27):** Added explicit blocked dispositions for all 19 cases and direct domain runner tests (68/68 focused; 521/521 full). Independent review of `b5a962d..3798822` returned NEEDS FIXES: the canonical executor does not consult the blocked registry before fixture creation; legacy financial reconciliation can still return `passed` for four blocked payment cases; exported blocked-contract helpers read caller properties without rejecting getters. These are open and Task 5 is not complete pending fix round 1 and independent re-review.
+**Initial implementation (2026-09-27):** Added explicit blocked dispositions for all 19 cases and direct domain runner tests (68/68 focused; 521/521 full). Independent review of `b5a962d..3798822` returned NEEDS FIXES: the canonical executor did not consult the blocked registry before fixture creation; legacy financial reconciliation could return `passed` for four blocked payment cases; exported blocked-contract helpers read caller properties without rejecting getters. Fix round 1 below implements these corrections; final Task 5 approval remains pending independent re-review.
+
+**Fix round 1 (2026-09-27):** Added a canonical Task 5 blocked-ID gate before fixture/contract invocation; `reconcileFinancialCase` now refuses all 19 before evidence readers; blocked-helper inputs are descriptor-snapshotted and accessors rejected without invocation. TDD RED was 94/100 with six failures. GREEN is `npm run test:task5 -- --test-reporter=dot` **90/90**, full `npm test -- --test-reporter=dot` **517/517**, and `git diff --check` passed. Independent re-review remains pending.
 
 **Files:**
 - Create: src/billing/scenarios/blocked.mjs
@@ -173,22 +175,23 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - Modify: src/billing/financial.mjs and src/billing/fixtures.mjs (no pass-producing legacy path for blocked payment cases)
 - Conditional only: src/runtime/billing-preview.mjs (extend only if a Task 5 case is proven safe; no generic POST/API access)
 - Test: test/billing/scenarios/signup.test.mjs
+- Test: test/billing/scenarios/blocked.test.mjs
 - Test: test/billing/scenarios/pricing.test.mjs
 - Test: test/billing/scenarios/payment.test.mjs
 - Test: test/billing/scenarios/zero.test.mjs
 - Test support: test/billing/scenarios/support.mjs
-- Modify: test/billing/fixtures.test.mjs, test/billing/fixture-run.test.mjs, test/contracts/evidence.test.mjs
+- Modify: test/billing/fixtures.test.mjs, test/billing/fixture-run.test.mjs, test/billing/financial.test.mjs, test/billing/observations.test.mjs, test/contracts/evidence.test.mjs
 - Modify: package.json
 
-- [ ] For each of the 19 IDs, ensure both domain runners and the canonical executor refuse blocked cases before fixture creation, Preview/browser, CRM/Mailchimp, Supabase, Stripe, or evidence callbacks and never emit `passed`.
+- [x] For each of the 19 IDs, ensure both domain runners and the canonical executor refuse blocked cases before fixture creation, Preview/browser, CRM/Mailchimp, Supabase, Stripe, or evidence callbacks and never emit `passed`.
 - [x] No path met every execution gate; preserve GET `/` as the only document route and do not add generic POST/API access. Tests reject a hostile cross-origin POST/action input before any callback; no scenario infers a pass from HTTP 2xx, a UI label or app-supplied value.
 - [x] Keep all five signup IDs blocked until a verifier-owned signup policy and non-delivering isolated inbox, suppression of CRM/Mailchimp side effects, and an approved append-only identity/row retention path exist. `signup.expired-intent` and `signup.tampered-intent` do not mutate signed cookies; unit-only parser coverage is not Preview acceptance.
 - [x] Coupon/progressive/combo/zero-total paths lack explicit synthetic catalog values and price snapshots; payment paths lack approved independently verified TEST readback and reversible-resource ownership. Ambiguous decline/abandon/timeout/two-tab semantics remain blocked.
-- [ ] All legacy payment reconciliation entry points reject the four blocked payment IDs before invoking any evidence reader and cannot return a `passed` result for them.
-- [ ] Missing adapters and hostile getter-backed contracts/definitions are refused before callbacks; all 19 contracts have `maxWrites: 0` and empty operation allowlists.
+- [x] All legacy payment reconciliation entry points reject the four blocked payment IDs before invoking any evidence reader and cannot return a `passed` result for them; all 19 Task 5 IDs are guarded consistently.
+- [x] Missing adapters and hostile getter-backed contracts/definitions are refused before callbacks; all 19 contracts have `maxWrites: 0` and empty operation allowlists.
 - [x] The trusted Task 5 runners throw without returning any result for blocked cases; a direct `status: 'blocked'` result is rejected by the canonical validator. `validateBilling43Results` remains schema-only and accepts structurally valid caller-fabricated `passed` records; Task 9 must bind results to trusted execution receipts and never translate blocked/refused to `passed`.
 - [x] No local fake/adapter result is reported as remote acceptance.
-- [x] Initial test round (`npm run test:task5`: 68/68; `npm test`: 521/521); rerun after fix round is required.
+- [x] Fix-round verification (`npm run test:task5 -- --test-reporter=dot`: 90/90; `npm test -- --test-reporter=dot`: 517/517; `git diff --check`).
 - [ ] Obtain clean independent review after fix round and rerun the focused/full suites.
 - [x] Commit initial Task 5 implementation locally (`3798822`); no push or PR.
 
