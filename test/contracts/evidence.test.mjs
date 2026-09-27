@@ -89,6 +89,19 @@ test('canonical result validation rejects skipped, neutral, unknown, duplicate, 
   }
 });
 
+test('canonical result validation rejects a direct blocked status', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const results = canonicalResults();
+  results[0].status = 'blocked';
+  assert.throws(() => validate(results), { code: 'billing_result_invalid' });
+});
+
+test('canonical result validation checks schema only and does not authenticate caller-fabricated passes', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const callerFabricated = canonicalResults();
+  assert.equal(validate(callerFabricated).length, 43);
+});
+
 test('canonical result validation rejects extra keys, unknown evidence, and PII-like fields', () => {
   const validate = needExport(evidenceContracts, 'validateBilling43Results');
   const cases = [

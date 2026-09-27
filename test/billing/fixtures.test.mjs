@@ -43,6 +43,21 @@ test('canonical registry is the exact frozen 43-ID suite in Spec order', () => {
   assert.deepEqual(needValue(fixtures, 'FINANCIAL_SCENARIOS'), expectedIds);
 });
 
+test('Task 5 exposes exactly the 19 blocked canonical signup, pricing, payment, and zero cases', () => {
+  const expectedTask5Ids = [
+    'signup.native', 'signup.join', 'signup.expired-intent', 'signup.tampered-intent', 'signup.replay',
+    'pricing.base-agents', 'pricing.progressive', 'pricing.combo', 'pricing.coupon-allowed',
+    'pricing.coupon-rejected', 'pricing.zero-total',
+    'payment.approved', 'payment.declined', 'payment.abandoned', 'payment.timeout', 'payment.refresh',
+    'payment.two-tabs', 'zero.authorized', 'zero.replay',
+  ];
+  const contracts = needValue(fixtures, 'TASK5_BLOCKED_SCENARIO_CONTRACTS');
+  assert.deepEqual(Object.keys(contracts), expectedTask5Ids);
+  assert.equal(Object.isFrozen(contracts), true);
+  assert.ok(expectedTask5Ids.every((id) => expectedIds.includes(id)));
+  assert.equal(expectedTask5Ids.length, 19);
+});
+
 test('contract completeness failures occur before fixture creation or contract execution', async () => {
   const ids = needValue(billing43, 'BILLING_43_IDS');
   const runBilling43Scenario = needExport(billing43, 'runBilling43Scenario');

@@ -1,4 +1,24 @@
 import { BILLING_43_IDS } from '../contracts/billing-43.mjs';
+import { SIGNUP_SCENARIOS } from './scenarios/signup.mjs';
+import { PRICING_SCENARIOS } from './scenarios/pricing.mjs';
+import { PAYMENT_SCENARIOS } from './scenarios/payment.mjs';
+import { ZERO_SCENARIOS } from './scenarios/zero.mjs';
+
+const task5Entries = [SIGNUP_SCENARIOS, PRICING_SCENARIOS, PAYMENT_SCENARIOS, ZERO_SCENARIOS]
+  .flatMap((domain) => Object.values(domain));
+const task5ById = Object.create(null);
+for (const contract of task5Entries) {
+  if (!BILLING_43_IDS.includes(contract.id) || Object.hasOwn(task5ById, contract.id)) {
+    throw new Error('billing_task5_registry_invalid');
+  }
+  task5ById[contract.id] = contract;
+}
+const task5Ids = BILLING_43_IDS.filter((id) => Object.hasOwn(task5ById, id));
+if (task5Entries.length !== 19 || task5Ids.length !== 19) throw new Error('billing_task5_registry_invalid');
+
+export const TASK5_BLOCKED_SCENARIO_CONTRACTS = Object.freeze(Object.fromEntries(
+  task5Ids.map((id) => [id, task5ById[id]])));
+export const TASK5_BLOCKED_SCENARIO_IDS = Object.freeze(task5Ids);
 
 export const FINANCIAL_SCENARIOS = BILLING_43_IDS;
 

@@ -46,9 +46,13 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 
 ### Task 1: Canonical 43-scenario registry and strict result schema
 
+- **Implementation result (2026-09-27):** None of the audited 19 cases met the execution/evidence/retention gates, so all remain explicitly blocked with per-case reason codes, `maxWrites: 0`, and empty operation allowlists. Four immutable domain registries feed the exact Task 5 registry; each runner throws before effects and returns no scenario result. The Preview transport remains GET-only. Local tests do not constitute Preview, provider, or production acceptance.
+
 **Files:**
+- Create: src/billing/scenarios/blocked.mjs
 - Create: .gitignore
 - Modify: src/billing/fixtures.mjs
+- Modify: src/billing/fixture-run.mjs (share stable signup refusal codes)
 - Modify: src/billing/financial.mjs
 - Create: src/contracts/billing-43.mjs
 - Modify: src/contracts/evidence.mjs
@@ -170,17 +174,19 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - Test: test/billing/scenarios/pricing.test.mjs
 - Test: test/billing/scenarios/payment.test.mjs
 - Test: test/billing/scenarios/zero.test.mjs
+- Test support: test/billing/scenarios/support.mjs
+- Modify: test/billing/fixtures.test.mjs, test/billing/fixture-run.test.mjs, test/contracts/evidence.test.mjs
 - Modify: package.json
 
-- [ ] For each of the 19 IDs, define an explicit executable-or-blocked disposition. RED tests must prove exact transitions/effects/oracles/negative effects/cleanup for executable paths; blocked paths must refuse before Preview, fixture, CRM/Mailchimp, or provider effects and must never emit `passed`.
-- [ ] Implement contracts only for paths with fixed route/method/action allowlists, attempt/fence and write budgets, a distinct stored/provider-state reader, and ownership/retention rules. Extend transport narrowly from the audited app source only if at least one path passes those gates; otherwise preserve GET `/` as the only document route and prove all blocked cases are refused before transport use. Tests reject arbitrary URL/method/action and cross-origin requests. No scenario infers a pass from HTTP 2xx, a UI label or app-supplied value.
-- [ ] Keep all five signup IDs blocked until a verifier-owned signup policy and non-delivering isolated inbox, suppression of CRM/Mailchimp side effects, and an approved append-only identity/row retention path exist. `signup.expired-intent` and `signup.tampered-intent` must not mutate signed cookies; unit-only parser coverage is not Preview acceptance.
-- [ ] Coupon/progressive/combo/zero-total paths require explicit synthetic catalog values and price snapshots; payment paths require separately verified TEST resources, independent Stripe/database readback, and reversible-resource ownership. Ambiguous decline/abandon/timeout/two-tab semantics remain blocked until exact observable behavior and safe seams are specified.
-- [ ] Test invalid/missing adapters and unsupported endpoint/operation refuse before provider mutation; assert each contract stays within its maxWrites.
-- [ ] Confirm the trusted Task 5 runner cannot produce `passed` for a blocked case, and that a direct `status: 'blocked'` record is rejected by the canonical validator. Record the present validator boundary: `validateBilling43Results` is schema-only and cannot detect a caller that fabricates a structurally valid `passed` record; Task 9 must bind results to trusted execution receipts and must never translate blocked/refused to passed.
-- [ ] No local fake/adapter result is reported as remote acceptance.
-- [ ] Run the four domain test files and full npm test.
-- [ ] Commit as feat(billing): gate unvalidated signup pricing and payment flows (or implement only the cases that meet every safety/evidence gate).
+- [x] For each of the 19 IDs, define an explicit executable-or-blocked disposition. RED tests prove blocked paths refuse before Preview/browser, fixture, CRM/Mailchimp, Supabase, or Stripe callbacks and never emit `passed`.
+- [x] No path met every execution gate; preserve GET `/` as the only document route and do not add generic POST/API access. Tests reject a hostile cross-origin POST/action input before any callback; no scenario infers a pass from HTTP 2xx, a UI label or app-supplied value.
+- [x] Keep all five signup IDs blocked until a verifier-owned signup policy and non-delivering isolated inbox, suppression of CRM/Mailchimp side effects, and an approved append-only identity/row retention path exist. `signup.expired-intent` and `signup.tampered-intent` do not mutate signed cookies; unit-only parser coverage is not Preview acceptance.
+- [x] Coupon/progressive/combo/zero-total paths lack explicit synthetic catalog values and price snapshots; payment paths lack approved independently verified TEST readback and reversible-resource ownership. Ambiguous decline/abandon/timeout/two-tab semantics remain blocked.
+- [x] Missing adapters and unsupported endpoint/operation inputs are refused before provider callbacks; all 19 contracts have `maxWrites: 0` and empty operation allowlists.
+- [x] The trusted Task 5 runners throw without returning any result for blocked cases; a direct `status: 'blocked'` result is rejected by the canonical validator. `validateBilling43Results` remains schema-only and accepts structurally valid caller-fabricated `passed` records; Task 9 must bind results to trusted execution receipts and never translate blocked/refused to `passed`.
+- [x] No local fake/adapter result is reported as remote acceptance.
+- [x] Run the four domain test files and full npm test (`npm run test:task5`: 68/68; `npm test`: 521/521).
+- [x] Commit as feat(billing): gate unvalidated signup pricing and payment flows; local branch only, no push or PR.
 
 ### Task 6: Executable subscription, finance, access, and webhook contracts
 

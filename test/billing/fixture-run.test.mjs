@@ -481,10 +481,16 @@ test('fixture writer rejects unconfigured or unsafe mutation capabilities before
 
 test('native signup requiring confirmation blocks without an isolated non-delivering inbox and never offers Auth-admin creation', async () => {
   const allowSignup = needExport(fixtureRun, 'assertNativeSignupReady');
-  for (const caseId of ['signup.native', 'signup.join', 'signup.expired-intent',
-    'signup.tampered-intent', 'signup.replay']) {
+  const blockedSignupCases = [
+    ['signup.native', 'signup_native_inbox_and_policy_unavailable'],
+    ['signup.join', 'signup_join_policy_reader_unavailable'],
+    ['signup.expired-intent', 'signup_expired_intent_verifier_unavailable'],
+    ['signup.tampered-intent', 'signup_tampered_intent_verifier_unavailable'],
+    ['signup.replay', 'signup_replay_finalizer_reader_unavailable'],
+  ];
+  for (const [caseId, reasonCode] of blockedSignupCases) {
     await assert.rejects(allowSignup({ caseId, confirmationRequired: true }),
-      { code: 'signup_confirmation_policy_unverified' });
+      { code: reasonCode });
   }
   assert.equal(Object.keys(needExport(supabase, 'createSupabaseFixturePublisher')({
     expectedEnvironment: environment,
@@ -496,13 +502,13 @@ test('native signup requiring confirmation blocks without an isolated non-delive
 test('caller booleans and a self-reported inbox cannot authorize native signup when no trusted policy reader exists', async () => {
   const allowSignup = needExport(fixtureRun, 'assertNativeSignupReady');
   for (const input of [
-    { caseId: 'signup.native', confirmationRequired: false },
-    { caseId: 'signup.native', confirmationRequired: true,
+    { caseId: 'signup.native', code: 'signup_native_inbox_and_policy_unavailable', confirmationRequired: false },
+    { caseId: 'signup.native', code: 'signup_native_inbox_and_policy_unavailable', confirmationRequired: true,
       inbox: { isolated: true, delivery: 'disabled', async verify() {
         return { isolated: true, delivery: 'disabled' };
       } } },
   ]) {
-    await assert.rejects(allowSignup(input), { code: 'signup_confirmation_policy_unverified' });
+    await assert.rejects(allowSignup(input), { code: input.code });
   }
 });
 

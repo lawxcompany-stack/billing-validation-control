@@ -2,10 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { BILLING_43_IDS } from '../contracts/billing-43.mjs';
 import { isActiveFixtureMutationTransaction } from '../attempts/store.mjs';
 import { assertCurrentAttempt } from './contracts.mjs';
+import { SIGNUP_SCENARIOS } from './scenarios/signup.mjs';
+import { runBlockedBillingScenario } from './scenarios/blocked.mjs';
 
 const CASE_SET = new Set(BILLING_43_IDS);
-const SIGNUP_CASES = new Set(['signup.native', 'signup.join', 'signup.expired-intent',
-  'signup.tampered-intent', 'signup.replay']);
 const FIXTURE_KINDS = new Set(['catalog', 'billing_identity']);
 const FIXTURE_MARKER = 'lawx-billing-validation-synthetic-v1';
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u;
@@ -165,8 +165,6 @@ export function createAttemptFixtureRun({ context, publisher, readers, startedAt
 }
 
 export async function assertNativeSignupReady({ caseId } = {}) {
-  if (typeof caseId !== 'string' || !SIGNUP_CASES.has(caseId)) refuse('signup_case_invalid');
-  // No verifier-owned signup policy or isolated inbox capability exists yet.
-  // Caller booleans and caller-implemented `verify()` callbacks are not evidence.
-  refuse('signup_confirmation_policy_unverified');
+  if (typeof caseId !== 'string' || !Object.hasOwn(SIGNUP_SCENARIOS, caseId)) refuse('signup_case_invalid');
+  return runBlockedBillingScenario(SIGNUP_SCENARIOS, caseId);
 }
