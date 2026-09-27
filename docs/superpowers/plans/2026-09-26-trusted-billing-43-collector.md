@@ -197,6 +197,8 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 
 ### Task 6: Executable subscription, finance, access, and webhook contracts
 
+**Progress (2026-09-27):** Local commit `a115378` adds exact immutable fail-closed blocks for the remaining 24 canonical IDs (focused tests 32/32, full suite 523/523). Independent review found this is a safe interim refusal layer, not the requested executable journeys; Task 6 is **not complete**. Fix round 1 made no code changes because no case has all required trusted operations, independent before/after product/provider readback, negative-effect checks, and append-only ownership/cleanup in the approved adapters. Scoped re-review confirmed both Important findings remain open. Further work requires an approved case-level contract or authorization to add non-production product seams; no mock-only pass or transition will be invented.
+
 **Files:**
 - Create: src/billing/scenarios/subscription.mjs
 - Create: src/billing/scenarios/finance.mjs
