@@ -325,10 +325,13 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_leases (
   owner_run_attempt integer NOT NULL,
   fence uuid NOT NULL,
   expires_at timestamptz NOT NULL,
+  recovery_only boolean NOT NULL DEFAULT false,
   PRIMARY KEY (branch_id, suite, fixture_key),
   FOREIGN KEY (attempt_id, branch_id, suite, fixture_key)
     REFERENCES billing_validation_control.attempts(attempt_id, branch_id, suite, fixture_key)
 );
+ALTER TABLE billing_validation_control.fixture_leases
+  ADD COLUMN IF NOT EXISTS recovery_only boolean NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS billing_validation_lease_expiry
   ON billing_validation_control.fixture_leases (expires_at);
 

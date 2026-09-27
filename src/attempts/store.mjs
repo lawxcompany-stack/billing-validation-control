@@ -456,7 +456,8 @@ export function createAttemptStore(adapter) {
         await tx.putRetentionReservation(reservation);
         await tx.putLease({ key, attemptId, fence, expiresAt: now + ttlSeconds,
           candidateSha, ownerRepository: workflow.repository, ownerRef: workflow.ref,
-          ownerRunId: workflow.runId, ownerRunAttempt: workflow.runAttempt }, lease?.fence ?? null);
+          ownerRunId: workflow.runId, ownerRunAttempt: workflow.runAttempt, recoveryOnly: false },
+        lease?.fence ?? null);
         return admissionResult(row, fence, reservation);
       });
     },
@@ -521,7 +522,7 @@ export function createAttemptStore(adapter) {
         const lease = await tx.getLease(row.key);
         const now = await tx.now();
         await assertFencedOwner(tx, row, lease, request.attemptId, request.fence, now);
-        if (row.state === 'rechecking') refuse('recovery_read_only');
+        if (row.state === 'rechecking' || lease.recoveryOnly === true) refuse('recovery_read_only');
         if (request.candidateSha !== row.candidateSha || !equal(request.workflow, row.workflow) ||
             !equal(request.environment, row.environment) ||
             request.environment.stripe.accountId !== row.environment.stripe.accountId) {
@@ -575,7 +576,8 @@ export function createAttemptStore(adapter) {
         if (typeof tx.lockResourceLocks !== 'function' || typeof tx.getResourceLocks !== 'function' ||
             typeof tx.listPendingStripeIntents !== 'function' ||
             typeof tx.getRetentionReservationByAttempt !== 'function' ||
-            typeof tx.getRetentionReceipt !== 'function' || typeof tx.putLease !== 'function' ||
+            typeof tx.getRetentionReceipt !== 'function' || typeof tx.getCleanupReceipt !== 'function' ||
+            typeof tx.putLease !== 'function' ||
             typeof tx.putResourceLocks !== 'function') refuse('stripe_intent_store_unavailable');
         await tx.lockResourceLocks(row.environment);
         const lease = await tx.getLease(row.key);
@@ -583,9 +585,12 @@ export function createAttemptStore(adapter) {
         const locks = await tx.getResourceLocks(row.environment);
         assertResourceOwner(locks, row, lease, attemptId, fence);
         const pendingIntents = await tx.listPendingStripeIntents(attemptId);
-        if (!Array.isArray(pendingIntents) || pendingIntents.length === 0 ||
-            pendingIntents.some((intent) => !intent || intent.attemptId !== attemptId ||
+        if (!Array.isArray(pendingIntents) || pendingIntents.some((intent) => !intent || intent.attemptId !== attemptId ||
               intent.state !== 'in_flight')) refuse('recovery_unverified');
+        if (pendingIntents.length === 0 && (lease.recoveryOnly !== true ||
+            row.cleanupStatus !== 'pending' || await tx.getCleanupReceipt(attemptId))) {
+          refuse('recovery_unverified');
+        }
         const reservation = await tx.getRetentionReservationByAttempt(attemptId);
         if (!reservation || await tx.getRetentionReceipt(reservation.reservationId)) {
           refuse('recovery_unverified');
@@ -607,7 +612,8 @@ export function createAttemptStore(adapter) {
         }
         const now = await tx.now();
         const nextFence = randomUUID();
-        const renewed = { ...lease, fence: nextFence, expiresAt: now + ttlSeconds,
+        const renewed = { ...lease, fence: nextFence, recoveryOnly: true,
+          expiresAt: now + ttlSeconds,
           ownerRepository: currentRun.repository, ownerRef: currentRun.ref,
           ownerRunId: currentRun.runId, ownerRunAttempt: currentRun.runAttempt };
         await tx.putLease(renewed, lease.fence);
@@ -661,8 +667,9 @@ export function createAttemptStore(adapter) {
         const row = await tx.getAttempt(attemptId);
         if (!row) refuse('attempt_missing');
         await tx.lockResourceLocks(row.environment);
-        await assertFencedOwner(tx, row, await tx.getLease(row.key), attemptId, fence, await tx.now());
-        if (row.state === 'rechecking') refuse('recovery_read_only');
+        const lease = await tx.getLease(row.key);
+        await assertFencedOwner(tx, row, lease, attemptId, fence, await tx.now());
+        if (row.state === 'rechecking' || lease.recoveryOnly === true) refuse('recovery_read_only');
         return tx.fixtureMutation(mutation);
       });
     },

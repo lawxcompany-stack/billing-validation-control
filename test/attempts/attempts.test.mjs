@@ -8,6 +8,7 @@ import { cleanupAttempt } from '../../src/attempts/cleanup.mjs';
 import { withExternalFence, withFixtureMutation, withRenewingLease } from '../../src/attempts/lock.mjs';
 import { createSnapshot } from '../../src/contracts/attempt.mjs';
 import { providerIdempotencyKey } from '../../src/attempts/prepare.mjs';
+import { runStripeMutation } from '../../src/runtime/stripe.mjs';
 
 const environment = {
   database: { projectRef: 'abcdefghijklmnopqrst', branchId: 'validation-child-1' },
@@ -552,6 +553,162 @@ test('interrupted Stripe recovery hands off repeatedly using the latest verified
   assert.equal(adapter.reservations.size, 1);
   assert.equal(adapter.receipts.size, 0);
   assert.equal(adapter.cleanupReceipts.size, 0);
+});
+
+test('recovery-only authority blocks fixture and Stripe writes after terminal transitions, renewals, and handoffs', async () => {
+  for (const terminalState of ['cancelled', 'complete', 'timed_out']) {
+    const adapter = fakeAdapter();
+    const store = createAttemptStore(adapter);
+    const prior = await prepareAttempt(store, input(`attempt-terminal-${terminalState}`, shaA,
+      `invoice-${terminalState}`));
+    const initialOperation = `checkout:create:terminal-${terminalState}`;
+    await store.beginStripeIntent({ attemptId: prior.attemptId, fence: prior.fence,
+      candidateSha: prior.candidateSha, workflow: prior.workflow, environment: prior.environment,
+      action: 'checkout.replay', operation: initialOperation, requestDigest: 'a'.repeat(64),
+      idempotencyKey: providerIdempotencyKey(prior.attemptId, 'stripe', initialOperation) });
+    await store.transition({ attemptId: prior.attemptId, fence: prior.fence,
+      from: 'collecting', to: 'cancelled' });
+
+    const firstRecoveryRun = { ...prior.workflow, runId: '200', runAttempt: 1 };
+    const secondRecoveryRun = { ...prior.workflow, runId: '300', runAttempt: 1 };
+    adapter.verifyRecovery = async ({ ownerRun }) => ({ runTerminal: true, runnerRemoved: true,
+      currentRun: ownerRun.runId === '100' ? firstRecoveryRun : secondRecoveryRun });
+    adapter.advance(61);
+    const first = await store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+      fence: prior.fence });
+    await store.renew({ attemptId: prior.attemptId, fence: first.fence, ttlSeconds: 90 });
+    const latest = await store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+      fence: first.fence });
+    await store.transition({ attemptId: prior.attemptId, fence: latest.fence,
+      from: 'rechecking', to: terminalState });
+
+    let fixtureWrites = 0;
+    let providerDispatches = 0;
+    const results = await Promise.allSettled([
+      store.fixtureMutation({ attemptId: prior.attemptId, fence: latest.fence }, async () => {
+        fixtureWrites++;
+      }),
+      runStripeMutation({ attempts: store, owner: { attemptId: prior.attemptId,
+        fence: latest.fence, candidateSha: prior.candidateSha, workflow: prior.workflow,
+        environment: prior.environment }, action: 'checkout.replay',
+      operation: `checkout:create:blocked-${terminalState}`, input: {},
+      idempotencyKey: providerIdempotencyKey(prior.attemptId, 'stripe',
+        `checkout:create:blocked-${terminalState}`), adapter: { mutate: async () => {
+        providerDispatches++;
+      } } }),
+    ]);
+
+    assert.deepEqual(results.map((result) => result.status), ['rejected', 'rejected']);
+    assert.deepEqual(results.map((result) => result.reason.code), ['recovery_read_only', 'recovery_read_only']);
+    assert.equal(fixtureWrites, 0);
+    assert.equal(providerDispatches, 0);
+    assert.equal(adapter.stripeIntents.size, 1);
+    assert.equal(adapter.leases.get(JSON.stringify(prior.key)).recoveryOnly, true);
+  }
+});
+
+test('recovery may resume after its final reconciliation but never starts with no pending intent', async () => {
+  const initialAdapter = fakeAdapter();
+  const initialStore = createAttemptStore(initialAdapter);
+  const initial = await prepareAttempt(initialStore, input('attempt-empty-initial', shaA, 'invoice-empty-initial'));
+  await initialStore.transition({ attemptId: initial.attemptId, fence: initial.fence,
+    from: 'collecting', to: 'cancelled' });
+  let initialProofCalls = 0;
+  initialAdapter.verifyRecovery = async () => {
+    initialProofCalls++;
+    return { runTerminal: true, runnerRemoved: true,
+      currentRun: { ...initial.workflow, runId: '200', runAttempt: 1 } };
+  };
+  await assert.rejects(initialStore.handoffStripeIntentRecovery({ attemptId: initial.attemptId,
+    fence: initial.fence }), { code: 'recovery_unverified' });
+  assert.equal(initialProofCalls, 0);
+  assert.equal(initialAdapter.leases.get(JSON.stringify(initial.key)).fence, initial.fence);
+
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const prior = await prepareAttempt(store, input('attempt-final-reconcile', shaA, 'invoice-final-reconcile'));
+  const operation = 'checkout:create:final-reconcile';
+  const intent = await store.beginStripeIntent({ attemptId: prior.attemptId, fence: prior.fence,
+    candidateSha: prior.candidateSha, workflow: prior.workflow, environment: prior.environment,
+    action: 'checkout.replay', operation, requestDigest: 'b'.repeat(64),
+    idempotencyKey: providerIdempotencyKey(prior.attemptId, 'stripe', operation) });
+  await store.transition({ attemptId: prior.attemptId, fence: prior.fence,
+    from: 'collecting', to: 'cancelled' });
+  const firstRecoveryRun = { ...prior.workflow, runId: '200', runAttempt: 1 };
+  const secondRecoveryRun = { ...prior.workflow, runId: '300', runAttempt: 1 };
+  const recoveryEvidence = [];
+  adapter.verifyRecovery = async ({ ownerRun, pendingIntents }) => {
+    recoveryEvidence.push({ ownerRun, pendingIntents });
+    return { runTerminal: true, runnerRemoved: true,
+      currentRun: ownerRun.runId === '100' ? firstRecoveryRun : secondRecoveryRun };
+  };
+  const first = await store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+    fence: prior.fence });
+  const observation = { accountId: environment.stripe.accountId, livemode: false, operation,
+    requestDigest: intent.requestDigest, idempotencyKey: intent.idempotencyKey,
+    resourceIds: ['cs_synthetic123'] };
+  const receipt = await store.reconcileStripeIntent({ attemptId: prior.attemptId,
+    fence: first.fence, intentId: intent.intentId, observation });
+  const retainedLocks = [...adapter.resourceLocks.values()];
+  const retainedReservation = [...adapter.reservations.values()];
+
+  adapter.advance(100);
+  adapter.verifyRecovery = async () => ({ runTerminal: false, runnerRemoved: false,
+    currentRun: secondRecoveryRun });
+  await assert.rejects(store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+    fence: first.fence }), { code: 'recovery_unverified' });
+  adapter.verifyRecovery = async () => ({ runTerminal: true, runnerRemoved: true,
+    currentRun: firstRecoveryRun });
+  await assert.rejects(store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+    fence: first.fence }), { code: 'recovery_unverified' });
+  assert.equal(adapter.leases.get(JSON.stringify(prior.key)).fence, first.fence);
+
+  adapter.cleanupReceipts.set(prior.attemptId, { attemptId: prior.attemptId });
+  await assert.rejects(store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+    fence: first.fence }), { code: 'recovery_unverified' });
+  adapter.cleanupReceipts.delete(prior.attemptId);
+  const [reservationId, reservationRow] = adapter.reservations.entries().next().value;
+  adapter.reservations.delete(reservationId);
+  await assert.rejects(store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+    fence: first.fence }), { code: 'recovery_unverified' });
+  adapter.reservations.set(reservationId, reservationRow);
+  const savedLocks = new Map(adapter.resourceLocks);
+  adapter.resourceLocks.clear();
+  await assert.rejects(store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+    fence: first.fence }), { code: 'lease_fence_lost' });
+  for (const [lockKey, lock] of savedLocks) adapter.resourceLocks.set(lockKey, lock);
+  adapter.verifyRecovery = async ({ ownerRun, pendingIntents }) => {
+    recoveryEvidence.push({ ownerRun, pendingIntents });
+    return { runTerminal: true, runnerRemoved: true,
+      currentRun: ownerRun.runId === '100' ? firstRecoveryRun : secondRecoveryRun };
+  };
+
+  const resumed = await store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+    fence: first.fence });
+
+  assert.notEqual(resumed.fence, first.fence);
+  assert.equal(resumed.state, 'rechecking');
+  assert.equal(adapter.leases.get(JSON.stringify(prior.key)).recoveryOnly, true);
+  assert.equal(recoveryEvidence[1].ownerRun.runId, '200');
+  assert.deepEqual(recoveryEvidence[1].pendingIntents, []);
+  assert.equal(adapter.stripeReceipts.get(intent.intentId).receiptId, receipt.receiptId);
+  assert.deepEqual([...adapter.resourceLocks.values()].map(({ resourceType, resourceId }) =>
+    `${resourceType}:${resourceId}`).sort(), retainedLocks.map(({ resourceType, resourceId }) =>
+    `${resourceType}:${resourceId}`).sort());
+  assert.ok([...adapter.resourceLocks.values()].every(({ attemptId, fence }) =>
+    attemptId === prior.attemptId && fence === resumed.fence));
+  assert.deepEqual([...adapter.reservations.values()], retainedReservation);
+  assert.equal(adapter.cleanupReceipts.size, 0);
+
+  await store.transition({ attemptId: prior.attemptId, fence: resumed.fence,
+    from: 'rechecking', to: 'complete' });
+  const cleanup = await store.cleanup({ attemptId: prior.attemptId, fence: resumed.fence,
+    projection: cleanupProjection });
+  assert.equal(cleanup.cleanupStatus, 'complete');
+  assert.equal(adapter.cleanupReceipts.size, 1);
+  assert.equal(adapter.resourceLocks.size, 0);
+  await assert.rejects(store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+    fence: resumed.fence }), { code: 'recovery_unverified' });
 });
 
 test('intent recovery requires verifier-bound current run identity and ignores caller terminal flags', async () => {

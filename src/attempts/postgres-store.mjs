@@ -481,7 +481,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
         await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [JSON.stringify(keyValues(key))]);
         const result = await queryClient.query(`SELECT branch_id, suite, fixture_key, attempt_id, fence,
           owner_candidate_sha, owner_repository, owner_ref, owner_run_id, owner_run_attempt,
-          extract(epoch FROM expires_at) AS expires_at_epoch
+          recovery_only, extract(epoch FROM expires_at) AS expires_at_epoch
           FROM billing_validation_control.fixture_leases
           WHERE branch_id = $1 AND suite = $2 AND fixture_key = $3 FOR UPDATE`, keyValues(key));
         const row = result.rows[0];
@@ -489,22 +489,23 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
           candidateSha: row.owner_candidate_sha?.trim(), ownerRepository: row.owner_repository,
           ownerRef: row.owner_ref, ownerRunId: row.owner_run_id,
           ownerRunAttempt: row.owner_run_attempt,
+          recoveryOnly: row.recovery_only === true,
           expiresAt: Number(row.expires_at_epoch) } : null;
       },
       async putLease(lease, expectedFence) {
         const result = await queryClient.query(`INSERT INTO billing_validation_control.fixture_leases
           (branch_id, suite, fixture_key, attempt_id, fence, expires_at,
-           owner_candidate_sha, owner_repository, owner_ref, owner_run_id, owner_run_attempt)
-          VALUES ($1,$2,$3,$4,$5,to_timestamp($6),$8,$9,$10,$11,$12)
+           owner_candidate_sha, owner_repository, owner_ref, owner_run_id, owner_run_attempt, recovery_only)
+          VALUES ($1,$2,$3,$4,$5,to_timestamp($6),$8,$9,$10,$11,$12,$13)
           ON CONFLICT (branch_id, suite, fixture_key) DO UPDATE SET
             attempt_id = EXCLUDED.attempt_id, fence = EXCLUDED.fence, expires_at = EXCLUDED.expires_at,
             owner_candidate_sha = EXCLUDED.owner_candidate_sha, owner_repository = EXCLUDED.owner_repository,
             owner_ref = EXCLUDED.owner_ref, owner_run_id = EXCLUDED.owner_run_id,
-            owner_run_attempt = EXCLUDED.owner_run_attempt
+            owner_run_attempt = EXCLUDED.owner_run_attempt, recovery_only = EXCLUDED.recovery_only
           WHERE billing_validation_control.fixture_leases.fence = $7::uuid`,
         [...keyValues(lease.key), lease.attemptId, lease.fence, lease.expiresAt, expectedFence,
           lease.candidateSha, lease.ownerRepository, lease.ownerRef,
-          lease.ownerRunId, lease.ownerRunAttempt]);
+          lease.ownerRunId, lease.ownerRunAttempt, lease.recoveryOnly === true]);
         if (result.rowCount === 0) refuse('lease_fence_lost');
       },
       async deleteLease(key, attemptId, fence) {
