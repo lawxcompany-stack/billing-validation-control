@@ -63,6 +63,31 @@ test('provider mutations bind the current fence, exact child and TEST identity, 
   assert.equal(JSON.stringify(request).includes('sk_test_private_output'), false);
 });
 
+test('provider mutation checks independent reader readiness before creating a Stripe intent or dispatching', async () => {
+  const create = needExport(contracts, 'createVerifiedContext');
+  const mutate = needExport(contracts, 'mutateProvider');
+  const h = makeAttemptParts();
+  const readinessCalls = [];
+  const readers = {
+    expectedEnvironment: h.preflight.expectedEnvironment,
+    expectedWebhookEndpointId: h.preflight.providerVerification.stripe.webhookEndpointId,
+    async assertReady(binding) {
+      readinessCalls.push(binding);
+      throw new Error('reader identity mismatch');
+    },
+  };
+  const context = create({ ...h, readers });
+
+  const result = await Promise.allSettled([mutate(context, { provider: 'stripe', action: 'checkout.replay',
+    operation: 'checkout-replay:reader-gate', input: { amount: 2500 } })]);
+
+  assert.equal(result[0].status, 'rejected');
+  assert.equal(result[0].reason.code, 'billing_readers_unavailable');
+  assert.equal(readinessCalls.length, 1);
+  assert.equal(h.calls.intentBegins.length, 0);
+  assert.equal(h.calls.mutations.length, 0);
+});
+
 test('Stripe mutation refuses before adapter invocation when durable intent storage is unavailable', async () => {
   const create = needExport(contracts, 'createVerifiedContext');
   const mutate = needExport(contracts, 'mutateProvider');

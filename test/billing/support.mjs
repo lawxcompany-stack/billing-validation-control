@@ -124,7 +124,12 @@ export function makeAttemptParts({ attemptId = 'attempt-task6', fence = '1111111
       calls.mutations.push(structuredClone(request));
     },
   };
-  return { attempts, owner, preflight, mutationAdapter, calls, intents, receipts };
+  const readers = { expectedEnvironment: preflight.expectedEnvironment,
+    expectedWebhookEndpointId: preflight.providerVerification.stripe.webhookEndpointId,
+    async assertReady() { return true; } };
+  const readerBinding = Object.freeze({ attemptId, caseId: 'payment.approved',
+    startedAt: '2026-09-23T09:00:00.000Z' });
+  return { attempts, owner, preflight, mutationAdapter, readers, readerBinding, calls, intents, receipts };
 }
 
 export async function importIfMissing(importer) {
@@ -236,7 +241,8 @@ export function makeReaders({ provider = paidProviderState(), baseline = databas
       return structuredClone(replayStates.shift());
     },
   };
-  return { stripe, supabase, calls };
+  return { stripe, supabase, calls, expectedEnvironment: environment,
+    expectedWebhookEndpointId: 'we_task6endpoint', async assertReady() { return true; } };
 }
 
 export function paidDatabaseSnapshot({ observedAt } = {}) {

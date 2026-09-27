@@ -117,3 +117,35 @@ test('rejects extra attestation fields and noncanonical signatures', async () =>
     }), { code: document === noncanonicalSignature ? 'attestation_signature_invalid' : 'attestation_shape_invalid' });
   }
 });
+
+test('bounds signed deployment-identity responses before parsing and does not use buffered response.json()', async () => {
+  const valid = signedAttestation();
+  for (const mode of [
+    { contentLength: String(64 * 1024 + 1), chunk: Buffer.from(JSON.stringify(valid)) },
+    { contentLength: null, chunk: Buffer.alloc(64 * 1024 + 1, 97) },
+  ]) {
+    const calls = { reads: 0, cancels: 0, json: 0 };
+    const body = new ReadableStream({
+      start(controller) { controller.enqueue(mode.chunk); controller.close(); },
+      cancel() { calls.cancels += 1; },
+    });
+    const getReader = body.getReader.bind(body);
+    body.getReader = (...args) => { calls.reads += 1; return getReader(...args); };
+    const response = {
+      ok: true,
+      status: 200,
+      headers: { get(name) {
+        if (name.toLowerCase() === 'content-type') return 'application/json';
+        if (name.toLowerCase() === 'content-length') return mode.contentLength;
+        return null;
+      } },
+      body,
+      async json() { calls.json += 1; return valid; },
+    };
+
+    await assert.rejects(verifyDeploymentAttestation({ deployment, candidate, policy,
+      fetchImpl: async () => response }), { code: 'attestation_response_invalid' });
+    assert.equal(calls.json, 0);
+    if (mode.contentLength !== null) assert.equal(calls.reads, 0);
+  }
+});

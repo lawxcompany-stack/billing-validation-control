@@ -528,10 +528,13 @@ export function createStripeBillingReader({ expectedEnvironment, expectedWebhook
       if (created.present) {
         if (!plainRecord(created.value)) refuse('stripe_reader_input_invalid');
         const gte = ownValue(created.value, 'gte');
-        if (!gte.present || !Number.isSafeInteger(gte.value) || gte.value < 1 || Reflect.ownKeys(created.value).length !== 1) {
+        const lte = ownValue(created.value, 'lte');
+        if (!gte.present || !Number.isSafeInteger(gte.value) || gte.value < 1 ||
+            lte.present && (!Number.isSafeInteger(lte.value) || lte.value < gte.value) ||
+            Reflect.ownKeys(created.value).some((key) => key !== 'gte' && key !== 'lte')) {
           refuse('stripe_reader_input_invalid');
         }
-        safeQuery.created = Object.freeze({ gte: gte.value });
+        safeQuery.created = Object.freeze({ gte: gte.value, ...(lte.present ? { lte: lte.value } : {}) });
       }
       let events;
       try { events = await source.listEvents(Object.freeze({ ...safeQuery,
@@ -540,8 +543,7 @@ export function createStripeBillingReader({ expectedEnvironment, expectedWebhook
       if (!Array.isArray(events) || events.length > 100) refuse('stripe_reader_response_invalid');
       return Object.freeze(events.map((event) => {
         const projected = projectStripeEvent(event);
-        if (projected.accountId !== undefined && projected.accountId !== null &&
-            projected.accountId !== identity.accountId) refuse('stripe_reader_response_invalid');
+        if (projected.accountId !== identity.accountId) refuse('stripe_reader_response_invalid');
         return projected;
       }));
     },
@@ -569,18 +571,30 @@ export function stripeRequestDigest({ action, operation, input } = {}) {
 }
 
 export async function runStripeMutation({ attempts, owner, action, operation, input, idempotencyKey,
-  adapter } = {}) {
+  adapter, readers, readerBinding } = {}) {
   if (!attempts || typeof attempts.assertFence !== 'function' ||
       typeof attempts.beginStripeIntent !== 'function' || !owner ||
       typeof owner.attemptId !== 'string' || typeof owner.fence !== 'string' ||
       !/^[a-f0-9]{40}$/u.test(owner.candidateSha ?? '') ||
       !object(owner.workflow) || !object(owner.environment) ||
       !ACCOUNT.test(owner.environment.stripe?.accountId ?? '') ||
+      typeof owner.webhookEndpointId !== 'string' || !ENDPOINT.test(owner.webhookEndpointId) ||
       !MUTABLE_ACTIONS.has(action) || typeof operation !== 'string' || !OPERATION.test(operation) ||
       !object(input) || typeof adapter?.mutate !== 'function' ||
+      !isValidExpectedEnvironment(readers?.expectedEnvironment) ||
+      readers.expectedEnvironment.database.projectRef !== owner.environment.database?.projectRef ||
+      readers.expectedEnvironment.database.branchId !== owner.environment.database?.branchId ||
+      readers.expectedEnvironment.deployment.id !== owner.environment.deployment?.id ||
+      readers.expectedEnvironment.deployment.origin !== owner.environment.deployment?.origin ||
+      readers.expectedEnvironment.stripe.accountId !== owner.environment.stripe.accountId ||
+      readers.expectedWebhookEndpointId !== owner.webhookEndpointId ||
+      typeof readers.assertReady !== 'function' || readerBinding?.attemptId !== owner.attemptId ||
+      typeof readerBinding?.caseId !== 'string' || typeof readerBinding?.startedAt !== 'string' ||
       idempotencyKey !== providerIdempotencyKey(owner.attemptId, 'stripe', operation)) {
     refuse('stripe_mutation_invalid');
   }
+  try { await readers.assertReady(Object.freeze({ ...readerBinding })); }
+  catch { refuse('stripe_readers_unavailable'); }
   const requestDigest = stripeRequestDigest({ action, operation, input });
   const safeInput = JSON.parse(canonicalJson(input));
   const current = await attempts.assertFence({ attemptId: owner.attemptId, fence: owner.fence });

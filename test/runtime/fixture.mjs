@@ -50,7 +50,15 @@ export function fetchFixture(document) {
     calls,
     async fetchImpl(url, options) {
       calls.push({ url, options });
-      return { ok: true, status: 200, async json() { return document; } };
+      const bytes = Buffer.from(JSON.stringify(document), 'utf8');
+      return { ok: true, status: 200,
+        headers: { get(name) {
+          if (name.toLowerCase() === 'content-type') return 'application/json';
+          if (name.toLowerCase() === 'content-length') return String(bytes.byteLength);
+          return null;
+        } },
+        body: new ReadableStream({ start(controller) { controller.enqueue(bytes); controller.close(); } }),
+        async json() { return document; } };
     },
   };
 }

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { BILLING_43_IDS } from '../contracts/billing-43.mjs';
 import { sanitizeDatabaseSnapshot } from '../billing/observations.mjs';
+import { isActiveFixtureMutationTransaction } from '../attempts/store.mjs';
 
 const API = 'https://api.supabase.com';
 const REF = /^[a-z0-9]{20}$/u;
@@ -197,7 +198,10 @@ function sanitizeWebhookInbox(value) {
   if (value === null) return null;
   const result = selectedSafeFields(value, WEBHOOK_FIELDS, ['eventId', 'status']);
   if (!result || typeof result.eventId !== 'string' || typeof result.status !== 'string' ||
-      result.livemode !== undefined && typeof result.livemode !== 'boolean' ||
+      typeof result.accountId !== 'string' || !/^acct_[A-Za-z0-9_]+$/u.test(result.accountId) ||
+      result.livemode !== false || typeof result.receivedAt !== 'string' || !Number.isFinite(Date.parse(result.receivedAt)) ||
+      typeof result.processedAt !== 'string' || !Number.isFinite(Date.parse(result.processedAt)) ||
+      Date.parse(result.processedAt) < Date.parse(result.receivedAt) ||
       result.attempts !== undefined && (!Number.isSafeInteger(result.attempts) || result.attempts < 0)) {
     refuse('supabase_webhook_response_invalid');
   }
@@ -209,7 +213,9 @@ function sanitizeWebhookReceipts(value) {
   return Object.freeze(value.map((entry) => {
     const result = selectedSafeFields(entry, WEBHOOK_FIELDS, ['id', 'eventId']);
     if (!result || typeof result.id !== 'string' || typeof result.eventId !== 'string' ||
-        result.livemode !== undefined && typeof result.livemode !== 'boolean') {
+        typeof result.accountId !== 'string' || !/^acct_[A-Za-z0-9_]+$/u.test(result.accountId) ||
+        result.livemode !== false || result.status !== 'processed' ||
+        typeof result.receivedAt !== 'string' || !Number.isFinite(Date.parse(result.receivedAt))) {
       refuse('supabase_webhook_response_invalid');
     }
     return Object.freeze(result);
@@ -309,7 +315,7 @@ export function createSupabaseBillingReader({ expectedEnvironment, source } = {}
 export function createSupabaseFixturePublisher({ expectedEnvironment, adapter, attempts, owner } = {}) {
   if (!isValidExpectedEnvironment(expectedEnvironment)) refuse('supabase_fixture_adapter_unavailable');
 
-  async function assertReady(binding = {}) {
+  async function assertReadyBinding(binding = {}, verifyFence = true) {
     if (!object(adapter) || typeof adapter.readIdentity !== 'function' ||
         typeof adapter.insertAttemptFixture !== 'function' || !exactRecord(adapter.capabilities,
           Object.keys(FIXTURE_CAPABILITIES)) ||
@@ -333,7 +339,7 @@ export function createSupabaseFixturePublisher({ expectedEnvironment, adapter, a
     let actual;
     try { actual = await adapter.readIdentity(); } catch { refuse('supabase_fixture_adapter_unavailable'); }
     if (!fixtureIdentity(actual, expectedEnvironment)) refuse('supabase_fixture_identity_mismatch');
-    if (attempts && typeof attempts.assertFence === 'function') {
+    if (verifyFence && attempts && typeof attempts.assertFence === 'function') {
       try {
         const current = await attempts.assertFence({ attemptId: binding.attemptId, fence: binding.fence });
         if (current?.attemptId !== binding.attemptId || current?.fence !== binding.fence ||
@@ -343,6 +349,10 @@ export function createSupabaseFixturePublisher({ expectedEnvironment, adapter, a
       } catch { refuse('supabase_fixture_adapter_unavailable'); }
     }
     return true;
+  }
+
+  async function assertReady(binding = {}) {
+    return assertReadyBinding(binding, true);
   }
 
   async function insertAttemptFixture(input) {
@@ -359,9 +369,10 @@ export function createSupabaseFixturePublisher({ expectedEnvironment, adapter, a
         typeof input.transaction.transactionId !== 'string' || !SAFE_CONTROL_ID.test(input.transaction.transactionId) ||
         input.transaction.reservationLocked !== true || input.transaction.reservationValidated !== true ||
         input.transaction.reservationStatus !== 'active' || input.transaction.reservationSettled !== false ||
+        !isActiveFixtureMutationTransaction(input.transaction) ||
         !Number.isSafeInteger(input.transaction.remainingDatabaseRows) ||
         input.transaction.remainingDatabaseRows < 1) refuse('supabase_fixture_input_invalid');
-    await assertReady(input);
+    await assertReadyBinding(input, false);
     let receipt;
     try { receipt = await adapter.insertAttemptFixture(input); }
     catch { refuse('fixture_mutation_ambiguous'); }

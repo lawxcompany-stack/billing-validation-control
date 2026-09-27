@@ -158,7 +158,8 @@ const owner = Object.freeze({ attemptId: 'attempt-stripe-local',
   environment: Object.freeze({ database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst',
     branchId: 'validation-branch-1' }),
   deployment: Object.freeze({ id: 'dpl_candidate123', origin: 'https://candidate.vercel.app' }),
-  stripe: Object.freeze({ accountId: policy.stripe.accountId }) }) });
+  stripe: Object.freeze({ accountId: policy.stripe.accountId }) }),
+  webhookEndpointId: policy.stripe.webhookEndpointId });
 const operation = 'checkout:create:local-session';
 const action = 'checkout.replay';
 const mutationInput = Object.freeze({ amount: 2500, currency: 'usd',
@@ -219,8 +220,27 @@ function localIntentStore({ currentFence = owner.fence } = {}) {
 }
 
 function stripeIntentInput(attempts, adapter) {
-  return { attempts, owner, action, operation, input: mutationInput, idempotencyKey, adapter };
+  return { attempts, owner, action, operation, input: mutationInput, idempotencyKey, adapter,
+    readers: { expectedEnvironment: owner.environment, expectedWebhookEndpointId: policy.stripe.webhookEndpointId,
+      async assertReady() { return true; } },
+    readerBinding: { attemptId: owner.attemptId, caseId: 'payment.approved',
+      startedAt: '2026-09-23T09:00:00.000Z' } };
 }
+
+test('low-level Stripe mutation refuses an unavailable independent reader before intent or provider dispatch', async () => {
+  const attempts = localIntentStore();
+  let adapterCalls = 0;
+  const readers = { expectedEnvironment: owner.environment,
+    expectedWebhookEndpointId: policy.stripe.webhookEndpointId,
+    async assertReady() { throw new Error('Stripe account mismatch'); } };
+
+  await assert.rejects(stripeModule.runStripeMutation({ ...stripeIntentInput(attempts, { async mutate() {
+    adapterCalls++;
+  } }), readers }), { code: 'stripe_readers_unavailable' });
+
+  assert.deepEqual(attempts.calls, []);
+  assert.equal(adapterCalls, 0);
+});
 
 test('persists an immutable in_flight TEST intent before adapter invocation and withholds its raw response', async () => {
   const run = stripeModule.runStripeMutation;

@@ -41,6 +41,17 @@ test('independent readers pin the validation branch, Stripe TEST account and web
   const createStripeReader = needExport(stripeRuntime, 'createStripeBillingReader');
   const calls = [];
   let effectApplied = false;
+  let webhookInbox = { attemptId: 'attempt-task4', caseId: 'payment.approved',
+    branchId: environment.database.branchId, eventId: 'evt_task4', eventType: 'invoice.paid',
+    objectId: 'in_task4', accountId: environment.stripe.accountId, livemode: false, status: 'processed',
+    attempts: 1, receivedAt: new Date(Date.parse(startedAt) + 2_000).toISOString(),
+    processedAt: new Date(Date.parse(startedAt) + 3_000).toISOString(),
+    secret: 'do-not-return', cookie: 'do-not-return' };
+  let eventCreated = Math.floor(Date.parse(startedAt) / 1000) + 1;
+  let webhookReceipts = [{ id: 'receipt_task4', attemptId: 'attempt-task4', caseId: 'payment.approved',
+    branchId: environment.database.branchId, eventId: 'evt_task4', eventType: 'invoice.paid',
+    objectId: 'in_task4', accountId: environment.stripe.accountId, livemode: false, status: 'processed',
+    receivedAt: new Date(Date.parse(startedAt) + 2_500).toISOString(), rawBody: 'private' }];
   const supabaseIdentity = { projectRef: environment.database.projectRef,
     branchId: environment.database.branchId, readOnly: true };
   const stripeIdentity = { accountId: environment.stripe.accountId, webhookEndpointId: 'we_task6endpoint',
@@ -55,17 +66,13 @@ test('independent readers pin the validation branch, Stripe TEST account and web
       calls.push('supabase.inbox');
       assert.equal(effectApplied, true);
       assert.equal(query.eventId, 'evt_task4');
-      return { attemptId: query.attemptId, caseId: query.caseId,
-        branchId: environment.database.branchId, eventId: 'evt_task4', objectId: 'in_task4', status: 'processed',
-        secret: 'do-not-return', cookie: 'do-not-return' };
+      return webhookInbox;
     },
     async readWebhookReceipts(query) {
       calls.push('supabase.receipts');
       assert.equal(effectApplied, true);
       assert.equal(query.eventId, 'evt_task4');
-      return [{ id: 'receipt_task4', attemptId: query.attemptId, caseId: query.caseId,
-        branchId: environment.database.branchId, eventId: 'evt_task4', objectId: 'in_task4',
-        status: 'processed', rawBody: 'private' }];
+      return webhookReceipts;
     },
   } });
   const stripeReader = createStripeReader({ expectedEnvironment: environment,
@@ -82,7 +89,8 @@ test('independent readers pin the validation branch, Stripe TEST account and web
       assert.equal(query.eventId, 'evt_task4');
       assert.equal(query.objectId, 'in_task4');
       return [{ id: 'evt_task4', eventType: 'invoice.paid', livemode: false,
-        created: Math.floor(Date.parse(startedAt) / 1000) + 1,
+        accountId: environment.stripe.accountId,
+        created: eventCreated,
         objectId: 'in_task4', payload: 'private event body', client_secret: 'pi_secret_private' }];
     },
   } });
@@ -95,13 +103,56 @@ test('independent readers pin the validation branch, Stripe TEST account and web
   effectApplied = true;
   assert.deepEqual(calls, ['supabase.identity', 'stripe.identity', 'stripe.endpoint', 'provider.dispatch']);
   const evidence = await readers.readWebhookEvidence({ attemptId: request.attemptId, caseId: request.caseId,
-    startedAt, eventId: 'evt_task4', objectId: 'in_task4' });
+    startedAt, cutoffAt: new Date(Date.parse(startedAt) + 60_000).toISOString(),
+    eventId: 'evt_task4', objectId: 'in_task4' });
   assert.deepEqual(calls.slice(4), ['supabase.identity', 'stripe.identity', 'stripe.endpoint',
     'stripe.events', 'stripe.endpoint', 'supabase.inbox', 'supabase.receipts']);
-  assert.deepEqual(evidence, { eventId: 'evt_task4', eventObserved: true,
-    inboxStatus: 'processed', receiptCount: 1 });
+  assert.deepEqual(evidence, { eventId: 'evt_task4', accountId: environment.stripe.accountId,
+    livemode: false, eventObserved: true, inboxStatus: 'processed', receiptCount: 1,
+    receivedAt: webhookInbox.receivedAt, processedAt: webhookInbox.processedAt });
   assert.equal(JSON.stringify(evidence).includes('private'), false);
   assert.equal(JSON.stringify(evidence).includes('cookie'), false);
+
+  const validInbox = structuredClone(webhookInbox);
+  const validReceipts = structuredClone(webhookReceipts);
+  const apply = (source, changes = {}) => {
+    const result = { ...source };
+    for (const [key, value] of Object.entries(changes)) {
+      if (value === undefined) delete result[key];
+      else result[key] = value;
+    }
+    return result;
+  };
+  for (const invalid of [
+    { inbox: { accountId: undefined } },
+    { inbox: { accountId: 'acct_wrong' } },
+    { inbox: { livemode: undefined } },
+    { inbox: { livemode: true } },
+    { inbox: { receivedAt: new Date(Date.parse(startedAt) - 1).toISOString() } },
+    { inbox: { processedAt: new Date(Date.parse(startedAt) + 1_000).toISOString() } },
+    { inbox: { processedAt: new Date(Date.parse(startedAt) + 61_000).toISOString() } },
+    { receipt: { accountId: undefined } },
+    { receipt: { livemode: true } },
+    { receipt: { receivedAt: new Date(Date.parse(startedAt) + 61_000).toISOString() } },
+  ]) {
+    webhookInbox = apply(validInbox, invalid.inbox);
+    webhookReceipts = invalid.receipt
+      ? [apply(validReceipts[0], invalid.receipt)]
+      : validReceipts;
+    await assert.rejects(readers.readWebhookEvidence({ attemptId: request.attemptId,
+      caseId: request.caseId, startedAt,
+      cutoffAt: new Date(Date.parse(startedAt) + 60_000).toISOString(),
+      eventId: 'evt_task4', objectId: 'in_task4' }), { code: 'observation_evidence_invalid' });
+  }
+
+  webhookInbox = validInbox;
+  webhookReceipts = validReceipts;
+  eventCreated = Math.floor(Date.parse(startedAt) / 1000);
+  await assert.rejects(readers.readWebhookEvidence({ attemptId: request.attemptId, caseId: request.caseId,
+    startedAt: new Date(Date.parse(startedAt) + 999).toISOString(),
+    cutoffAt: new Date(Date.parse(startedAt) + 60_000).toISOString(),
+    eventId: 'evt_task4', objectId: 'in_task4' }), { code: 'observation_evidence_invalid' },
+  'Stripe second-precision event timestamp just before a fractional start must not be rounded into the run window');
 });
 
 test('missing or mismatched readonly identities refuse readiness before provider dispatch', async () => {

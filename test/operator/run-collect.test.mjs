@@ -111,6 +111,26 @@ test('operator browser disconnect closes the signal transport and browser endpoi
   assert.equal(calls.serverClose, 1);
 });
 
+test('reader readiness failure blocks collection before browser initialization or scenario preparation', async () => {
+  const controlContext = makeControlContext();
+  const { chromium, calls } = mockedChromium();
+  const readers = makeReaders();
+  readers.assertReady = async () => { throw new Error('reader branch identity mismatch'); };
+  let initialized = false;
+  let prepared = false;
+
+  await assert.rejects(runCollect({ chromium, candidateSha, controlContext,
+    caseId: 'initial.challenge.success', identity: { customerId: 'cus_task6', invoiceId: 'in_task6',
+      paymentIntentId: 'pi_task6', teamId: 'team_task6' }, readers,
+    expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] }, startedAt,
+    initializeBrowser: async () => { initialized = true; },
+    prepareScenario: async () => { prepared = true; } }), { code: 'operator_readers_unavailable' });
+
+  assert.equal(calls.launch.length, 0);
+  assert.equal(initialized, false);
+  assert.equal(prepared, false);
+});
+
 test('unsupported 3DS scenarios are refused before launching the operator or preparing a fixture', async () => {
   const controlContext = makeControlContext();
   const { chromium, calls } = mockedChromium();

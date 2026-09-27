@@ -14,6 +14,11 @@ const transitions = {
   collected: new Set(['cancelled', 'timed_out']),
   rechecking: new Set(['complete', 'cancelled', 'timed_out']),
 };
+const activeFixtureMutationTransactions = new WeakSet();
+
+export function isActiveFixtureMutationTransaction(value) {
+  return value !== null && typeof value === 'object' && activeFixtureMutationTransactions.has(value);
+}
 
 function equal(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
 function safeId(value) { return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/.test(value); }
@@ -672,6 +677,65 @@ export function createAttemptStore(adapter) {
         if (row.state === 'rechecking' || lease.recoveryOnly === true) refuse('recovery_read_only');
         return tx.fixtureMutation(mutation);
       });
+    },
+    async fixtureMutationWithReservation(request, mutation) {
+      const fields = exactDataRecord(request, ['attemptId', 'fence', 'reservationId', 'rows']);
+      const requested = exactDataRecord(fields?.rows, ['databaseRows']);
+      if (!fields || !safeId(fields.attemptId) || typeof fields.fence !== 'string' ||
+          !/^[0-9a-f-]{36}$/i.test(fields.fence) || !safeId(fields.reservationId) ||
+          !requested || !Number.isSafeInteger(requested.databaseRows) || requested.databaseRows < 1 ||
+          typeof mutation !== 'function') refuse('fixture_mutation_invalid');
+
+      const committed = await adapter.transaction(async (tx) => {
+        await tx.lockAttempt(fields.attemptId);
+        const row = await tx.getAttempt(fields.attemptId);
+        if (!row) refuse('attempt_missing');
+        if (typeof tx.lockResourceLocks !== 'function' || typeof tx.lockRetention !== 'function' ||
+            typeof tx.getRetentionReservation !== 'function' ||
+            typeof tx.getRetentionReceipt !== 'function' ||
+            typeof tx.setRetentionFixtureRowsUsed !== 'function' ||
+            typeof tx.fixtureMutation !== 'function') refuse('retention_store_unavailable');
+        await tx.lockResourceLocks(row.environment);
+        const lease = await tx.getLease(row.key);
+        const now = await tx.now();
+        await assertFencedOwner(tx, row, lease, fields.attemptId, fields.fence, now);
+        if (row.state !== 'collecting' || lease.recoveryOnly === true) refuse('recovery_read_only');
+
+        const scope = retentionScope(row.environment);
+        await tx.lockRetention(scope);
+        const reservation = await tx.getRetentionReservation(fields.reservationId);
+        if (!reservation) refuse('retention_reservation_missing');
+        const projection = snapshotUsage(reservation.projection);
+        if (reservation.attemptId !== fields.attemptId || reservation.reservationId !== fields.reservationId ||
+            !equal(reservation.scope, scope) || !projection) refuse('fixture_reservation_invalid');
+        if (await tx.getRetentionReceipt(fields.reservationId)) refuse('retention_attempt_settled');
+        if (requested.databaseRows > projection.databaseRows) refuse('fixture_reservation_insufficient');
+        const usedRows = reservation.fixtureRowsUsed ?? 0;
+        if (!Number.isSafeInteger(usedRows) || usedRows < 0 || usedRows > projection.databaseRows) {
+          refuse('retention_ledger_invalid');
+        }
+        const nextUsedRows = usedRows + requested.databaseRows;
+        if (!Number.isSafeInteger(nextUsedRows) || nextUsedRows > projection.databaseRows) {
+          refuse('fixture_reservation_insufficient');
+        }
+        await tx.setRetentionFixtureRowsUsed({ reservationId: fields.reservationId,
+          attemptId: fields.attemptId, expectedRows: usedRows, usedRows: nextUsedRows });
+
+        const transaction = Object.freeze({ attemptId: fields.attemptId, fence: fields.fence,
+          reservationId: fields.reservationId, transactionId: randomUUID(), reservationLocked: true,
+          reservationValidated: true, reservationStatus: 'active', reservationSettled: false,
+          remainingDatabaseRows: projection.databaseRows - usedRows });
+        let value;
+        let writerError;
+        activeFixtureMutationTransactions.add(transaction);
+        try {
+          try { value = await tx.fixtureMutation(() => mutation(transaction)); }
+          catch (error) { writerError = error; }
+        } finally { activeFixtureMutationTransactions.delete(transaction); }
+        return { value, writerError };
+      });
+      if (committed.writerError) throw committed.writerError;
+      return committed.value;
     },
     async renew({ attemptId, fence, ttlSeconds }) {
       if (!validTtl(ttlSeconds)) refuse('attempt_input_invalid');

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { BILLING_43_IDS } from '../../src/contracts/billing-43.mjs';
+import { createAttemptStore } from '../../src/attempts/store.mjs';
 import { environment, importIfMissing, makeAttemptParts, needExport } from './support.mjs';
 
 const fixtureRun = await importIfMissing(() => import('../../src/billing/fixture-run.mjs'));
@@ -56,10 +57,10 @@ function attemptContext({ currentFence, requested = capacity.requested, branchId
   return { parts, owner, calls };
 }
 
-function createContext(parts, owner) {
+function createContext(parts, owner, attempts = parts.attempts) {
   const create = needExport(contracts, 'createVerifiedContext');
-  return create({ attempts: parts.attempts, owner, preflight: parts.preflight,
-    mutationAdapter: parts.mutationAdapter });
+  return create({ attempts, owner, preflight: parts.preflight,
+    mutationAdapter: parts.mutationAdapter, readers: parts.readers, readerBinding: parts.readerBinding });
 }
 
 function offlineReaders(store) {
@@ -125,6 +126,121 @@ function offlinePublisher(parts, owner, store, { insertError } = {}) {
   return create({ expectedEnvironment: environment, adapter, attempts: parts.attempts, owner });
 }
 
+function integratedFixtureRig({ databaseRows = 2 } = {}) {
+  const parts = makeAttemptParts();
+  const owner = { ...parts.owner, reservationId: 'reservation-integrated', capacity: {
+    requested: { attempts: 1, databaseRows, authUsers: 0, stripeObjects: 0 },
+  } };
+  const key = { branchId: environment.database.branchId, suite: 'billing', fixtureKey: 'fixture-integrated' };
+  const now = 1_000;
+  const locks = [
+    { resourceType: 'supabase_branch',
+      resourceId: `${environment.database.projectRef}:${environment.database.branchId}` },
+    { resourceType: 'stripe_account', resourceId: environment.stripe.accountId },
+  ].map((resource) => ({ ...resource, attemptId: owner.attemptId, fence: owner.fence,
+    candidateSha: owner.candidateSha, workflow: owner.workflow, environment: owner.environment,
+    expiresAt: now + 60 }));
+  const state = {
+    attempt: { attemptId: owner.attemptId, key, candidateSha: owner.candidateSha,
+      workflow: owner.workflow, environment: owner.environment, state: 'collecting',
+      cleanupStatus: 'pending', resourceIds: [], createdAt: now, updatedAt: now },
+    lease: { key, attemptId: owner.attemptId, fence: owner.fence, expiresAt: now + 60,
+      candidateSha: owner.candidateSha, ownerRepository: owner.workflow.repository,
+      ownerRef: owner.workflow.ref, ownerRunId: owner.workflow.runId,
+      ownerRunAttempt: owner.workflow.runAttempt, recoveryOnly: false },
+    locks,
+    reservation: { reservationId: owner.reservationId, attemptId: owner.attemptId,
+      scope: { projectRef: environment.database.projectRef,
+        branchId: environment.database.branchId, stripeAccountId: environment.stripe.accountId },
+      projection: { attempts: 1, databaseRows, authUsers: 0, stripeObjects: 0 },
+      fixtureRowsUsed: 0 },
+    receipt: null,
+    now,
+    events: [],
+  };
+  let tail = Promise.resolve();
+  const adapter = { expectedEnvironment: environment, state, async transaction(operation) {
+    const previous = tail;
+    let release;
+    tail = new Promise((resolve) => { release = resolve; });
+    await previous;
+    const tx = {
+      async lockAttempt() { state.events.push('attempt-lock'); },
+      async lockResourceLocks() { state.events.push('resource-lock'); },
+      async lockRetention() { state.events.push('reservation-lock'); },
+      async getAttempt(attemptId) { return attemptId === state.attempt.attemptId
+        ? structuredClone(state.attempt) : null; },
+      async getLease(candidateKey) { return JSON.stringify(candidateKey) === JSON.stringify(key)
+        ? structuredClone(state.lease) : null; },
+      async getResourceLocks() { return structuredClone(state.locks); },
+      async now() { return state.now; },
+      async getRetentionReservation(reservationId) { state.events.push('reservation-read');
+        return reservationId === state.reservation?.reservationId ? structuredClone(state.reservation) : null; },
+      async getRetentionReservationByAttempt(attemptId) {
+        return attemptId === state.reservation?.attemptId ? structuredClone(state.reservation) : null;
+      },
+      async getRetentionReceipt(reservationId) { return reservationId === state.reservation?.reservationId
+        ? structuredClone(state.receipt) : null; },
+      async setRetentionFixtureRowsUsed({ reservationId, attemptId, expectedRows, usedRows }) {
+        if (!state.reservation || reservationId !== state.reservation.reservationId ||
+            attemptId !== state.reservation.attemptId ||
+            state.reservation.fixtureRowsUsed !== expectedRows || usedRows > state.reservation.projection.databaseRows) {
+          throw Object.assign(new Error('fixture_reservation_insufficient'), {
+            code: 'fixture_reservation_insufficient',
+          });
+        }
+        state.reservation.fixtureRowsUsed = usedRows;
+        state.events.push('claim');
+      },
+      async fixtureMutation(callback) { return callback(); },
+    };
+    try { return await operation(tx); }
+    finally { release(); }
+  } };
+  return { parts, owner, state, attempts: createAttemptStore(adapter) };
+}
+
+function integratedPublisher(rig, store, { insertError } = {}) {
+  const create = needExport(supabase, 'createSupabaseFixturePublisher');
+  const identity = { projectRef: environment.database.projectRef,
+    branchId: environment.database.branchId, appendOnly: true };
+  const adapter = {
+    identity,
+    capabilities: { transactionalFence: true, transactionalReservation: true,
+      rejectsExistingIds: true, update: false, delete: false, authAdmin: false },
+    async readIdentity() { return identity; },
+    async insertAttemptFixture(request) {
+      store.fixtureRpc.push(structuredClone(request));
+      rig.state.events.push('rpc');
+      if (insertError) throw insertError;
+      if (store.fixtures.has(request.fixtureId)) throw Object.assign(new Error('duplicate'), {
+        code: 'fixture_resource_exists',
+      });
+      const fixture = { fixtureId: request.fixtureId, namespaceId: request.namespaceId,
+        attemptId: request.attemptId, caseId: request.caseId, kind: request.kind,
+        marker: request.marker, synthetic: true };
+      store.fixtures.set(request.fixtureId, fixture);
+      return { inserted: true, fixtureId: request.fixtureId,
+        attemptId: request.attemptId, caseId: request.caseId };
+    },
+  };
+  return needExport(supabase, 'createSupabaseFixturePublisher')({ expectedEnvironment: environment,
+    adapter, attempts: rig.attempts, owner: rig.owner });
+}
+
+function integratedRun(rig, store) {
+  const context = createContext(rig.parts, rig.owner, rig.attempts);
+  const publisher = integratedPublisher(rig, store);
+  const readers = offlineReaders(store);
+  assert.equal(typeof context.attempts.fixtureMutationWithReservation, 'function');
+  assert.equal(typeof publisher.insertAttemptFixture, 'function');
+  assert.equal(typeof readers.supabase?.listAttemptFixtures, 'function');
+  assert.equal(typeof readers.supabase?.readSyntheticFixture, 'function');
+  return needExport(fixtureRun, 'createAttemptFixtureRun')({ context,
+    publisher, readers,
+    startedAt: '2026-09-27T09:00:00.000Z' });
+}
+
 test('the canonical case registry stays frozen, exact, and free of duplicate IDs', () => {
   assert.equal(BILLING_43_IDS.length, 43);
   assert.equal(Object.isFrozen(BILLING_43_IDS), true);
@@ -168,12 +284,9 @@ test('all 43 case handles are minted from the canonical registry once, in canoni
 });
 
 test('fixture resources receive fresh cryptographic IDs in an attempt/case namespace, not run/email/caller-derived IDs', async () => {
-  const createRun = needExport(fixtureRun, 'createAttemptFixtureRun');
-  const parts = attemptContext();
+  const rig = integratedFixtureRig({ databaseRows: 3 });
   const store = { fixtureRpc: [], fixtures: new Map(), databaseSnapshot: {} };
-  const context = createContext(parts.parts, parts.owner);
-  const run = createRun({ context, publisher: offlinePublisher(parts.parts, parts.owner, store),
-    readers: offlineReaders(store), startedAt: '2026-09-27T09:00:00.000Z' });
+  const run = integratedRun(rig, store);
   const scenario = run.openCase(BILLING_43_IDS[0]);
   const one = await scenario.publish({ kind: 'catalog' });
   const two = await scenario.publish({ kind: 'billing_identity' });
@@ -186,11 +299,11 @@ test('fixture resources receive fresh cryptographic IDs in an attempt/case names
   assert.equal(one.namespaceId, two.namespaceId);
   assert.notEqual(one.namespaceId, otherCase.namespaceId);
   for (const id of [one.fixtureId, two.fixtureId, one.namespaceId]) {
-    assert.equal(id.includes(parts.owner.attemptId), false);
-    assert.equal(id.includes(parts.owner.workflow.runId), false);
+    assert.equal(id.includes(rig.owner.attemptId), false);
+    assert.equal(id.includes(rig.owner.workflow.runId), false);
     assert.equal(id.includes('angelo.neto@advbox.com.br'), false);
   }
-  assert.equal(one.attemptId, parts.owner.attemptId);
+  assert.equal(one.attemptId, rig.owner.attemptId);
   assert.equal(one.caseId, BILLING_43_IDS[0]);
   assert.equal(one.synthetic, true);
   assert.equal(JSON.stringify(one).includes('cookie'), false);
@@ -246,32 +359,74 @@ test('fixture publication is unavailable when the attempt store lacks same-trans
 });
 
 test('each fixture write is fenced, reservation-bound, insert-only, and independently read back', async () => {
-  const createRun = needExport(fixtureRun, 'createAttemptFixtureRun');
-  const parts = attemptContext();
+  const rig = integratedFixtureRig({ databaseRows: 1 });
   const store = { fixtureRpc: [], fixtures: new Map(), databaseSnapshot: {} };
-  const context = createContext(parts.parts, parts.owner);
-  const publisher = offlinePublisher(parts.parts, parts.owner, store);
-  const run = createRun({ context, publisher, readers: offlineReaders(store),
-    startedAt: '2026-09-27T09:00:00.000Z' });
+  const publisher = integratedPublisher(rig, store);
+  const run = integratedRun(rig, store);
   const result = await run.openCase(BILLING_43_IDS[0]).publish({ kind: 'catalog' });
 
-  assert.equal(parts.calls.assertions, 3);
-  assert.deepEqual(parts.calls.transactions, [], 'legacy fixtureMutation does not prove reservation capacity');
-  assert.deepEqual(parts.calls.reservationTransactions, [{ attemptId: parts.owner.attemptId,
-    fence: parts.owner.fence, reservationId: parts.owner.reservationId, rows: { databaseRows: 1 } }]);
+  assert.equal(rig.state.reservation.fixtureRowsUsed, 1);
+  assert.ok(rig.state.events.indexOf('claim') < rig.state.events.indexOf('rpc'));
   assert.equal(store.fixtureRpc.length, 1);
-  assert.equal(store.fixtureRpc[0].attemptId, parts.owner.attemptId);
-  assert.equal(store.fixtureRpc[0].reservationId, parts.owner.reservationId);
-  assert.equal(store.fixtureRpc[0].fence, parts.owner.fence);
+  assert.equal(store.fixtureRpc[0].attemptId, rig.owner.attemptId);
+  assert.equal(store.fixtureRpc[0].reservationId, rig.owner.reservationId);
+  assert.equal(store.fixtureRpc[0].fence, rig.owner.fence);
   assert.equal(store.fixtureRpc[0].environment.database.branchId, environment.database.branchId);
   assert.equal(store.fixtureRpc[0].synthetic, true);
-  assert.equal(store.fixtureRpc[0].transaction.transactionId, 'tx-1');
+  assert.match(store.fixtureRpc[0].transaction.transactionId, UUID);
   assert.equal(store.fixtureRpc[0].transaction.reservationLocked, true);
   assert.equal(store.fixtureRpc[0].transaction.reservationValidated, true);
   assert.equal(store.fixtureRpc[0].transaction.reservationStatus, 'active');
   assert.equal(store.fixtureRpc[0].transaction.reservationSettled, false);
   assert.deepEqual(result, store.fixtures.get(result.fixtureId));
   assert.equal(Object.keys(publisher).some((key) => /delete|update|auth/iu.test(key)), false);
+});
+
+test('real offline attempt store and fixture publisher persist claims before the adapter write and fence replay/concurrency', async () => {
+  const rig = integratedFixtureRig({ databaseRows: 1 });
+  const store = { fixtureRpc: [], fixtures: new Map(), databaseSnapshot: {} };
+  const first = integratedRun(rig, store);
+  const concurrent = integratedRun(rig, store);
+  const results = await Promise.allSettled([
+    first.openCase(BILLING_43_IDS[0]).publish({ kind: 'catalog' }),
+    concurrent.openCase(BILLING_43_IDS[0]).publish({ kind: 'catalog' }),
+  ]);
+
+  assert.equal(results.filter(({ status }) => status === 'fulfilled').length, 1);
+  const refused = results.find(({ status }) => status === 'rejected');
+  assert.equal(refused.reason.code, 'fixture_reservation_insufficient');
+  assert.equal(rig.state.reservation.fixtureRowsUsed, 1);
+  assert.equal(store.fixtureRpc.length, 1);
+  assert.ok(rig.state.events.indexOf('claim') < rig.state.events.indexOf('rpc'));
+
+  await assert.rejects(integratedRun(rig, store).openCase(BILLING_43_IDS[0]).publish({ kind: 'catalog' }),
+    { code: 'fixture_reservation_insufficient' });
+  assert.equal(store.fixtureRpc.length, 1, 'a new publisher instance cannot replay a consumed claim');
+});
+
+test('integrated publisher and concrete attempt store refuse invalid reservations/fences before any RPC', async () => {
+  const scenarios = [
+    ['missing reservation', (rig) => { rig.state.reservation = null; }, 'retention_reservation_missing'],
+    ['settled reservation', (rig) => { rig.state.receipt = { reservationId: rig.owner.reservationId }; },
+      'retention_attempt_settled'],
+    ['reservation attempt mismatch', (rig) => { rig.state.reservation.attemptId = 'attempt-other'; },
+      'fixture_reservation_invalid'],
+    ['reservation scope mismatch', (rig) => { rig.state.reservation.scope.branchId = 'other-branch'; },
+      'fixture_reservation_invalid'],
+    ['reservation capacity too small', (rig) => { rig.state.reservation.projection.databaseRows = 0; },
+      'fixture_reservation_insufficient'],
+    ['expired fence', (rig) => { rig.state.now = rig.state.lease.expiresAt + 1; }, 'lease_fence_lost'],
+    ['recovery-only fence', (rig) => { rig.state.lease.recoveryOnly = true; }, 'recovery_read_only'],
+  ];
+
+  for (const [name, prepare, code] of scenarios) {
+    const rig = integratedFixtureRig({ databaseRows: 2 });
+    const store = { fixtureRpc: [], fixtures: new Map(), databaseSnapshot: {} };
+    prepare(rig);
+    const run = integratedRun(rig, store);
+    await assert.rejects(run.openCase(BILLING_43_IDS[0]).publish({ kind: 'catalog' }), { code }, name);
+    assert.equal(store.fixtureRpc.length, 0, name);
+  }
 });
 
 test('fixture writer rejects unconfigured or unsafe mutation capabilities before invoking the adapter', async () => {
@@ -298,44 +453,50 @@ test('fixture writer rejects unconfigured or unsafe mutation capabilities before
 
 test('native signup requiring confirmation blocks without an isolated non-delivering inbox and never offers Auth-admin creation', async () => {
   const allowSignup = needExport(fixtureRun, 'assertNativeSignupReady');
-  await assert.rejects(allowSignup({ caseId: 'signup.native', confirmationRequired: true }),
-    { code: 'signup_inbox_unavailable' });
-  const ready = await allowSignup({ caseId: 'signup.native', confirmationRequired: true,
-    inbox: { isolated: true, delivery: 'disabled', async verify() {
-      return { isolated: true, delivery: 'disabled' };
-    } } });
-  assert.equal(ready.caseId, 'signup.native');
-  assert.equal(ready.authCreation, 'native-preview-only');
+  for (const caseId of ['signup.native', 'signup.join', 'signup.expired-intent',
+    'signup.tampered-intent', 'signup.replay']) {
+    await assert.rejects(allowSignup({ caseId, confirmationRequired: true }),
+      { code: 'signup_confirmation_policy_unverified' });
+  }
   assert.equal(Object.keys(needExport(supabase, 'createSupabaseFixturePublisher')({
     expectedEnvironment: environment,
   })).some((key) => /auth|admin/iu.test(key)), false);
-  await assert.rejects(allowSignup({ caseId: 'payment.approved', confirmationRequired: true }),
+  await assert.rejects(allowSignup({ caseId: 'payment.approved' }),
     { code: 'signup_case_invalid' });
-  for (const unsafeInbox of [
-    { isolated: false, delivery: 'disabled', async verify() { return { isolated: true, delivery: 'disabled' }; } },
-    { isolated: true, delivery: 'enabled', async verify() { return { isolated: true, delivery: 'enabled' }; } },
-    { isolated: true, delivery: 'disabled', async verify() { return { isolated: false, delivery: 'disabled' }; } },
+});
+
+test('caller booleans and a self-reported inbox cannot authorize native signup when no trusted policy reader exists', async () => {
+  const allowSignup = needExport(fixtureRun, 'assertNativeSignupReady');
+  for (const input of [
+    { caseId: 'signup.native', confirmationRequired: false },
+    { caseId: 'signup.native', confirmationRequired: true,
+      inbox: { isolated: true, delivery: 'disabled', async verify() {
+        return { isolated: true, delivery: 'disabled' };
+      } } },
   ]) {
-    await assert.rejects(allowSignup({ caseId: 'signup.native', confirmationRequired: true,
-      inbox: unsafeInbox }), { code: 'signup_inbox_unavailable' });
+    await assert.rejects(allowSignup(input), { code: 'signup_confirmation_policy_unverified' });
   }
 });
 
 test('ambiguous fixture mutation is sanitized and never retried', async () => {
-  const createRun = needExport(fixtureRun, 'createAttemptFixtureRun');
-  const parts = attemptContext();
+  const rig = integratedFixtureRig({ databaseRows: 2 });
   const store = { fixtureRpc: [], fixtures: new Map(), databaseSnapshot: {} };
-  const context = createContext(parts.parts, parts.owner);
-  const publisher = offlinePublisher(parts.parts, parts.owner, store, {
+  const context = createContext(rig.parts, rig.owner, rig.attempts);
+  const publisher = integratedPublisher(rig, store, {
     insertError: new Error('upstream response leaked sk_test_sensitive and cookie=value'),
   });
-  const run = createRun({ context, publisher, readers: offlineReaders(store),
+  const run = needExport(fixtureRun, 'createAttemptFixtureRun')({ context, publisher, readers: offlineReaders(store),
     startedAt: '2026-09-27T09:00:00.000Z' });
-  await assert.rejects(run.openCase(BILLING_43_IDS[0]).publish({ kind: 'catalog' }), (error) => {
+  const scenario = run.openCase(BILLING_43_IDS[0]);
+  await assert.rejects(scenario.publish({ kind: 'catalog' }), (error) => {
     assert.equal(error.code, 'fixture_mutation_ambiguous');
     assert.equal(error.message.includes('sk_test_sensitive'), false);
     assert.equal(error.message.includes('cookie=value'), false);
     return true;
   });
   assert.equal(store.fixtureRpc.length, 1);
+  assert.equal(rig.state.reservation.fixtureRowsUsed, 1, 'ambiguous provider outcome consumes capacity conservatively');
+  await assert.rejects(scenario.publish({ kind: 'billing_identity' }),
+    { code: 'fixture_mutation_unresolved' });
+  assert.equal(store.fixtureRpc.length, 1, 'an ambiguous write is never retried');
 });

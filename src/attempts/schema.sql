@@ -209,6 +209,60 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.retention_reservations (
 CREATE INDEX IF NOT EXISTS billing_validation_retention_scope
   ON billing_validation_control.retention_reservations (project_ref, branch_id, stripe_account_id);
 
+CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_reservation_claims (
+  reservation_id text PRIMARY KEY
+    REFERENCES billing_validation_control.retention_reservations(reservation_id),
+  attempt_id text NOT NULL UNIQUE
+    REFERENCES billing_validation_control.attempts(attempt_id),
+  database_rows_used bigint NOT NULL CHECK (database_rows_used >= 0),
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE OR REPLACE FUNCTION billing_validation_control.validate_fixture_reservation_claim()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  reservation billing_validation_control.retention_reservations%ROWTYPE;
+BEGIN
+  SELECT * INTO reservation
+  FROM billing_validation_control.retention_reservations
+  WHERE reservation_id = NEW.reservation_id
+  FOR KEY SHARE;
+  IF NOT FOUND OR reservation.attempt_id <> NEW.attempt_id OR
+     NEW.database_rows_used > (reservation.projection ->> 'databaseRows')::bigint OR
+     TG_OP = 'UPDATE' AND NEW.database_rows_used < OLD.database_rows_used THEN
+    RAISE EXCEPTION 'billing_fixture_reservation_claim_invalid' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS billing_validation_fixture_reservation_claim_valid
+  ON billing_validation_control.fixture_reservation_claims;
+CREATE TRIGGER billing_validation_fixture_reservation_claim_valid
+  BEFORE INSERT OR UPDATE ON billing_validation_control.fixture_reservation_claims
+  FOR EACH ROW EXECUTE FUNCTION billing_validation_control.validate_fixture_reservation_claim();
+CREATE OR REPLACE FUNCTION billing_validation_control.reject_fixture_reservation_claim_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  RAISE EXCEPTION 'billing_fixture_reservation_claims_append_only' USING ERRCODE = '55000';
+END;
+$$;
+DROP TRIGGER IF EXISTS billing_validation_fixture_reservation_claim_immutable_delete
+  ON billing_validation_control.fixture_reservation_claims;
+CREATE TRIGGER billing_validation_fixture_reservation_claim_immutable_delete
+  BEFORE DELETE ON billing_validation_control.fixture_reservation_claims
+  FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_fixture_reservation_claim_delete();
+DROP TRIGGER IF EXISTS billing_validation_fixture_reservation_claim_no_truncate
+  ON billing_validation_control.fixture_reservation_claims;
+CREATE TRIGGER billing_validation_fixture_reservation_claim_no_truncate
+  BEFORE TRUNCATE ON billing_validation_control.fixture_reservation_claims
+  FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_fixture_reservation_claim_delete();
+
 CREATE TABLE IF NOT EXISTS billing_validation_control.retention_receipts (
   receipt_id text PRIMARY KEY,
   reservation_id text NOT NULL UNIQUE

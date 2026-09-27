@@ -83,8 +83,13 @@ export async function withRenewingLease(store, owner, { ttlSeconds, intervalMs, 
         const renewed = await Promise.race([
           store.renew({ attemptId: owner.attemptId, fence: owner.fence, ttlSeconds }),
           new Promise((_, reject) => {
-            renewalWaitTimer = setTimeout(() => reject(error('lease_renewal_timeout')),
-              Math.min(intervalMs, remainingMs));
+            renewalWaitTimer = setTimeout(() => {
+              // Timer scheduling can be delayed under CI load. Once the
+              // confirmed server deadline has elapsed (or is within 1 ms),
+              // expiry is the authoritative refusal, not a renewal timeout.
+              reject(error(deadline - performance.now() <= 1
+                ? 'lease_expired' : 'lease_renewal_timeout'));
+            }, Math.min(intervalMs, remainingMs));
           }),
         ]);
         clearTimeout(renewalWaitTimer);

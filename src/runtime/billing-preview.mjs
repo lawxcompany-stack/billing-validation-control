@@ -1,4 +1,5 @@
 import { immutableVercelOrigin } from '../github/deployments.mjs';
+import { isVerifiedDeploymentAttestation } from './vercel.mjs';
 
 const ROUTES = Object.freeze({ home: '/' });
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -77,10 +78,15 @@ async function responseWithinLimit(response, { document = false } = {}) {
       (typeof headers['content-encoding'] !== 'string' || headers['content-encoding'].toLowerCase() !== 'identity')) return false;
   if (document && (typeof headers['content-type'] !== 'string' ||
       !headers['content-type'].toLowerCase().startsWith('text/html'))) return false;
-  if (typeof response.body !== 'function') return false;
+  let request;
   try {
-    const body = await response.body();
-    return body instanceof Uint8Array && body.byteLength <= MAX_RESPONSE_BYTES && body.byteLength === Number(length);
+    request = response.request();
+    if (typeof response.finished !== 'function' || typeof request?.sizes !== 'function') return false;
+    const failure = await response.finished();
+    if (failure !== null) return false;
+    const sizes = await request.sizes();
+    return record(sizes) && Number.isSafeInteger(sizes.responseBodySize) &&
+      sizes.responseBodySize <= MAX_RESPONSE_BYTES && sizes.responseBodySize === Number(length);
   } catch { return false; }
 }
 
@@ -142,11 +148,17 @@ function boundedUi(page, isClosed) {
  * catalogs must be added by a later reviewed scenario contract, never by input.
  */
 export async function createBillingPreviewBrowser(input = {}) {
-  if (!exactKeys(input, ['deployment', 'chromium']) || !validDeployment(input.deployment) ||
+  const validInputKeys = exactKeys(input, ['deployment', 'candidate', 'chromium']) ||
+    exactKeys(input, ['deployment', 'candidate', 'deploymentAttestation', 'chromium']);
+  if (!validInputKeys ||
+      !validDeployment(input.deployment) ||
       !record(input.chromium) || typeof input.chromium.launch !== 'function') {
     refuse('preview_transport_unavailable');
   }
-  const { deployment, chromium } = input;
+  const { deployment, candidate, deploymentAttestation, chromium } = input;
+  if (!isVerifiedDeploymentAttestation(deploymentAttestation, { deployment, candidate })) {
+    refuse('preview_deployment_unverified');
+  }
   const origin = deployment.origin;
   let browser;
   let context;
@@ -198,9 +210,14 @@ export async function createBillingPreviewBrowser(input = {}) {
       page.setDefaultTimeout?.(TIMEOUT_MS);
       let responseViolation = false;
       const responseChecks = new WeakMap();
+      const pendingResponseChecks = new Set();
       const checkResponse = (response, isDocument) => {
         if (!responseChecks.has(response)) {
-          responseChecks.set(response, responseWithinLimit(response, { document: isDocument }));
+          const check = Promise.resolve().then(() => responseWithinLimit(response, { document: isDocument }))
+            .catch(() => false);
+          responseChecks.set(response, check);
+          pendingResponseChecks.add(check);
+          void check.finally(() => pendingResponseChecks.delete(check));
         }
         return responseChecks.get(response);
       };
@@ -224,6 +241,7 @@ export async function createBillingPreviewBrowser(input = {}) {
       const response = await page.goto(`${origin}${ROUTES[routeId]}`, {
         waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS,
       });
+      await Promise.all([...pendingResponseChecks]);
       if (responseViolation || !await checkResponse(response, true) ||
           typeof response.status !== 'function' || response.status() < 200 || response.status() >= 300) {
         try { await page.close(); } catch { /* best-effort disposal */ }

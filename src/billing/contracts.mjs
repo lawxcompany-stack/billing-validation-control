@@ -36,16 +36,36 @@ function exactVerifiedEnvironment(preflight) {
     stripe.webhookUrl === `${expected.deployment.origin}/api/stripe/webhook`;
 }
 
-export function createVerifiedContext({ attempts, owner, preflight, mutationAdapter } = {}) {
+function validReaderBinding(binding, attemptId) {
+  return binding && binding.attemptId === attemptId &&
+    typeof binding.caseId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(binding.caseId) &&
+    typeof binding.startedAt === 'string' && Number.isFinite(Date.parse(binding.startedAt));
+}
+
+export function createVerifiedContext({ attempts, owner, preflight, mutationAdapter, readers, readerBinding } = {}) {
   if (!attempts || typeof attempts.assertFence !== 'function' ||
       typeof owner?.attemptId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(owner.attemptId) ||
       typeof owner.fence !== 'string' || owner.fence.length < 2 ||
       !exactVerifiedEnvironment(preflight) ||
       canonical(owner.environment) !== canonical(preflight.expectedEnvironment) ||
+      canonical(readers?.expectedEnvironment) !== canonical(preflight.expectedEnvironment) ||
+      readers?.expectedWebhookEndpointId !== preflight.providerVerification.stripe.webhookEndpointId ||
+      typeof readers?.assertReady !== 'function' || !validReaderBinding(readerBinding, owner.attemptId) ||
       (mutationAdapter !== undefined && typeof mutationAdapter?.mutate !== 'function')) {
     refuse('billing_environment_unverified');
   }
-  return Object.freeze({ attempts, owner, preflight, mutationAdapter });
+  return Object.freeze({ attempts, owner, preflight, mutationAdapter, readers,
+    readerBinding: Object.freeze({ ...readerBinding }) });
+}
+
+export async function assertReadersReady(context, { readers = context?.readers, binding = context?.readerBinding,
+  code = 'billing_readers_unavailable' } = {}) {
+  if (!context?.preflight || !validReaderBinding(binding, context.owner?.attemptId) ||
+      canonical(readers?.expectedEnvironment) !== canonical(context.preflight.expectedEnvironment) ||
+      readers?.expectedWebhookEndpointId !== context.preflight.providerVerification?.stripe?.webhookEndpointId ||
+      typeof readers?.assertReady !== 'function') refuse(code);
+  try { await readers.assertReady(Object.freeze({ ...binding })); }
+  catch { refuse(code); }
 }
 
 export async function assertCurrentAttempt(context) {
@@ -76,6 +96,7 @@ export async function mutateProvider(context, { provider = 'stripe', action, ope
       typeof context.mutationAdapter?.mutateInTransaction !== 'function')) {
     refuse('supabase_transaction_adapter_unavailable');
   }
+  await assertReadersReady(context);
   const idempotencyKey = providerIdempotencyKey(owner.attemptId, provider, operation);
   const current = await assertCurrentAttempt(context);
   if (provider === 'stripe' && typeof attempts.beginStripeIntent !== 'function') {
@@ -91,9 +112,11 @@ export async function mutateProvider(context, { provider = 'stripe', action, ope
     if (provider === 'stripe') {
       const stripeOwner = { attemptId: owner.attemptId, fence: owner.fence,
         candidateSha: current.candidateSha, workflow: current.workflow,
-        environment: current.environment };
+        environment: current.environment,
+        webhookEndpointId: context.preflight.providerVerification.stripe.webhookEndpointId };
       const result = await runStripeMutation({ attempts, owner: stripeOwner, action, operation,
-        input, idempotencyKey, adapter: context.mutationAdapter });
+        input, idempotencyKey, adapter: context.mutationAdapter, readers: context.readers,
+        readerBinding: context.readerBinding });
       return Object.freeze({ operation, idempotencyKey, dispatched: true,
         intentId: result.intentId, requestDigest: result.requestDigest, state: result.state });
     }

@@ -190,6 +190,17 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
           return structuredClone([...reservations.values()].find((row) => row.attemptId === id) ?? null);
         },
         async getRetentionReservation(id) { return structuredClone(reservations.get(id) ?? null); },
+        async setRetentionFixtureRowsUsed({ reservationId, attemptId, expectedRows, usedRows }) {
+          const reservation = reservations.get(reservationId);
+          if (!reservation || reservation.attemptId !== attemptId ||
+              (reservation.fixtureRowsUsed ?? 0) !== expectedRows ||
+              usedRows > reservation.projection.databaseRows) {
+            throw Object.assign(new Error('fixture_reservation_insufficient'), {
+              code: 'fixture_reservation_insufficient',
+            });
+          }
+          reservations.set(reservationId, { ...reservation, fixtureRowsUsed: usedRows });
+        },
         async getRetentionReceipt(id) { return structuredClone(receipts.get(id) ?? null); },
         async getCleanupReceipt(id) { return structuredClone(cleanupReceipts.get(id) ?? null); },
         async putCleanupReceipt(row) {
@@ -207,7 +218,7 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
           if (reservations.has(row.reservationId) || [...reservations.values()].some((item) => item.attemptId === row.attemptId)) {
             throw Object.assign(new Error('reservation_conflict'), { code: 'retention_reservation_conflict' });
           }
-          reservations.set(row.reservationId, structuredClone(row));
+          reservations.set(row.reservationId, structuredClone({ ...row, fixtureRowsUsed: 0 }));
         },
         async putRetentionReceipt(row) {
           if (!reservations.has(row.reservationId) || receipts.has(row.reservationId)) {
@@ -241,6 +252,94 @@ test('duplicate prepare is atomic and replay returns the original fence', async 
   assert.equal(a.fence, b.fence);
   assert.equal(a.attemptId, 'attempt-a');
   assert.equal(a.state, 'collecting');
+});
+
+test('fixture reservation claims are serialized, persisted before the writer, and survive ambiguous writer failure', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const owner = await prepareAttempt(store, { ...input(),
+    projection: { ...projection, databaseRows: 1 } });
+  const request = { attemptId: owner.attemptId, fence: owner.fence,
+    reservationId: owner.reservationId, rows: { databaseRows: 1 } };
+  let writerCalls = 0;
+
+  await assert.rejects(store.fixtureMutationWithReservation(request, async (transaction) => {
+    writerCalls++;
+    assert.equal(adapter.reservations.get(owner.reservationId).fixtureRowsUsed, 1);
+    assert.equal(transaction.reservationLocked, true);
+    assert.equal(transaction.reservationValidated, true);
+    assert.equal(transaction.reservationStatus, 'active');
+    assert.equal(transaction.reservationSettled, false);
+    assert.equal(transaction.remainingDatabaseRows, 1);
+    throw new Error('ambiguous remote writer outcome');
+  }), /ambiguous remote writer outcome/u);
+
+  assert.equal(adapter.reservations.get(owner.reservationId).fixtureRowsUsed, 1);
+  const retry = await Promise.allSettled([store.fixtureMutationWithReservation(request, async () => {
+    writerCalls++;
+  })]);
+  assert.equal(retry[0].status, 'rejected');
+  assert.equal(retry[0].reason.code, 'fixture_reservation_insufficient');
+  assert.equal(writerCalls, 1);
+});
+
+test('fixture reservation validation refuses missing, settled, divergent, insufficient, expired, and recovery-only owners before writing', async () => {
+  const cases = [
+    { name: 'missing reservation', prepare(adapter, owner) { adapter.reservations.delete(owner.reservationId); },
+      code: 'retention_reservation_missing' },
+    { name: 'settled reservation', prepare(adapter, owner) {
+      adapter.receipts.set(owner.reservationId, { reservationId: owner.reservationId });
+    }, code: 'retention_attempt_settled' },
+    { name: 'reservation belongs to another attempt', prepare(adapter, owner) {
+      const reservation = adapter.reservations.get(owner.reservationId);
+      adapter.reservations.set(owner.reservationId, { ...reservation, attemptId: 'attempt-other' });
+    }, code: 'fixture_reservation_invalid' },
+    { name: 'reservation scope diverges', prepare(adapter, owner) {
+      const reservation = adapter.reservations.get(owner.reservationId);
+      adapter.reservations.set(owner.reservationId, { ...reservation,
+        scope: { ...reservation.scope, branchId: 'other-validation-branch' } });
+    }, code: 'fixture_reservation_invalid' },
+    { name: 'requested rows exceed reserved projection', rows: { databaseRows: 2 },
+      code: 'fixture_reservation_insufficient' },
+    { name: 'lease expired', prepare(adapter) { adapter.advance(61); }, code: 'lease_expired' },
+    { name: 'recovery-only lease', prepare(adapter, owner) {
+      const key = JSON.stringify(owner.key);
+      adapter.leases.set(key, { ...adapter.leases.get(key), recoveryOnly: true });
+    }, code: 'recovery_read_only' },
+  ];
+
+  for (const scenario of cases) {
+    const adapter = fakeAdapter();
+    const store = createAttemptStore(adapter);
+    const owner = await prepareAttempt(store, { ...input(),
+      projection: { ...projection, databaseRows: 1 } });
+    scenario.prepare?.(adapter, owner);
+    let writerCalls = 0;
+    await assert.rejects(store.fixtureMutationWithReservation({ attemptId: owner.attemptId,
+      fence: owner.fence, reservationId: owner.reservationId,
+      rows: scenario.rows ?? { databaseRows: 1 } }, async () => { writerCalls++; }),
+    { code: scenario.code }, scenario.name);
+    assert.equal(writerCalls, 0, scenario.name);
+  }
+});
+
+test('concurrent fixture reservation claims cannot exceed the persisted row allowance', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const owner = await prepareAttempt(store, { ...input(),
+    projection: { ...projection, databaseRows: 1 } });
+  const request = { attemptId: owner.attemptId, fence: owner.fence,
+    reservationId: owner.reservationId, rows: { databaseRows: 1 } };
+  let writerCalls = 0;
+
+  const results = await Promise.allSettled([1, 2].map(() => store.fixtureMutationWithReservation(request,
+    async () => { writerCalls++; return true; })));
+
+  assert.equal(results.filter(({ status }) => status === 'fulfilled').length, 1);
+  assert.equal(results.filter(({ status, reason }) => status === 'rejected' &&
+    reason?.code === 'fixture_reservation_insufficient').length, 1);
+  assert.equal(writerCalls, 1);
+  assert.equal(adapter.reservations.get(owner.reservationId).fixtureRowsUsed, 1);
 });
 
 test('different candidate SHAs cannot concurrently own one branch/suite/fixture key', async () => {
@@ -590,12 +689,14 @@ test('recovery-only authority blocks fixture and Stripe writes after terminal tr
       }),
       runStripeMutation({ attempts: store, owner: { attemptId: prior.attemptId,
         fence: latest.fence, candidateSha: prior.candidateSha, workflow: prior.workflow,
-        environment: prior.environment }, action: 'checkout.replay',
+        environment: prior.environment, webhookEndpointId: 'we_controltest' }, action: 'checkout.replay',
       operation: `checkout:create:blocked-${terminalState}`, input: {},
       idempotencyKey: providerIdempotencyKey(prior.attemptId, 'stripe',
         `checkout:create:blocked-${terminalState}`), adapter: { mutate: async () => {
         providerDispatches++;
-      } } }),
+      } }, readers: { expectedEnvironment: prior.environment, expectedWebhookEndpointId: 'we_controltest',
+        async assertReady() { return true; } }, readerBinding: { attemptId: prior.attemptId,
+        caseId: 'payment.approved', startedAt: '2026-09-23T09:00:00.000Z' } }),
     ]);
 
     assert.deepEqual(results.map((result) => result.status), ['rejected', 'rejected']);

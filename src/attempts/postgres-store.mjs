@@ -143,6 +143,7 @@ function retentionReservationFromDb(db) {
     quotas: jsonValue(db.quota_limits),
     projection: jsonValue(db.projection),
     capacity: jsonValue(db.capacity_snapshot),
+    fixtureRowsUsed: Number(db.fixture_rows_used ?? 0),
     createdAt: Number(db.created_at_epoch),
   };
 }
@@ -368,16 +369,33 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
       async getRetentionReservationByAttempt(attemptId) {
         const result = await queryClient.query(`SELECT reservation_id, attempt_id, project_ref, branch_id,
           stripe_account_id, policy_version, quota_limits, projection, capacity_snapshot,
+          COALESCE((SELECT claim.database_rows_used FROM billing_validation_control.fixture_reservation_claims AS claim
+            WHERE claim.reservation_id = reservation.reservation_id), 0) AS fixture_rows_used,
           extract(epoch FROM created_at) AS created_at_epoch
-          FROM billing_validation_control.retention_reservations WHERE attempt_id = $1`, [attemptId]);
+          FROM billing_validation_control.retention_reservations AS reservation WHERE attempt_id = $1`, [attemptId]);
         return retentionReservationFromDb(result.rows[0]);
       },
       async getRetentionReservation(reservationId) {
         const result = await queryClient.query(`SELECT reservation_id, attempt_id, project_ref, branch_id,
           stripe_account_id, policy_version, quota_limits, projection, capacity_snapshot,
+          COALESCE((SELECT claim.database_rows_used FROM billing_validation_control.fixture_reservation_claims AS claim
+            WHERE claim.reservation_id = reservation.reservation_id), 0) AS fixture_rows_used,
           extract(epoch FROM created_at) AS created_at_epoch
-          FROM billing_validation_control.retention_reservations WHERE reservation_id = $1`, [reservationId]);
+          FROM billing_validation_control.retention_reservations AS reservation
+          WHERE reservation_id = $1 FOR UPDATE OF reservation`, [reservationId]);
         return retentionReservationFromDb(result.rows[0]);
+      },
+      async setRetentionFixtureRowsUsed({ reservationId, attemptId, expectedRows, usedRows }) {
+        const result = await queryClient.query(`INSERT INTO billing_validation_control.fixture_reservation_claims
+          (reservation_id, attempt_id, database_rows_used)
+          VALUES ($1,$2,$4)
+          ON CONFLICT (reservation_id) DO UPDATE SET database_rows_used = EXCLUDED.database_rows_used
+          WHERE billing_validation_control.fixture_reservation_claims.attempt_id = $2
+            AND billing_validation_control.fixture_reservation_claims.database_rows_used = $3
+          RETURNING database_rows_used`, [reservationId, attemptId, expectedRows, usedRows]);
+        if (result.rowCount !== 1 || Number(result.rows?.[0]?.database_rows_used ?? usedRows) !== usedRows) {
+          refuse('fixture_reservation_insufficient');
+        }
       },
       async getRetentionReceipt(reservationId) {
         const result = await queryClient.query(`SELECT receipt_id, reservation_id, attempt_id, project_ref,

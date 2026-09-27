@@ -104,38 +104,56 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - Test: test/runtime/stripe.test.mjs
 - Modify: test/billing/support.mjs
 
-- [ ] Test that distinct suite/fixture keys for the same Supabase branch or Stripe account conflict on a global resource lock; disjoint resources can proceed independently.
-- [ ] Test old fences cannot reserve, mutate, renew, reconcile as owner, cleanup, or release after takeover; expired lease does not enable takeover.
-- [ ] Test that a durable in_flight intent is written before Stripe invocation, operation/request digest/idempotency key cannot be changed, and timeout/cancel/network ambiguity keeps lock and reservation.
-- [ ] Test same-key retry is refused for unresolved intent; only an independent matching provider observation can settle it. Test that expired idempotency evidence/Test Clock deletes_after blocks instead of retrying/deleting.
-- [ ] Implement global branch/account lock rows and fenced state transitions; include run, attempt, SHA and environment identity in uniqueness and ownership checks.
-- [ ] Require Supabase mutation adapters to execute inside the same fenced child-database transaction; reject plain/unfenced mutate callbacks.
-- [ ] Preserve the Stripe intent handle through app replay/cleanup call sites; `replayCheckoutRequest` requires an independent read-only observer before dispatch and records an append-only receipt for a successful dispatch before returning. A missing observer blocks before mutation; failed observation/receipt retains the unresolved intent. Cleanup independently reconciles every successful cleanup mutation before any lease release, and tests refuse release while any intent is unresolved.
-- [ ] Provide a recovery-only handoff for orphaned intents after the prior run is terminal and its runner removed; rotate the fence, expose pending intents by attempt, permit read-only reconciliation only, and retain resource locks/reservation until separate cleanup verification.
-- [ ] Run focused concurrency/provider tests and full npm test.
-- [ ] Commit as feat(billing): fence shared resources and provider intents.
+- [x] Test that distinct suite/fixture keys for the same Supabase branch or Stripe account conflict on a global resource lock; disjoint resources can proceed independently.
+- [x] Test old fences cannot reserve, mutate, renew, reconcile as owner, cleanup, or release after takeover; expired lease does not enable takeover.
+- [x] Test that a durable in_flight intent is written before Stripe invocation, operation/request digest/idempotency key cannot be changed, and timeout/cancel/network ambiguity keeps lock and reservation.
+- [x] Test same-key retry is refused for unresolved intent; only an independent matching provider observation can settle it. Test that expired idempotency evidence/Test Clock deletes_after blocks instead of retrying/deleting.
+- [x] Implement global branch/account lock rows and fenced state transitions; include run, attempt, SHA and environment identity in uniqueness and ownership checks.
+- [x] Require Supabase mutation adapters to execute inside the same fenced child-database transaction; reject plain/unfenced mutate callbacks.
+- [x] Preserve the Stripe intent handle through app replay/cleanup call sites; `replayCheckoutRequest` requires an independent read-only observer before dispatch and records an append-only receipt for a successful dispatch before returning. A missing observer blocks before mutation; failed observation/receipt retains the unresolved intent. Cleanup independently reconciles every successful cleanup mutation before any lease release, and tests refuse release while any intent is unresolved.
+- [x] Provide a recovery-only handoff for orphaned intents after the prior run is terminal and its runner removed; rotate the fence, expose pending intents by attempt, permit read-only reconciliation only, and retain resource locks/reservation until separate cleanup verification.
+- [x] Run focused concurrency/provider tests and full npm test.
+- [x] Commit as feat(billing): fence shared resources and provider intents.
 
 ### Task 4: Attempt-scoped synthetic fixture publisher and readers
+
+**Progress (2026-09-27):** Local implementation and automated acceptance criteria are green. Independent review did not return a verdict; keep the review and local-commit gates open. Signup stays fail-closed without a trusted policy/inbox adapter. Preview response bytes are checked from framing and Playwright request-size metadata after completion; this is not a strict in-flight network/memory cap.
 
 **Files:**
 - Create: src/billing/fixture-run.mjs
 - Create: src/runtime/billing-preview.mjs
 - Modify: src/runtime/supabase.mjs
 - Modify: src/runtime/stripe.mjs
+- Modify: src/runtime/vercel.mjs
+- Modify: src/runtime/preflight.mjs
+- Modify: src/attempts/store.mjs
+- Modify: src/attempts/postgres-store.mjs
+- Modify: src/attempts/schema.sql
+- Modify: src/attempts/lock.mjs (deadline/renewal timer precedence regression)
+- Modify: src/billing/contracts.mjs
 - Modify: src/billing/observations.mjs
+- Modify: src/operator/run-collect.mjs
 - Test: test/billing/fixture-run.test.mjs
 - Test: test/runtime/billing-preview.test.mjs
 - Test: test/billing/observations.test.mjs
+- Test: test/runtime/vercel.test.mjs
+- Test: test/runtime/preflight.test.mjs
+- Test: test/runtime/supabase.test.mjs
+- Test: test/runtime/stripe.test.mjs
+- Test: test/attempts/attempts.test.mjs
+- Test: test/attempts/postgres.test.mjs
+- Test: test/operator/run-collect.test.mjs
 - Modify: package.json
 
-- [ ] Test `caseId` comes exactly once from the frozen canonical `BILLING_43_IDS`; trusted code creates fresh random fixture/resource IDs (not derived from run ID, email, or caller input) in a unique attempt/case namespace except deliberate within-case replay/race.
-- [ ] Test fixed Preview transport allows only the exact approved immutable HTTPS deployment/origin/path/methods, rejects redirects to other origins and refuses arbitrary URL, header, injected script, privileged-Node import/exec, or response-selected provider operation. The immutable Preview bundle may run only inside the disposable isolated browser.
-- [ ] Test fixture publication is blocked with zero RPCs unless attempt admission, sufficient capacity reservation, branch/account lease, and current fence are verified before the first RPC; each write rechecks ownership/fence/reservation transactionally.
-- [ ] Test fixture publisher writes only attempt-owned synthetic catalog/identity data through fenced allowlisted RPCs and does not update existing catalog rows or delete/overwrite fixtures. Auth identities may be created only by real native signup through Preview, never direct `auth.users` SQL or Supabase admin Auth; signup cases requiring confirmation are blocked without a verified isolated non-delivering inbox.
-- [ ] Test independent read-only readers bind every observation to attempt, provider account, validation branch, run window, exact object IDs, Stripe TEST endpoint/event and Supabase webhook inbox/receipt; reader capability/configuration is verified before provider mutation dispatch, while event evidence is read after the flow. Sanitize identity and raw provider payload.
-- [ ] Implement injectable offline adapters and fail-closed production adapter interfaces. No remote adapter is invoked by the test suite.
-- [ ] Run focused fixture/runtime/observation tests and full npm test.
-- [ ] Commit as feat(billing): publish attempt-scoped synthetic billing fixtures.
+- [x] Test `caseId` comes exactly once from the frozen canonical `BILLING_43_IDS`; trusted code creates fresh random fixture/resource IDs (not derived from run ID, email, or caller input) in a unique attempt/case namespace except deliberate within-case replay/race.
+- [x] Test fixed Preview transport allows only the exact approved immutable HTTPS deployment/origin/path/methods, rejects redirects to other origins and refuses arbitrary URL, header, injected script, privileged-Node import/exec, or response-selected provider operation. The immutable Preview bundle may run only inside the disposable isolated browser.
+- [x] Test fixture publication is blocked with zero RPCs unless attempt admission, sufficient capacity reservation, branch/account lease, and current fence are verified before the first RPC; each write rechecks ownership/fence/reservation transactionally.
+- [x] Test fixture publisher writes only attempt-owned synthetic catalog/identity data through fenced allowlisted RPCs and does not update existing catalog rows or delete/overwrite fixtures. Auth identities may be created only by real native signup through Preview, never direct `auth.users` SQL or Supabase admin Auth; signup cases requiring confirmation are blocked without a verified isolated non-delivering inbox. Signup remains unavailable until a trusted policy/inbox reader is wired.
+- [x] Test independent read-only readers bind every observation to attempt, provider account, validation branch, run window, exact object IDs, Stripe TEST endpoint/event and Supabase webhook inbox/receipt; reader capability/configuration is verified before provider mutation dispatch, while event evidence is read after the flow. Sanitize identity and raw provider payload.
+- [x] Implement injectable offline adapters and fail-closed production adapter interfaces. No remote adapter is invoked by the test suite.
+- [x] Run focused fixture/runtime/observation tests and full npm test.
+- [ ] Obtain independent code-review verdict; the dispatched reviewer did not return before shutdown.
+- [ ] Commit locally as feat(billing): publish attempt-scoped synthetic billing fixtures.
 
 ### Task 5: Executable signup, pricing, payment, and zero-total contracts
 

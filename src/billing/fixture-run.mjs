@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { BILLING_43_IDS } from '../contracts/billing-43.mjs';
+import { isActiveFixtureMutationTransaction } from '../attempts/store.mjs';
 import { assertCurrentAttempt } from './contracts.mjs';
 
 const CASE_SET = new Set(BILLING_43_IDS);
@@ -66,7 +67,6 @@ export function createAttemptFixtureRun({ context, publisher, readers, startedAt
   const namespaces = new Map();
   const allocatedIds = new Set();
   let nextCaseIndex = 0;
-  let usedRows = 0;
 
   function allocateUuid() {
     let id;
@@ -91,7 +91,6 @@ export function createAttemptFixtureRun({ context, publisher, readers, startedAt
         refuse('fixture_input_invalid');
       }
       if (unresolvedMutation) refuse('fixture_mutation_unresolved');
-      if (usedRows >= capacityRows(owner)) refuse('fixture_reservation_insufficient');
       const fixtureId = allocateUuid();
       const binding = Object.freeze({ attemptId: owner.attemptId, caseId, startedAt });
       try { await readers.assertReady(binding); } catch { refuse('fixture_readers_unavailable'); }
@@ -115,12 +114,12 @@ export function createAttemptFixtureRun({ context, publisher, readers, startedAt
         kind: input.kind, marker: FIXTURE_MARKER, synthetic: true });
       let receipt;
       unresolvedMutation = true;
-      usedRows += 1;
       try {
         receipt = await context.attempts.fixtureMutationWithReservation({ attemptId: owner.attemptId,
           fence: owner.fence, reservationId: owner.reservationId,
           rows: Object.freeze({ databaseRows: 1 }) }, async (transaction) => {
           if (!record(transaction) || transaction.attemptId !== owner.attemptId ||
+              !isActiveFixtureMutationTransaction(transaction) ||
               transaction.fence !== owner.fence || transaction.reservationId !== owner.reservationId ||
               typeof transaction.transactionId !== 'string' || !SAFE_ID.test(transaction.transactionId) ||
               transaction.reservationLocked !== true || transaction.reservationValidated !== true ||
@@ -131,7 +130,8 @@ export function createAttemptFixtureRun({ context, publisher, readers, startedAt
         });
       } catch (error) {
         if (['lease_fence_lost', 'lease_expired', 'fixture_reservation_insufficient',
-          'fixture_mutation_ambiguous'].includes(error?.code)) {
+          'fixture_reservation_invalid', 'retention_reservation_missing', 'retention_attempt_settled',
+          'recovery_read_only', 'fixture_transaction_unavailable', 'fixture_mutation_ambiguous'].includes(error?.code)) {
           refuse(error.code);
         }
         refuse('fixture_mutation_ambiguous');
@@ -162,18 +162,9 @@ export function createAttemptFixtureRun({ context, publisher, readers, startedAt
   return Object.freeze({ attemptId: owner.attemptId, openCase });
 }
 
-export async function assertNativeSignupReady({ caseId, confirmationRequired = false, inbox } = {}) {
+export async function assertNativeSignupReady({ caseId } = {}) {
   if (typeof caseId !== 'string' || !SIGNUP_CASES.has(caseId)) refuse('signup_case_invalid');
-  if (typeof confirmationRequired !== 'boolean') refuse('signup_confirmation_policy_invalid');
-  if (confirmationRequired) {
-    if (inbox?.isolated !== true || inbox?.delivery !== 'disabled' || typeof inbox.verify !== 'function') {
-      refuse('signup_inbox_unavailable');
-    }
-    let verification;
-    try { verification = await inbox.verify(); } catch { refuse('signup_inbox_unavailable'); }
-    if (!record(verification) || Reflect.ownKeys(verification).length !== 2 ||
-        verification.isolated !== true || verification.delivery !== 'disabled') refuse('signup_inbox_unavailable');
-  }
-  return Object.freeze({ caseId, authCreation: 'native-preview-only',
-    confirmation: confirmationRequired ? 'isolated-inbox-verified' : 'not-required' });
+  // No verifier-owned signup policy or isolated inbox capability exists yet.
+  // Caller booleans and caller-implemented `verify()` callbacks are not evidence.
+  refuse('signup_confirmation_policy_unverified');
 }

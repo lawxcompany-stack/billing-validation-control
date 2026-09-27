@@ -1,5 +1,5 @@
 import { runThreeDsCase } from '../billing/three-ds.mjs';
-import { assertCurrentAttempt } from '../billing/contracts.mjs';
+import { assertCurrentAttempt, assertReadersReady } from '../billing/contracts.mjs';
 import { isValidExpectedAccess } from '../billing/observations.mjs';
 import { threeDsScenario } from '../billing/fixtures.mjs';
 import { createOperatorPanel, startOperatorEndpoint } from './endpoint.mjs';
@@ -131,6 +131,9 @@ export async function runCollect({ chromium, candidateSha, controlContext, caseI
   const { scenario, owner, normalizedSha, identity: trustedIdentity } = validateInput({ candidateSha, controlContext, caseId,
     identity, readers, expectedAccess, startedAt, initializeBrowser, prepareScenario,
     timeoutMs, capabilityTtlMs });
+
+  await assertReadersReady(controlContext, { readers,
+    binding: { attemptId: owner.attemptId, caseId, startedAt }, code: 'operator_readers_unavailable' });
 
   // Task 5's lease remains authoritative. This is a fenced read only; this
   // transport neither extends nor releases an attempt.

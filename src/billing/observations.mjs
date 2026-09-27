@@ -74,23 +74,29 @@ export function createIndependentBillingReaders({ expectedEnvironment, expectedW
   }
 
   async function readWebhookEvidence(input) {
-    const keys = ['attemptId', 'caseId', 'startedAt', 'eventId', 'objectId'];
+    const keys = ['attemptId', 'caseId', 'startedAt', 'cutoffAt', 'eventId', 'objectId'];
+    const startedAt = dateMs(input?.startedAt);
+    const cutoffAt = dateMs(input?.cutoffAt);
     if (!isObject(input) || Reflect.ownKeys(input).length !== keys.length ||
         keys.some((key) => !Object.hasOwn(input, key)) || !safeToken(input.attemptId) ||
         !safeToken(input.caseId) || !safeToken(input.eventId) || !safeToken(input.objectId) ||
-        dateMs(input.startedAt) === null) refuse('observation_reader_binding_invalid');
+        startedAt === null || cutoffAt === null || startedAt > cutoffAt || cutoffAt > Date.now()) {
+      refuse('observation_reader_binding_invalid');
+    }
     await assertReady(input);
-    const started = Math.floor(dateMs(input.startedAt) / 1000);
+    const started = Math.ceil(startedAt / 1000);
+    const cutoff = Math.floor(cutoffAt / 1000);
     let events;
     try {
       events = await stripe.listEvents({ eventId: input.eventId, objectId: input.objectId,
-        attemptId: input.attemptId, caseId: input.caseId, created: { gte: started } });
+        attemptId: input.attemptId, caseId: input.caseId, created: { gte: started, lte: cutoff } });
     } catch { refuse('observation_read_failed'); }
     if (!Array.isArray(events) || events.length > 100) refuse('observation_evidence_invalid');
     const eventMatches = events.filter((event) => event?.id === input.eventId &&
-      typeof event.eventType === 'string' && event.livemode === false && event.objectId === input.objectId &&
-      Number.isSafeInteger(event.created) && event.created >= started &&
-      event.created <= Math.floor(Date.now() / 1000));
+      typeof event.eventType === 'string' && event.accountId === expectedEnvironment.stripe.accountId &&
+      event.livemode === false && event.objectId === input.objectId &&
+      Number.isSafeInteger(event.created) && event.created * 1000 >= startedAt &&
+      event.created * 1000 <= cutoffAt);
     if (eventMatches.length !== 1) refuse('observation_evidence_invalid');
     let endpoint;
     try { endpoint = await stripe.retrieveWebhookEndpoint(expectedWebhookEndpointId); }
@@ -110,17 +116,29 @@ export function createIndependentBillingReaders({ expectedEnvironment, expectedW
       [inbox, receipts] = await Promise.all([
         supabase.readWebhookInbox(query), supabase.readWebhookReceipts(query),
       ]);
-    } catch { refuse('observation_read_failed'); }
+    } catch (error) {
+      if (error?.code === 'supabase_webhook_response_invalid') refuse('observation_evidence_invalid');
+      refuse('observation_read_failed');
+    }
     const inboxMatches = isObject(inbox) && inbox.attemptId === input.attemptId &&
       inbox.caseId === input.caseId && inbox.branchId === expectedEnvironment.database.branchId &&
-      inbox.eventId === input.eventId && inbox.objectId === input.objectId && inbox.status === 'processed';
+      inbox.eventId === input.eventId && inbox.objectId === input.objectId && inbox.status === 'processed' &&
+      inbox.accountId === expectedEnvironment.stripe.accountId && inbox.livemode === false;
+    const receivedAt = dateMs(inbox?.receivedAt);
+    const processedAt = dateMs(inbox?.processedAt);
+    const inboxWindowValid = receivedAt !== null && processedAt !== null &&
+      startedAt <= receivedAt && receivedAt <= processedAt && processedAt <= cutoffAt;
     const receiptCount = Array.isArray(receipts) ? receipts.filter((receipt) => isObject(receipt) &&
       receipt.attemptId === input.attemptId && receipt.caseId === input.caseId &&
       receipt.branchId === expectedEnvironment.database.branchId && receipt.eventId === input.eventId &&
-      receipt.objectId === input.objectId && receipt.status === 'processed').length : 0;
-    if (!inboxMatches || receiptCount < 1) refuse('observation_evidence_invalid');
-    return Object.freeze({ eventId: input.eventId, eventObserved: true,
-      inboxStatus: 'processed', receiptCount });
+      receipt.objectId === input.objectId && receipt.status === 'processed' &&
+      receipt.accountId === expectedEnvironment.stripe.accountId && receipt.livemode === false &&
+      dateMs(receipt.receivedAt) !== null && dateMs(receipt.receivedAt) >= startedAt &&
+      dateMs(receipt.receivedAt) <= cutoffAt && dateMs(receipt.receivedAt) <= processedAt).length : 0;
+    if (!inboxMatches || !inboxWindowValid || receiptCount < 1) refuse('observation_evidence_invalid');
+    return Object.freeze({ eventId: input.eventId, accountId: expectedEnvironment.stripe.accountId,
+      livemode: false, eventObserved: true, inboxStatus: 'processed', receiptCount,
+      receivedAt: new Date(receivedAt).toISOString(), processedAt: new Date(processedAt).toISOString() });
   }
 
   return Object.freeze({ expectedEnvironment, expectedWebhookEndpointId, supabase, stripe,
