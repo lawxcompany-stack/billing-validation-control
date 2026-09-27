@@ -72,7 +72,7 @@ O aceite Task 4 significa apenas que interfaces e testes offline atendem a este 
 
 ## Riscos/gates ainda abertos
 
-- Ainda é necessário validar e corrigir os três achados da revisão da Task 3 antes de iniciar a Task 4: recibo de cleanup antes de release; flags de retorno corretas; handoff de recovery retomável sem permitir takeover inseguro.
-- A existência/configuração de RPCs de fixture e leitores com grants mínimos precisa ser comprovada em implementação local e, futuramente, por readback da branch filha autorizada. Nenhuma migration remota está aprovada aqui.
+- Os achados das revisões da Task 3 foram corrigidos e a rodada 2 recebeu revisão independente limpa. A implementação da Task 4 pode começar localmente; isso não supre a integração futura dos verificadores de recovery/cleanup exigidos nas Tasks 8/9.
+- A existência/configuração de RPCs de fixture e leitores com grants mínimos precisa ser representada por interfaces fail-closed e testes locais, e futuramente comprovada por readback da branch filha autorizada. Nenhuma migration remota está aprovada aqui.
 - Os estados atuais registrados de migration/fingerprint/webhook continuam externos e bloqueantes; esta documentação não os altera nem os revalida.
 - A skill `multi-agent-brainstorming` não estava disponível na sessão. Para reduzir risco, o plano deverá usar implementação sequencial com subagente implementador e revisão independente por subagente, além dos gates de teste locais.
