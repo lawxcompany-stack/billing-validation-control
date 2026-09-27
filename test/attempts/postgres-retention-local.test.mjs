@@ -80,3 +80,13 @@ test('local PostgreSQL SQL executes the checked-in validator against integer and
     code: 'local_postgres_schema_invalid',
   });
 });
+
+test('local PostgreSQL cleanup projection SQL executes the checked-in closed-schema validator', () => {
+  const schemaSql = readFileSync(new URL('../../src/attempts/schema.sql', import.meta.url), 'utf8');
+  const sql = buildRetentionValidationSql(schemaSql, 'billing_validation_test_0123456789abcdef');
+
+  assert.match(sql, /CREATE OR REPLACE FUNCTION billing_validation_test_0123456789abcdef\.valid_cleanup_projection/);
+  assert.match(sql, /canonical_cleanup_projection_rejected/);
+  assert.match(sql, /unknown_cleanup_projection_field_accepted/);
+  assert.match(sql, /invalid_cleanup_projection_accepted/);
+});

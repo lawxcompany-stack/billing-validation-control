@@ -177,6 +177,51 @@ function terminalRequest(input) {
   return { reservationId: values.reservationId, outcome: values.outcome, retained };
 }
 
+const CLEANUP_PROJECTION_KEYS = ['cleanupClaim', 'databaseBaselineDigest', 'mutatedResourceIds',
+  'retainedDatabaseResources', 'retainedObjects', 'removedDatabaseFixtureCount'];
+const RETAINED_CLEANUP_STATUSES = Object.freeze({
+  customer: ['retained_test_customer'],
+  checkout_session: ['expired_test_checkout_session', 'completed_test_checkout_session'],
+  subscription: ['retained_test_subscription', 'canceled_test_subscription'],
+  payment_intent: ['retained_test_financial_object'], invoice: ['retained_test_financial_object'],
+  charge: ['retained_test_financial_object'], setup_intent: ['retained_test_financial_object'],
+  event: ['retained_test_financial_object'],
+});
+const CLEANUP_RESOURCE_PREFIXES = Object.freeze({ customer: 'cus_', checkout_session: 'cs_',
+  payment_intent: 'pi_', invoice: 'in_', subscription: 'sub_', charge: 'ch_',
+  setup_intent: 'seti_', event: 'evt_' });
+
+function snapshotCleanupProjection(value) {
+  const fields = exactDataRecord(value, CLEANUP_PROJECTION_KEYS);
+  if (!fields || fields.cleanupClaim !== 'owned_reversible_provider_fixtures_only' ||
+      !/^[a-f0-9]{64}$/.test(fields.databaseBaselineDigest ?? '') ||
+      fields.removedDatabaseFixtureCount !== 0 || !Array.isArray(fields.mutatedResourceIds) ||
+      !validResourceIds(fields.mutatedResourceIds) ||
+      fields.mutatedResourceIds.some((id) => !id.startsWith('cs_') && !id.startsWith('sub_')) ||
+      new Set(fields.mutatedResourceIds).size !== fields.mutatedResourceIds.length ||
+      !Array.isArray(fields.retainedDatabaseResources) || fields.retainedDatabaseResources.length !== 0 ||
+      !Array.isArray(fields.retainedObjects) || fields.retainedObjects.length > 100) return null;
+  const retainedObjects = [];
+  for (const item of fields.retainedObjects) {
+    const retained = exactDataRecord(item, ['id', 'type', 'status']);
+    const prefix = CLEANUP_RESOURCE_PREFIXES[retained?.type];
+    if (!retained || !prefix || !validResourceIds([retained.id]) || !retained.id.startsWith(prefix) ||
+        !RETAINED_CLEANUP_STATUSES[retained.type].includes(retained.status)) return null;
+    retainedObjects.push({ id: retained.id, type: retained.type, status: retained.status });
+  }
+  if (new Set(retainedObjects.map(({ id }) => id)).size !== retainedObjects.length) return null;
+  return Object.freeze({ cleanupClaim: fields.cleanupClaim,
+    databaseBaselineDigest: fields.databaseBaselineDigest,
+    mutatedResourceIds: Object.freeze([...fields.mutatedResourceIds]),
+    retainedDatabaseResources: Object.freeze([]),
+    retainedObjects: Object.freeze(retainedObjects.map(Object.freeze)),
+    removedDatabaseFixtureCount: 0 });
+}
+
+function cleanupProjectionDigest(projection) {
+  return createHash('sha256').update(JSON.stringify(projection), 'utf8').digest('hex');
+}
+
 function assertOwner(lease, attemptId, fence, now) {
   if (!lease || lease.attemptId !== attemptId || lease.fence !== fence) refuse('lease_fence_lost');
   if (lease.expiresAt <= now) refuse('lease_expired');
@@ -525,8 +570,8 @@ export function createAttemptStore(adapter) {
       return adapter.transaction(async (tx) => {
         await tx.lockAttempt(attemptId);
         const row = await tx.getAttempt(attemptId);
-        if (!row || !['complete', 'cancelled', 'timed_out'].includes(row.state) ||
-            row.cleanupStatus === 'complete') refuse('recovery_unverified');
+        if (!row || (!['complete', 'cancelled', 'timed_out'].includes(row.state) &&
+            row.state !== 'rechecking') || row.cleanupStatus === 'complete') refuse('recovery_unverified');
         if (typeof tx.lockResourceLocks !== 'function' || typeof tx.getResourceLocks !== 'function' ||
             typeof tx.listPendingStripeIntents !== 'function' ||
             typeof tx.getRetentionReservationByAttempt !== 'function' ||
@@ -545,15 +590,29 @@ export function createAttemptStore(adapter) {
         if (!reservation || await tx.getRetentionReceipt(reservation.reservationId)) {
           refuse('recovery_unverified');
         }
+        const ownerRun = snapshotWorkflow({ repository: lease.ownerRepository, ref: lease.ownerRef,
+          runId: lease.ownerRunId, runAttempt: lease.ownerRunAttempt,
+          runnerLabel: row.workflow.runnerLabel });
+        if (!ownerRun || ownerRun.repository !== row.workflow.repository || ownerRun.ref !== row.workflow.ref) {
+          refuse('recovery_unverified');
+        }
         const recovery = await adapter.verifyRecovery?.({ mode: 'stripe-intent-recovery', prior: row,
-          lease, resourceLocks: locks, pendingIntents: structuredClone(pendingIntents) });
+          lease, ownerRun, resourceLocks: locks, pendingIntents: structuredClone(pendingIntents) });
         if (recovery?.runTerminal !== true || recovery.runnerRemoved !== true) refuse('recovery_unverified');
+        const currentRun = snapshotWorkflow(ownDataValue(recovery, 'currentRun'));
+        if (!currentRun || currentRun.repository !== ownerRun.repository || currentRun.ref !== ownerRun.ref ||
+            currentRun.runnerLabel !== ownerRun.runnerLabel ||
+            (currentRun.runId === ownerRun.runId && currentRun.runAttempt === ownerRun.runAttempt)) {
+          refuse('recovery_unverified');
+        }
         const now = await tx.now();
         const nextFence = randomUUID();
-        const renewed = { ...lease, fence: nextFence, expiresAt: now + ttlSeconds };
+        const renewed = { ...lease, fence: nextFence, expiresAt: now + ttlSeconds,
+          ownerRepository: currentRun.repository, ownerRef: currentRun.ref,
+          ownerRunId: currentRun.runId, ownerRunAttempt: currentRun.runAttempt };
         await tx.putLease(renewed, lease.fence);
         await tx.putResourceLocks({ attemptId, fence: nextFence, candidateSha: row.candidateSha,
-          workflow: row.workflow, environment: row.environment, expiresAt: renewed.expiresAt }, locks);
+          workflow: currentRun, environment: row.environment, expiresAt: renewed.expiresAt }, locks);
         const changed = { ...row, state: 'rechecking', updatedAt: now };
         await tx.putAttempt(changed);
         return { ...changed, fence: nextFence, expiresAt: renewed.expiresAt, serverNow: now };
@@ -683,24 +742,41 @@ export function createAttemptStore(adapter) {
         return { ...changed, fence };
       });
     },
-    async cleanup({ attemptId, fence }) {
+    async cleanup({ attemptId, fence, projection: rawProjection }) {
+      const projection = snapshotCleanupProjection(rawProjection);
+      if (!projection) refuse('cleanup_receipt_invalid');
       return adapter.transaction(async (tx) => {
         await tx.lockAttempt(attemptId);
         const row = await tx.getAttempt(attemptId);
         if (!row) refuse('attempt_missing');
         await tx.lockResourceLocks(row.environment);
         const lease = await tx.getLease(row.key);
-        await assertFencedOwner(tx, row, lease, attemptId, fence, await tx.now());
+        const now = await tx.now();
+        await assertFencedOwner(tx, row, lease, attemptId, fence, now);
         if (!['complete', 'cancelled', 'timed_out'].includes(row.state)) refuse('cleanup_not_terminal');
         if (typeof tx.hasInFlightStripeIntent !== 'function' || await tx.hasInFlightStripeIntent(attemptId)) {
           refuse('stripe_intent_unresolved');
         }
-        if (await adapter.verifyCleanup?.({ row, lease }) !== true) refuse('cleanup_unverified');
-        const changed = { ...row, cleanupStatus: 'complete', updatedAt: await tx.now() };
+        if (typeof tx.getRetentionReservationByAttempt !== 'function' ||
+            typeof tx.getCleanupReceipt !== 'function' || typeof tx.putCleanupReceipt !== 'function') {
+          refuse('cleanup_receipt_store_unavailable');
+        }
+        const reservation = await tx.getRetentionReservationByAttempt(attemptId);
+        if (!reservation || reservation.attemptId !== attemptId || !safeId(reservation.reservationId) ||
+            !equal(reservation.scope, retentionScope(row.environment))) refuse('cleanup_receipt_invalid');
+        if (await tx.getCleanupReceipt(attemptId)) refuse('cleanup_receipt_conflict');
+        const digest = cleanupProjectionDigest(projection);
+        if (await adapter.verifyCleanup?.({ row, lease, reservation, projection, digest }) !== true) {
+          refuse('cleanup_unverified');
+        }
+        const receipt = { receiptId: randomUUID(), reservationId: reservation.reservationId,
+          attemptId, environment: row.environment, fence, digest, projection, createdAt: now };
+        await tx.putCleanupReceipt(receipt);
+        const changed = { ...row, cleanupStatus: 'complete', updatedAt: now };
         await tx.putAttempt(changed);
         await tx.deleteLease(row.key, attemptId, fence);
         await tx.deleteResourceLocks({ attemptId, fence, environment: row.environment });
-        return changed;
+        return { ...changed, cleanupReceipt: receipt };
       });
     },
   };

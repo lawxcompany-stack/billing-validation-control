@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { assertCurrentAttempt, mutateProvider, BillingControlRefusal } from './contracts.mjs';
 import { databaseSnapshotDigest, databaseSnapshotsEqual, sanitizeDatabaseSnapshot } from './observations.mjs';
 import { reconcileStripeIntent } from '../runtime/stripe.mjs';
@@ -294,15 +293,21 @@ export async function cleanupOwnedResources({ context, adapter } = {}) {
   }
   if (!databaseSnapshotsEqual(beforeDatabase, current)) refuse('cleanup_database_changed');
 
-  try { await context.attempts.cleanup({ attemptId: context.owner.attemptId, fence: context.owner.fence }); }
-  catch { refuse('cleanup_lease_release_failed'); }
   const databaseBaselineDigest = databaseSnapshotDigest(baseline);
   const cleanupClaim = 'owned_reversible_provider_fixtures_only';
-  const cleanupDigest = createHash('sha256').update(JSON.stringify({ mutatedResourceIds, retainedObjects,
-    retainedDatabaseResources, databaseBaselineDigest, cleanupClaim }), 'utf8').digest('hex');
-  return Object.freeze({ completed: true, cleanupClaim, databaseBaselineRestored: databaseSnapshotsEqual(baseline, current),
-    fixtureReusable: true,
+  const projection = { cleanupClaim, databaseBaselineDigest, mutatedResourceIds,
+    retainedDatabaseResources, retainedObjects, removedDatabaseFixtureCount: 0 };
+  let cleanup;
+  try {
+    cleanup = await context.attempts.cleanup({ attemptId: context.owner.attemptId,
+      fence: context.owner.fence, projection });
+  } catch { refuse('cleanup_lease_release_failed'); }
+  if (!/^[a-f0-9]{64}$/u.test(cleanup?.cleanupReceipt?.digest ?? '')) {
+    refuse('cleanup_lease_release_failed');
+  }
+  return Object.freeze({ completed: true, cleanupClaim, databaseBaselineRestored: false,
+    fixtureReusable: false,
     mutatedResourceIds: Object.freeze(mutatedResourceIds), retainedObjects: Object.freeze(retainedObjects),
     retainedDatabaseResources: Object.freeze(retainedDatabaseResources), removedDatabaseFixtureCount: 0,
-    databaseBaselineDigest, cleanupDigest });
+    databaseBaselineDigest, cleanupDigest: cleanup.cleanupReceipt.digest });
 }

@@ -138,8 +138,8 @@ test('cleanup expires and cancels owned resources in reverse order, retains char
   ].sort((a, b) => a.id.localeCompare(b.id)));
   assert.deepEqual(result.retainedDatabaseResources, []);
   assert.equal(result.removedDatabaseFixtureCount, 0);
-  assert.equal(result.databaseBaselineRestored, true);
-  assert.equal(result.fixtureReusable, true);
+  assert.equal(result.databaseBaselineRestored, false);
+  assert.equal(result.fixtureReusable, false);
   assert.equal(result.cleanupClaim, 'owned_reversible_provider_fixtures_only');
   assert.deepEqual(result.mutatedResourceIds, ['sub_task6', 'cs_task6']);
   assert.equal(Object.hasOwn(result, 'deletedResourceIds'), false);
@@ -147,10 +147,30 @@ test('cleanup expires and cancels owned resources in reverse order, retains char
     request.fence === fixture.context.owner.fence && request.environment.database.branchId === 'validation-child-123'), true);
   assert.equal(result.completed, true);
   assert.equal(fixture.parts.calls.cleanup.length, 1);
+  assert.equal(result.cleanupDigest, 'f'.repeat(64));
+  assert.deepEqual(fixture.parts.calls.cleanup[0].projection, {
+    cleanupClaim: result.cleanupClaim,
+    databaseBaselineDigest: result.databaseBaselineDigest,
+    mutatedResourceIds: result.mutatedResourceIds,
+    retainedDatabaseResources: result.retainedDatabaseResources,
+    retainedObjects: result.retainedObjects,
+    removedDatabaseFixtureCount: result.removedDatabaseFixtureCount,
+  });
   assert.equal(fixture.observedIntents.length, 2);
   assert.equal(fixture.parts.receipts.size, 2);
   assert.equal(fixture.parts.calls.reconciliations.length, 2);
   assert.equal(JSON.stringify(result).includes('client_secret'), false);
+});
+
+test('matching before and after snapshots still deny restoration and fixture reuse claims', async () => {
+  const cleanup = needExport(cleanupModule, 'cleanupOwnedResources');
+  const fixture = cleanupFixture();
+  const result = await cleanup({ context: fixture.context, adapter: fixture.adapter });
+
+  assert.deepEqual({ databaseBaselineRestored: result.databaseBaselineRestored,
+    fixtureReusable: result.fixtureReusable }, {
+    databaseBaselineRestored: false, fixtureReusable: false,
+  });
 });
 
 test('customer is explicitly retained and never passed to a Stripe mutation', async () => {

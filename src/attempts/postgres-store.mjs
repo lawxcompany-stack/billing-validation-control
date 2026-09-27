@@ -161,6 +161,16 @@ function retentionReceiptFromDb(db) {
   };
 }
 
+function cleanupReceiptFromDb(db) {
+  if (!db) return null;
+  return { receiptId: db.receipt_id, reservationId: db.reservation_id, attemptId: db.attempt_id,
+    environment: { database: { projectRef: db.project_ref.trim(), branchId: db.branch_id },
+      deployment: { id: db.deployment_id, origin: db.deployment_origin },
+      stripe: { accountId: db.stripe_account_id } },
+    fence: db.owner_fence, digest: db.cleanup_digest.trim(),
+    projection: jsonValue(db.verified_projection), createdAt: Number(db.created_at_epoch) };
+}
+
 function resourceLockFromDb(db) {
   if (!db) return null;
   return { resourceType: db.resource_type, resourceId: db.resource_id,
@@ -375,6 +385,25 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
           extract(epoch FROM created_at) AS created_at_epoch
           FROM billing_validation_control.retention_receipts WHERE reservation_id = $1`, [reservationId]);
         return retentionReceiptFromDb(result.rows[0]);
+      },
+      async getCleanupReceipt(attemptId) {
+        const result = await queryClient.query(`SELECT receipt_id, reservation_id, attempt_id, project_ref,
+          branch_id, deployment_id, deployment_origin, stripe_account_id, owner_fence, cleanup_digest,
+          verified_projection, extract(epoch FROM created_at) AS created_at_epoch
+          FROM billing_validation_control.cleanup_receipts WHERE attempt_id = $1 FOR UPDATE`, [attemptId]);
+        return cleanupReceiptFromDb(result.rows[0]);
+      },
+      async putCleanupReceipt(receipt) {
+        const result = await queryClient.query(`INSERT INTO billing_validation_control.cleanup_receipts
+          (receipt_id, reservation_id, attempt_id, project_ref, branch_id, deployment_id,
+           deployment_origin, stripe_account_id, owner_fence, cleanup_digest, verified_projection, created_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::uuid,$10,$11::jsonb,to_timestamp($12))`,
+        [receipt.receiptId, receipt.reservationId, receipt.attemptId,
+          receipt.environment.database.projectRef, receipt.environment.database.branchId,
+          receipt.environment.deployment.id, receipt.environment.deployment.origin,
+          receipt.environment.stripe.accountId, receipt.fence, receipt.digest,
+          JSON.stringify(receipt.projection), receipt.createdAt]);
+        if (result.rowCount !== 1) refuse('cleanup_receipt_conflict');
       },
       async putRetentionReservation(reservation) {
         const result = await queryClient.query(`INSERT INTO billing_validation_control.retention_reservations

@@ -19,6 +19,11 @@ const retentionPolicy = { version: 1, quotas: {
   attempts: 50, databaseRows: 500, authUsers: 50, stripeObjects: 500,
 } };
 const projection = { attempts: 1, databaseRows: 10, authUsers: 1, stripeObjects: 10 };
+const cleanupProjection = { cleanupClaim: 'owned_reversible_provider_fixtures_only',
+  databaseBaselineDigest: 'c'.repeat(64), mutatedResourceIds: ['cs_synthetic123'],
+  retainedDatabaseResources: [], retainedObjects: [
+    { id: 'ch_synthetic123', type: 'charge', status: 'retained_test_financial_object' },
+  ], removedDatabaseFixtureCount: 0 };
 
 function recordingClient() {
   const calls = [];
@@ -287,6 +292,19 @@ test('schema stores append-only retention reservations and terminal receipts wit
   assert.match(sql, /REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control\.retention_reservations/);
   assert.match(sql, /REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control\.retention_receipts/);
   assert.doesNotMatch(sql, /retention_reservations[\s\S]{0,500}expires_at/);
+});
+
+test('schema persists closed, attempt-bound append-only cleanup receipts', () => {
+  const sql = readFileSync(new URL('../../src/attempts/schema.sql', import.meta.url), 'utf8');
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS billing_validation_control\.cleanup_receipts/);
+  assert.match(sql, /reservation_id text NOT NULL UNIQUE/);
+  assert.match(sql, /owner_fence uuid NOT NULL/);
+  assert.match(sql, /cleanup_digest char\(64\) NOT NULL/);
+  assert.match(sql, /verified_projection jsonb NOT NULL/);
+  assert.match(sql, /reservation\.attempt_id <> NEW\.attempt_id/);
+  assert.match(sql, /BEFORE UPDATE OR DELETE ON billing_validation_control\.cleanup_receipts/);
+  assert.match(sql, /BEFORE TRUNCATE ON billing_validation_control\.cleanup_receipts/);
+  assert.match(sql, /REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control\.cleanup_receipts/);
 });
 
 test('schema persists global resource ownership and append-only Stripe intents and receipts', () => {
@@ -626,6 +644,150 @@ test('PostgreSQL pending intent query is authorized by the current attempt fence
     fence: '22222222-2222-4222-8222-222222222222' }), { code: 'lease_fence_lost' });
 });
 
+test('PostgreSQL cleanup receipt persists before release and rolls receipt, state, lease, and locks back together', async () => {
+  const attemptId = 'attempt-cleanup-pg';
+  const fence = '11111111-1111-4111-8111-111111111111';
+  const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
+    ref: 'refs/heads/main', runId: '100', runAttempt: 1,
+    runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
+  const verifiedProjection = cleanupProjection;
+  function makeFixture(failure = null) {
+    const state = {
+      attempt: { attempt_id: attemptId, branch_id: database.branchId, suite: 'billing',
+        fixture_key: 'invoice-cleanup', candidate_sha: 'a'.repeat(40),
+        workflow_repository: workflow.repository, workflow_ref: workflow.ref,
+        workflow_run_id: workflow.runId, workflow_run_attempt: workflow.runAttempt,
+        runner_label: workflow.runnerLabel, database_project_ref: database.projectRef,
+        deployment_id: 'dpl_candidate123', deployment_origin: 'https://candidate.vercel.app',
+        stripe_account_id: 'acct_synthetic123', state: 'cancelled', cleanup_status: 'pending',
+        artifact_id: null, resource_ids: [], created_at_epoch: 1000, updated_at_epoch: 1000 },
+      lease: { attempt_id: attemptId, fence, expires_at_epoch: 1200,
+        owner_candidate_sha: 'a'.repeat(40), owner_repository: workflow.repository,
+        owner_ref: workflow.ref, owner_run_id: workflow.runId, owner_run_attempt: workflow.runAttempt },
+      resources: [
+        { resource_type: 'supabase_branch', resource_id: `${database.projectRef}:${database.branchId}` },
+        { resource_type: 'stripe_account', resource_id: 'acct_synthetic123' },
+      ].map((resource) => ({ ...resource, owner_attempt_id: attemptId, fence,
+        candidate_sha: 'a'.repeat(40), workflow_repository: workflow.repository,
+        workflow_ref: workflow.ref, workflow_run_id: workflow.runId, workflow_run_attempt: 1,
+        runner_label: workflow.runnerLabel, environment_identity: preflight.expectedEnvironment,
+        expires_at_epoch: 1200 })),
+      reservation: { reservation_id: 'reservation-cleanup-pg', attempt_id: attemptId,
+        project_ref: database.projectRef, branch_id: database.branchId,
+        stripe_account_id: 'acct_synthetic123', policy_version: 1,
+        quota_limits: retentionPolicy.quotas, projection: {
+          attempts: 1, databaseRows: 10, authUsers: 1, stripeObjects: 10,
+        }, capacity_snapshot: {}, created_at_epoch: 1000 },
+      receipt: null,
+    };
+    const transactions = [];
+    let resourceDeletes = 0;
+    const client = { async transaction(fn) {
+      const before = structuredClone(state);
+      const transactionCalls = [];
+      transactions.push(transactionCalls);
+      try {
+        return await fn({ async query(sql, values = []) {
+          const call = { sql, values };
+          transactionCalls.push(call);
+          if (/SELECT extract\(epoch FROM clock_timestamp\(\)\) AS now/.test(sql)) {
+            return { rows: [{ now: 1100 }] };
+          }
+          if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.attempts')) {
+            return { rows: [state.attempt] };
+          }
+          if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.resource_locks')) {
+            return { rows: state.resources };
+          }
+          if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.fixture_leases')) {
+            return { rows: state.lease ? [state.lease] : [] };
+          }
+          if (sql.includes('SELECT EXISTS') && sql.includes('billing_validation_control.stripe_intents')) {
+            return { rows: [{ in_flight: false }] };
+          }
+          if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.retention_reservations')) {
+            return { rows: [state.reservation] };
+          }
+          if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.cleanup_receipts')) {
+            return { rows: state.receipt ? [state.receipt] : [] };
+          }
+          if (sql.startsWith('INSERT INTO billing_validation_control.cleanup_receipts')) {
+            if (failure === 'receipt-insert') {
+              throw Object.assign(new Error('simulated_receipt_insert_failure'), {
+                code: 'simulated_receipt_insert_failure',
+              });
+            }
+            state.receipt = { receipt_id: values[0], reservation_id: values[1], attempt_id: values[2],
+              project_ref: values[3], branch_id: values[4], deployment_id: values[5],
+              deployment_origin: values[6], stripe_account_id: values[7], owner_fence: values[8],
+              cleanup_digest: values[9], verified_projection: JSON.parse(values[10]), created_at_epoch: values[11] };
+            return { rows: [], rowCount: 1 };
+          }
+          if (sql.startsWith('INSERT INTO billing_validation_control.attempts')) {
+            state.attempt = { ...state.attempt, state: values[14], cleanup_status: values[15],
+              updated_at_epoch: values[21] };
+            return { rows: [], rowCount: 1 };
+          }
+          if (sql.startsWith('DELETE FROM billing_validation_control.fixture_leases')) {
+            state.lease = null;
+            return { rows: [], rowCount: 1 };
+          }
+          if (sql.startsWith('DELETE FROM billing_validation_control.resource_locks')) {
+            resourceDeletes++;
+            if (failure === 'resource-release' && resourceDeletes === 2) {
+              throw Object.assign(new Error('simulated_resource_release_failure'), {
+                code: 'simulated_resource_release_failure',
+              });
+            }
+            state.resources = state.resources.filter((resource) =>
+              resource.resource_type !== values[0] || resource.resource_id !== values[1]);
+            return { rows: [], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 1 };
+        } });
+      } catch (error) {
+        Object.assign(state, before);
+        throw error;
+      }
+    } };
+    const store = createPostgresAttemptStore({ client, preflight, target, verifyCleanup: async () => true });
+    return { state, store, transactions };
+  }
+
+  const successful = makeFixture();
+  const result = await successful.store.cleanup({ attemptId, fence, projection: verifiedProjection });
+  const receipt = successful.state.receipt;
+  assert.ok(receipt);
+  assert.equal(receipt.reservation_id, 'reservation-cleanup-pg');
+  assert.equal(receipt.attempt_id, attemptId);
+  assert.equal(receipt.owner_fence, fence);
+  assert.deepEqual(receipt.verified_projection, verifiedProjection);
+  assert.equal(result.cleanupReceipt.digest, receipt.cleanup_digest);
+  const calls = successful.transactions[0];
+  const index = (pattern) => calls.findIndex(({ sql }) => pattern.test(sql));
+  const receiptInsert = index(/^INSERT INTO billing_validation_control\.cleanup_receipts/);
+  const attemptWrite = index(/^INSERT INTO billing_validation_control\.attempts/);
+  const leaseDelete = index(/^DELETE FROM billing_validation_control\.fixture_leases/);
+  const resourceDelete = index(/^DELETE FROM billing_validation_control\.resource_locks/);
+  assert.ok(receiptInsert >= 0 && receiptInsert < attemptWrite && attemptWrite < leaseDelete && leaseDelete < resourceDelete);
+  assert.equal(successful.state.attempt.cleanup_status, 'complete');
+  assert.equal(successful.state.lease, null);
+  assert.equal(successful.state.resources.length, 0);
+
+  for (const failure of ['receipt-insert', 'resource-release']) {
+    const failed = makeFixture(failure);
+    await assert.rejects(failed.store.cleanup({ attemptId, fence, projection: verifiedProjection }), {
+      code: failure === 'receipt-insert'
+        ? 'simulated_receipt_insert_failure' : 'simulated_resource_release_failure',
+    });
+    assert.equal(failed.state.receipt, null);
+    assert.equal(failed.state.attempt.cleanup_status, 'pending');
+    assert.equal(failed.state.lease.fence, fence);
+    assert.equal(failed.state.resources.length, 2);
+    assert.equal(failed.state.reservation.reservation_id, 'reservation-cleanup-pg');
+  }
+});
+
 test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and cleanup behind recovery checks', async () => {
   const calls = [];
   const transactions = [];
@@ -658,6 +820,8 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
     created_at_epoch: 1000 };
   let leaseFence = oldFence;
   let leaseExpiry = 1060;
+  let leaseOwner = { owner_repository: workflow.repository, owner_ref: workflow.ref,
+    owner_run_id: workflow.runId, owner_run_attempt: workflow.runAttempt };
   const resources = [
     { resource_type: 'supabase_branch', resource_id: `${database.projectRef}:${database.branchId}` },
     { resource_type: 'stripe_account', resource_id: 'acct_synthetic123' },
@@ -689,8 +853,7 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
       }
       if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.fixture_leases')) {
         return { rows: [{ attempt_id: attemptId, fence: leaseFence, expires_at_epoch: leaseExpiry,
-          owner_candidate_sha: 'a'.repeat(40), owner_repository: workflow.repository,
-          owner_ref: workflow.ref, owner_run_id: workflow.runId, owner_run_attempt: 1 }] };
+          owner_candidate_sha: 'a'.repeat(40), ...leaseOwner }] };
       }
       if (sql.includes('FROM billing_validation_control.stripe_intents')) return { rows: [intent] };
       if (sql.includes('FROM billing_validation_control.retention_reservations')) {
@@ -700,6 +863,8 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
       if (sql.startsWith('INSERT INTO billing_validation_control.fixture_leases')) {
         leaseFence = values[4];
         leaseExpiry = values[5];
+        leaseOwner = { owner_repository: values[8], owner_ref: values[9],
+          owner_run_id: values[10], owner_run_attempt: values[11] };
         return { rows: [], rowCount: 1 };
       }
       if (sql.startsWith('UPDATE billing_validation_control.resource_locks')) {
@@ -724,12 +889,17 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
       return { rows: [], rowCount: 1 };
     } });
   } };
-  let recoveryEvidence;
+  const recoveryEvidence = [];
+  const firstRecoveryRun = { ...workflow, runId: '200', runAttempt: 1 };
+  const secondRecoveryRun = { ...workflow, runId: '300', runAttempt: 1 };
+  let currentRecoveryRun = firstRecoveryRun;
+  const provenOwnerRunIds = new Set(['100', '200']);
   let cleanupVerifierCalls = 0;
   const store = createPostgresAttemptStore({ client, preflight, target,
     verifyRecovery: async (input) => {
-      recoveryEvidence = input;
-      return { runTerminal: true, runnerRemoved: true };
+      recoveryEvidence.push(input);
+      const proof = provenOwnerRunIds.has(input.ownerRun?.runId);
+      return { runTerminal: proof, runnerRemoved: proof, currentRun: currentRecoveryRun };
     },
     verifyCleanup: async () => { cleanupVerifierCalls++; return true; },
   });
@@ -739,32 +909,74 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
   assert.equal(recovery.state, 'rechecking');
   assert.equal(recovery.cleanupStatus, 'pending');
   assert.equal(leaseFence, recovery.fence);
-  assert.ok(resources.every((resource) => resource.fence === recovery.fence));
-  assert.equal(recoveryEvidence.mode, 'stripe-intent-recovery');
-  assert.deepEqual(recoveryEvidence.pendingIntents.map(({ intentId }) => intentId), ['intent-recovery-pg']);
+  assert.equal(leaseOwner.owner_run_id, '200');
+  assert.ok(resources.every((resource) => resource.fence === recovery.fence &&
+    resource.workflow_run_id === '200'));
+  assert.equal(recoveryEvidence[0].mode, 'stripe-intent-recovery');
+  assert.deepEqual(recoveryEvidence[0].pendingIntents.map(({ intentId }) => intentId), ['intent-recovery-pg']);
+  assert.equal(recoveryEvidence[0].ownerRun.runId, '100');
+
+  currentRecoveryRun = secondRecoveryRun;
+  const secondRecovery = await store.handoffStripeIntentRecovery({ attemptId,
+    fence: recovery.fence, ttlSeconds: 60 });
+  assert.notEqual(secondRecovery.fence, recovery.fence);
+  assert.equal(leaseOwner.owner_run_id, '300');
+  assert.ok(resources.every((resource) => resource.fence === secondRecovery.fence &&
+    resource.workflow_run_id === '300'));
+  assert.equal(recoveryEvidence[1].ownerRun.runId, '200');
+  assert.equal(recoveryEvidence[1].lease.ownerRunId, '200');
+
+  const lockedResources = structuredClone(resources);
+  provenOwnerRunIds.add('300');
+  currentRecoveryRun = undefined;
+  await assert.rejects(store.handoffStripeIntentRecovery({ attemptId,
+    fence: secondRecovery.fence, runTerminal: true, runnerRemoved: true }), {
+    code: 'recovery_unverified',
+  });
+  provenOwnerRunIds.delete('300');
+  currentRecoveryRun = { ...workflow, runId: '400', runAttempt: 1 };
+  await assert.rejects(store.handoffStripeIntentRecovery({ attemptId,
+    fence: secondRecovery.fence, runTerminal: true, runnerRemoved: true }), {
+    code: 'recovery_unverified',
+  });
+  assert.equal(leaseFence, secondRecovery.fence);
+  assert.equal(leaseOwner.owner_run_id, '300');
+  assert.deepEqual(resources, lockedResources);
+  assert.equal(attempt.state, 'rechecking');
+
+  assert.deepEqual((await store.listPendingStripeIntents({ attemptId,
+    fence: secondRecovery.fence })).map(({ intentId }) => intentId), ['intent-recovery-pg']);
 
   const handoffWrite = /^(?:INSERT INTO billing_validation_control\.fixture_leases|UPDATE billing_validation_control\.resource_locks|INSERT INTO billing_validation_control\.attempts)/;
   const handoffWrites = transactions.flat().filter(({ sql }) => handoffWrite.test(sql));
-  assert.equal(handoffWrites.length, 4);
-  assert.equal(transactions.filter((items) => items.some(({ sql }) => handoffWrite.test(sql))).length, 1);
+  assert.equal(handoffWrites.length, 8);
+  assert.equal(transactions.filter((items) => items.some(({ sql }) => handoffWrite.test(sql))).length, 2);
   const leaseWrite = handoffWrites.find(({ sql }) => sql.startsWith('INSERT INTO billing_validation_control.fixture_leases'));
   assert.equal(leaseWrite.values[4], recovery.fence);
   assert.equal(leaseWrite.values[6], oldFence);
+  assert.equal(leaseWrite.values[10], '200');
+  const secondLeaseWrite = handoffWrites.filter(({ sql }) => sql.startsWith('INSERT INTO billing_validation_control.fixture_leases'))[1];
+  assert.equal(secondLeaseWrite.values[4], secondRecovery.fence);
+  assert.equal(secondLeaseWrite.values[6], recovery.fence);
+  assert.equal(secondLeaseWrite.values[10], '300');
   assert.ok(leaseWrite.sql.includes('WHERE billing_validation_control.fixture_leases.fence = $7::uuid'));
   const resourceWrites = handoffWrites.filter(({ sql }) =>
     sql.startsWith('UPDATE billing_validation_control.resource_locks'));
-  assert.equal(resourceWrites.length, 2);
-  assert.ok(resourceWrites.every(({ sql, values }) =>
+  assert.equal(resourceWrites.length, 4);
+  assert.ok(resourceWrites.slice(0, 2).every(({ sql, values }) =>
     sql.includes('owner_attempt_id = $13') && sql.includes('fence = $14::uuid') &&
     values[12] === attemptId && values[13] === oldFence));
+  assert.ok(resourceWrites.slice(2).every(({ values }) => values[13] === recovery.fence));
   const pendingQuery = calls.find(({ sql }) => sql.includes('FROM billing_validation_control.stripe_intents AS intent'));
   assert.ok(pendingQuery.sql.includes('NOT EXISTS'));
   assert.ok(pendingQuery.sql.includes('FOR UPDATE OF intent'));
 
   await assert.rejects(store.listPendingStripeIntents({ attemptId, fence: oldFence }),
     { code: 'lease_fence_lost' });
+  await assert.rejects(store.listPendingStripeIntents({ attemptId, fence: recovery.fence }),
+    { code: 'lease_fence_lost' });
   let fixtureMutationCalls = 0;
-  await assert.rejects(store.fixtureMutation({ attemptId, fence: recovery.fence }, async () => {
+  await assert.rejects(store.fixtureMutation({ attemptId, fence: secondRecovery.fence }, async () => {
     fixtureMutationCalls++;
   }), { code: 'recovery_read_only' });
   await assert.rejects(store.fixtureMutation({ attemptId, fence: oldFence }, async () => {
@@ -772,9 +984,9 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
   }), { code: 'lease_fence_lost' });
   assert.equal(fixtureMutationCalls, 0);
 
-  await store.transition({ attemptId, fence: recovery.fence, from: 'rechecking', to: 'complete' });
-  await assert.rejects(store.cleanup({ attemptId, fence: oldFence }), { code: 'lease_fence_lost' });
-  await assert.rejects(store.cleanup({ attemptId, fence: recovery.fence }), {
+  await store.transition({ attemptId, fence: secondRecovery.fence, from: 'rechecking', to: 'complete' });
+  await assert.rejects(store.cleanup({ attemptId, fence: oldFence, projection: cleanupProjection }), { code: 'lease_fence_lost' });
+  await assert.rejects(store.cleanup({ attemptId, fence: secondRecovery.fence, projection: cleanupProjection }), {
     code: 'stripe_intent_unresolved',
   });
   assert.equal(cleanupVerifierCalls, 0);

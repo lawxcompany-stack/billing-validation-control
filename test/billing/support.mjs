@@ -91,7 +91,7 @@ export function makeAttemptParts({ attemptId = 'attempt-task6', fence = '1111111
       return structuredClone(receipt);
     },
     async cleanup(input) {
-      calls.cleanup.push({ ...input });
+      calls.cleanup.push(structuredClone(input));
       if (input.attemptId !== attemptId || input.fence !== currentFence) {
         throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
       }
@@ -99,7 +99,7 @@ export function makeAttemptParts({ attemptId = 'attempt-task6', fence = '1111111
           !receipts.has(intent.intentId))) {
         throw Object.assign(new Error('stripe_intent_unresolved'), { code: 'stripe_intent_unresolved' });
       }
-      return { cleanupStatus: 'complete' };
+      return { cleanupStatus: 'complete', cleanupReceipt: { digest: 'f'.repeat(64) } };
     },
     async fixtureMutation(input, mutation) {
       calls.fixtureMutations.push(structuredClone(input));

@@ -32,6 +32,80 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION billing_validation_control.valid_cleanup_projection(document jsonb)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  item jsonb;
+  item_type text;
+  item_id text;
+  item_status text;
+  key_count integer;
+BEGIN
+  IF jsonb_typeof(document) IS DISTINCT FROM 'object' THEN RETURN false; END IF;
+  SELECT count(*) INTO key_count FROM jsonb_object_keys(document);
+  IF key_count <> 6 OR NOT (document ?& ARRAY['cleanupClaim', 'databaseBaselineDigest',
+      'mutatedResourceIds', 'retainedDatabaseResources', 'retainedObjects',
+      'removedDatabaseFixtureCount']) THEN
+    RETURN false;
+  END IF;
+  IF document ->> 'cleanupClaim' IS DISTINCT FROM 'owned_reversible_provider_fixtures_only' OR
+     jsonb_typeof(document -> 'databaseBaselineDigest') IS DISTINCT FROM 'string' OR
+     document ->> 'databaseBaselineDigest' !~ '^[a-f0-9]{64}$' OR
+     jsonb_typeof(document -> 'mutatedResourceIds') IS DISTINCT FROM 'array' OR
+     jsonb_typeof(document -> 'retainedDatabaseResources') IS DISTINCT FROM 'array' OR
+     jsonb_typeof(document -> 'retainedObjects') IS DISTINCT FROM 'array' OR
+     jsonb_typeof(document -> 'removedDatabaseFixtureCount') IS DISTINCT FROM 'number' OR
+     document ->> 'removedDatabaseFixtureCount' <> '0' THEN
+    RETURN false;
+  END IF;
+  IF jsonb_array_length(document -> 'retainedDatabaseResources') <> 0 THEN RETURN false; END IF;
+  FOR item IN SELECT value FROM jsonb_array_elements(document -> 'mutatedResourceIds') LOOP
+    IF jsonb_typeof(item) IS DISTINCT FROM 'string' OR
+       item #>> '{}' !~ '^(cs|sub)_[A-Za-z0-9_]{1,120}$' THEN
+      RETURN false;
+    END IF;
+  END LOOP;
+  FOR item IN SELECT value FROM jsonb_array_elements(document -> 'retainedObjects') LOOP
+    IF jsonb_typeof(item) IS DISTINCT FROM 'object' THEN RETURN false; END IF;
+    SELECT count(*) INTO key_count FROM jsonb_object_keys(item);
+    IF key_count <> 3 OR NOT (item ?& ARRAY['id', 'type', 'status']) OR
+       jsonb_typeof(item -> 'id') IS DISTINCT FROM 'string' OR
+       jsonb_typeof(item -> 'type') IS DISTINCT FROM 'string' OR
+       jsonb_typeof(item -> 'status') IS DISTINCT FROM 'string' THEN
+      RETURN false;
+    END IF;
+    item_id := item ->> 'id';
+    item_type := item ->> 'type';
+    item_status := item ->> 'status';
+    IF NOT (CASE item_type
+      WHEN 'customer' THEN item_id ~ '^cus_[A-Za-z0-9_]{1,120}$' AND item_status = 'retained_test_customer'
+      WHEN 'checkout_session' THEN item_id ~ '^cs_[A-Za-z0-9_]{1,120}$' AND
+        item_status IN ('expired_test_checkout_session', 'completed_test_checkout_session')
+      WHEN 'subscription' THEN item_id ~ '^sub_[A-Za-z0-9_]{1,120}$' AND
+        item_status IN ('retained_test_subscription', 'canceled_test_subscription')
+      WHEN 'payment_intent' THEN item_id ~ '^pi_[A-Za-z0-9_]{1,120}$' AND
+        item_status = 'retained_test_financial_object'
+      WHEN 'invoice' THEN item_id ~ '^in_[A-Za-z0-9_]{1,120}$' AND
+        item_status = 'retained_test_financial_object'
+      WHEN 'charge' THEN item_id ~ '^ch_[A-Za-z0-9_]{1,120}$' AND
+        item_status = 'retained_test_financial_object'
+      WHEN 'setup_intent' THEN item_id ~ '^seti_[A-Za-z0-9_]{1,120}$' AND
+        item_status = 'retained_test_financial_object'
+      WHEN 'event' THEN item_id ~ '^evt_[A-Za-z0-9_]{1,120}$' AND
+        item_status = 'retained_test_financial_object'
+      ELSE false
+    END) THEN
+      RETURN false;
+    END IF;
+  END LOOP;
+  RETURN true;
+END;
+$$;
+
 CREATE TABLE IF NOT EXISTS billing_validation_control.attempts (
   attempt_id text PRIMARY KEY,
   branch_id text NOT NULL,
@@ -257,6 +331,83 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_leases (
 );
 CREATE INDEX IF NOT EXISTS billing_validation_lease_expiry
   ON billing_validation_control.fixture_leases (expires_at);
+
+CREATE TABLE IF NOT EXISTS billing_validation_control.cleanup_receipts (
+  receipt_id text PRIMARY KEY,
+  reservation_id text NOT NULL UNIQUE
+    REFERENCES billing_validation_control.retention_reservations(reservation_id),
+  attempt_id text NOT NULL UNIQUE REFERENCES billing_validation_control.attempts(attempt_id),
+  project_ref char(20) NOT NULL,
+  branch_id text NOT NULL,
+  deployment_id text NOT NULL,
+  deployment_origin text NOT NULL,
+  stripe_account_id text NOT NULL,
+  owner_fence uuid NOT NULL,
+  cleanup_digest char(64) NOT NULL CHECK (cleanup_digest ~ '^[a-f0-9]{64}$'),
+  verified_projection jsonb NOT NULL CHECK (
+    billing_validation_control.valid_cleanup_projection(verified_projection)
+  ),
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE OR REPLACE FUNCTION billing_validation_control.validate_cleanup_receipt_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  reservation billing_validation_control.retention_reservations%ROWTYPE;
+  attempt billing_validation_control.attempts%ROWTYPE;
+  resource_count integer;
+BEGIN
+  SELECT * INTO reservation
+  FROM billing_validation_control.retention_reservations
+  WHERE reservation_id = NEW.reservation_id
+  FOR KEY SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'billing_cleanup_receipt_reservation_missing' USING ERRCODE = '23514';
+  END IF;
+  SELECT * INTO attempt
+  FROM billing_validation_control.attempts
+  WHERE attempt_id = NEW.attempt_id
+  FOR KEY SHARE;
+  IF NOT FOUND OR reservation.attempt_id <> NEW.attempt_id OR
+     reservation.project_ref <> NEW.project_ref OR reservation.branch_id <> NEW.branch_id OR
+     reservation.stripe_account_id <> NEW.stripe_account_id OR
+     attempt.database_project_ref <> NEW.project_ref OR attempt.branch_id <> NEW.branch_id OR
+     attempt.deployment_id <> NEW.deployment_id OR attempt.deployment_origin <> NEW.deployment_origin OR
+     attempt.stripe_account_id <> NEW.stripe_account_id OR attempt.state NOT IN ('complete', 'cancelled', 'timed_out') OR
+     attempt.cleanup_status <> 'pending' THEN
+    RAISE EXCEPTION 'billing_cleanup_receipt_identity_mismatch' USING ERRCODE = '23514';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM billing_validation_control.fixture_leases
+      WHERE attempt_id = NEW.attempt_id AND fence = NEW.owner_fence AND expires_at > clock_timestamp()) THEN
+    RAISE EXCEPTION 'billing_cleanup_receipt_fence_mismatch' USING ERRCODE = '23514';
+  END IF;
+  SELECT count(*) INTO resource_count FROM billing_validation_control.resource_locks
+  WHERE owner_attempt_id = NEW.attempt_id AND fence = NEW.owner_fence;
+  IF resource_count <> 2 THEN
+    RAISE EXCEPTION 'billing_cleanup_receipt_resource_lock_mismatch' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS billing_validation_cleanup_receipt_identity
+  ON billing_validation_control.cleanup_receipts;
+CREATE TRIGGER billing_validation_cleanup_receipt_identity
+  BEFORE INSERT ON billing_validation_control.cleanup_receipts
+  FOR EACH ROW EXECUTE FUNCTION billing_validation_control.validate_cleanup_receipt_identity();
+
+DROP TRIGGER IF EXISTS billing_validation_cleanup_receipt_immutable
+  ON billing_validation_control.cleanup_receipts;
+CREATE TRIGGER billing_validation_cleanup_receipt_immutable
+  BEFORE UPDATE OR DELETE ON billing_validation_control.cleanup_receipts
+  FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
+DROP TRIGGER IF EXISTS billing_validation_cleanup_receipt_no_truncate
+  ON billing_validation_control.cleanup_receipts;
+CREATE TRIGGER billing_validation_cleanup_receipt_no_truncate
+  BEFORE TRUNCATE ON billing_validation_control.cleanup_receipts
+  FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
 REVOKE ALL ON ALL TABLES IN SCHEMA billing_validation_control FROM PUBLIC, anon, authenticated;
 REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control.retention_reservations
   FROM PUBLIC, anon, authenticated;
@@ -265,5 +416,7 @@ REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control.retention_receipts
 REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control.stripe_intents
   FROM PUBLIC, anon, authenticated;
 REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control.stripe_receipts
+  FROM PUBLIC, anon, authenticated;
+REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control.cleanup_receipts
   FROM PUBLIC, anon, authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA billing_validation_control REVOKE ALL ON TABLES FROM PUBLIC, anon, authenticated;

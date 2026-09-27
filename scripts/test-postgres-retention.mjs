@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 const LOCAL_SCHEMA = /^billing_validation_test_[a-f0-9]{16}$/;
 const VALIDATOR = /^CREATE OR REPLACE FUNCTION billing_validation_control\.valid_retention_usage\([\s\S]*?^\$\$;[ \t]*$/m;
+const CLEANUP_VALIDATOR = /^CREATE OR REPLACE FUNCTION billing_validation_control\.valid_cleanup_projection\([\s\S]*?^\$\$;[ \t]*$/m;
 
 function refuse(code, message) {
   const error = new Error(message);
@@ -57,12 +58,18 @@ export function buildRetentionValidationSql(schemaSql, schemaName) {
   const definition = schemaSql.match(VALIDATOR)?.[0];
   if (!definition) refuse('local_postgres_validator_missing',
     'Could not locate valid_retention_usage in src/attempts/schema.sql.');
+  const cleanupDefinition = schemaSql.match(CLEANUP_VALIDATOR)?.[0];
+  if (!cleanupDefinition) refuse('local_postgres_validator_missing',
+    'Could not locate valid_cleanup_projection in src/attempts/schema.sql.');
 
   const localDefinition = definition.replace(
     'billing_validation_control.valid_retention_usage', `${schemaName}.valid_retention_usage`);
+  const localCleanupDefinition = cleanupDefinition.replace(
+    'billing_validation_control.valid_cleanup_projection', `${schemaName}.valid_cleanup_projection`);
   return `BEGIN;
 CREATE SCHEMA ${schemaName};
 ${localDefinition}
+${localCleanupDefinition}
 DO $retention_assertions$
 BEGIN
   IF NOT ${schemaName}.valid_retention_usage(
@@ -77,6 +84,23 @@ BEGIN
   END IF;
 END
 $retention_assertions$;
+DO $cleanup_assertions$
+BEGIN
+  IF NOT ${schemaName}.valid_cleanup_projection(
+    '{"cleanupClaim":"owned_reversible_provider_fixtures_only","databaseBaselineDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mutatedResourceIds":["cs_test123"],"retainedDatabaseResources":[],"retainedObjects":[{"id":"cus_test123","type":"customer","status":"retained_test_customer"}],"removedDatabaseFixtureCount":0}'::jsonb
+  ) THEN
+    RAISE EXCEPTION 'canonical_cleanup_projection_rejected';
+  END IF;
+  IF ${schemaName}.valid_cleanup_projection(
+    '{"cleanupClaim":"owned_reversible_provider_fixtures_only","databaseBaselineDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mutatedResourceIds":[],"retainedDatabaseResources":[],"retainedObjects":[],"removedDatabaseFixtureCount":0,"extra":true}'::jsonb
+  ) THEN
+    RAISE EXCEPTION 'unknown_cleanup_projection_field_accepted';
+  END IF;
+  IF ${schemaName}.valid_cleanup_projection('null'::jsonb) THEN
+    RAISE EXCEPTION 'invalid_cleanup_projection_accepted';
+  END IF;
+END
+$cleanup_assertions$;
 ROLLBACK;
 `;
 }
@@ -124,7 +148,7 @@ export function main() {
   }
   const schemaSql = readFileSync(new URL('../src/attempts/schema.sql', import.meta.url), 'utf8');
   runRetentionValidation({ connectionUrl, schemaSql });
-  process.stdout.write('Local PostgreSQL retention validator passed: canonical integer accepted; 2.0 rejected.\n');
+  process.stdout.write('Local PostgreSQL retention and cleanup validators passed.\n');
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

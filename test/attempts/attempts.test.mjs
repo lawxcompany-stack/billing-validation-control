@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { createAttemptStore } from '../../src/attempts/store.mjs';
 import { prepareAttempt } from '../../src/attempts/prepare.mjs';
@@ -22,6 +23,11 @@ const retentionPolicy = { version: 1, quotas: {
 const projection = { attempts: 1, databaseRows: 10, authUsers: 1, stripeObjects: 10 };
 const recheckRun = { repository: 'lawxcompany-stack/billing-validation-control',
   ref: 'refs/heads/main', runId: '200', runAttempt: 1 };
+const cleanupProjection = Object.freeze({ cleanupClaim: 'owned_reversible_provider_fixtures_only',
+  databaseBaselineDigest: 'c'.repeat(64), mutatedResourceIds: ['cs_synthetic123'],
+  retainedDatabaseResources: [], retainedObjects: [
+    { id: 'ch_synthetic123', type: 'charge', status: 'retained_test_financial_object' },
+  ], removedDatabaseFixtureCount: 0 });
 
 function input(attemptId = 'attempt-a', candidateSha = shaA, fixtureKey = 'invoice-a') {
   return { attemptId, key: { ...key, fixtureKey }, candidateSha, workflow: {
@@ -39,17 +45,22 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
   const resourceLocks = new Map();
   const stripeIntents = new Map();
   const stripeReceipts = new Map();
+  const cleanupReceipts = new Map();
   let clock = 1000;
   let recovery = { runTerminal: true, runnerRemoved: true, cleanupComplete: true };
   let cleanupVerified = true;
   let retentionReconcilerVerified = trustedRetentionReconciler;
   let providerReconcilerVerified = trustedProviderReconciler;
+  let cleanupReceiptFailure = false;
+  let cleanupResourceLockFailure = false;
+  const recoveryInputs = [];
+  const cleanupSteps = [];
   let tail = Promise.resolve();
   let transactionCount = 0;
   const snapshot = () => ({ attempts: structuredClone(attempts), leases: structuredClone(leases),
     reservations: structuredClone(reservations), receipts: structuredClone(receipts),
     resourceLocks: structuredClone(resourceLocks), stripeIntents: structuredClone(stripeIntents),
-    stripeReceipts: structuredClone(stripeReceipts) });
+    stripeReceipts: structuredClone(stripeReceipts), cleanupReceipts: structuredClone(cleanupReceipts) });
   const sameScope = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const resourceKeys = (value) => [
     { resourceType: 'supabase_branch', resourceId: `${value.database.projectRef}:${value.database.branchId}` },
@@ -63,14 +74,21 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
   };
   return {
     attempts, leases, reservations, receipts, resourceLocks, stripeIntents, stripeReceipts,
+    cleanupReceipts, cleanupSteps,
+    recoveryInputs,
     advance: (seconds) => { clock += seconds; },
     transactionCount: () => transactionCount,
     setRecovery: (value) => { recovery = value; },
     setCleanupVerified: (value) => { cleanupVerified = value; },
     setRetentionReconcilerVerified: (value) => { retentionReconcilerVerified = value; },
     setProviderReconcilerVerified: (value) => { providerReconcilerVerified = value; },
+    setCleanupReceiptFailure: (value) => { cleanupReceiptFailure = value; },
+    setCleanupResourceLockFailure: (value) => { cleanupResourceLockFailure = value; },
     verifyCleanup: async () => cleanupVerified,
-    ...(trustedRecovery ? { verifyRecovery: async () => recovery } : {}),
+    ...(trustedRecovery ? { verifyRecovery: async (input) => {
+      recoveryInputs.push(structuredClone(input));
+      return recovery;
+    } } : {}),
     verifyRetentionReceipt: async () => retentionReconcilerVerified,
     verifyProviderObservation: async () => providerReconcilerVerified,
     async transaction(fn) {
@@ -86,7 +104,10 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
         lockResourceLocks: async () => {},
         now: () => clock,
         getAttempt: async (id) => structuredClone(attempts.get(id) ?? null),
-        putAttempt: async (row) => attempts.set(row.attemptId, structuredClone(row)),
+        putAttempt: async (row) => {
+          if (row.cleanupStatus === 'complete') cleanupSteps.push('attempt');
+          attempts.set(row.attemptId, structuredClone(row));
+        },
         getLease: async (k) => structuredClone(leases.get(JSON.stringify(k)) ?? null),
         async getResourceLocks(ownerEnvironment) {
           return resourceKeys(ownerEnvironment).map((resource) => resourceLocks.get(resourceMapKey(resource)))
@@ -104,6 +125,11 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
           }));
         },
         async deleteResourceLocks(owner) {
+          if (cleanupResourceLockFailure) {
+            cleanupResourceLockFailure = false;
+            throw Object.assign(new Error('resource_lock_release_failed'), { code: 'resource_lock_release_failed' });
+          }
+          cleanupSteps.push('resourceLocks');
           for (const resource of resourceKeys(owner.environment)) {
             const row = resourceLocks.get(resourceMapKey(resource));
             if (row?.attemptId !== owner.attemptId || row.fence !== owner.fence) {
@@ -146,7 +172,10 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
           stripeReceipts.set(receipt.intentId, structuredClone(receipt));
         },
         putLease: async (row) => leases.set(JSON.stringify(row.key), structuredClone(row)),
-        deleteLease: async (k) => leases.delete(JSON.stringify(k)),
+        deleteLease: async (k) => {
+          cleanupSteps.push('lease');
+          return leases.delete(JSON.stringify(k));
+        },
         async getRetentionUsage(scope) {
           const allReservations = [...reservations.values()].filter((row) => sameScope(row.scope, scope));
           const settled = allReservations.filter((row) => receipts.has(row.reservationId));
@@ -161,6 +190,18 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
         },
         async getRetentionReservation(id) { return structuredClone(reservations.get(id) ?? null); },
         async getRetentionReceipt(id) { return structuredClone(receipts.get(id) ?? null); },
+        async getCleanupReceipt(id) { return structuredClone(cleanupReceipts.get(id) ?? null); },
+        async putCleanupReceipt(row) {
+          if (cleanupReceiptFailure) {
+            cleanupReceiptFailure = false;
+            throw Object.assign(new Error('cleanup_receipt_insert_failed'), { code: 'cleanup_receipt_insert_failed' });
+          }
+          if (cleanupReceipts.has(row.attemptId)) {
+            throw Object.assign(new Error('cleanup_receipt_conflict'), { code: 'cleanup_receipt_conflict' });
+          }
+          cleanupSteps.push('receipt');
+          cleanupReceipts.set(row.attemptId, structuredClone(row));
+        },
         async putRetentionReservation(row) {
           if (reservations.has(row.reservationId) || [...reservations.values()].some((item) => item.attemptId === row.attemptId)) {
             throw Object.assign(new Error('reservation_conflict'), { code: 'retention_reservation_conflict' });
@@ -178,7 +219,7 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
       try { return await fn(tx); }
       catch (error) {
         attempts.clear(); leases.clear(); reservations.clear(); receipts.clear();
-        resourceLocks.clear(); stripeIntents.clear(); stripeReceipts.clear();
+        resourceLocks.clear(); stripeIntents.clear(); stripeReceipts.clear(); cleanupReceipts.clear();
         for (const [k, v] of before.attempts) attempts.set(k, v);
         for (const [k, v] of before.leases) leases.set(k, v);
         for (const [k, v] of before.reservations) reservations.set(k, v);
@@ -186,6 +227,7 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
         for (const [k, v] of before.resourceLocks) resourceLocks.set(k, v);
         for (const [k, v] of before.stripeIntents) stripeIntents.set(k, v);
         for (const [k, v] of before.stripeReceipts) stripeReceipts.set(k, v);
+        for (const [k, v] of before.cleanupReceipts) cleanupReceipts.set(k, v);
         throw error;
       } finally { unlock(); }
     },
@@ -253,7 +295,8 @@ test('renewal retains the fence and expired owners cannot mutate or release', as
   assert.equal(renewed.fence, row.fence);
   adapter.advance(61);
   await assert.rejects(withFixtureMutation(store, row, async () => {}), { code: 'lease_expired' });
-  await assert.rejects(cleanupAttempt(store, { attemptId: row.attemptId, fence: row.fence, verified: true }), { code: 'lease_expired' });
+  await assert.rejects(cleanupAttempt(store, { attemptId: row.attemptId, fence: row.fence,
+    projection: cleanupProjection, verified: true }), { code: 'lease_expired' });
 });
 
 test('lease survives collect and recheck until verified cleanup', async () => {
@@ -273,10 +316,74 @@ test('lease survives collect and recheck until verified cleanup', async () => {
   await store.transition({ attemptId: row.attemptId, fence: resumed.fence,
     from: 'rechecking', to: 'complete' });
   adapter.setCleanupVerified(false);
-  await assert.rejects(cleanupAttempt(store, { attemptId: row.attemptId, fence: resumed.fence, verified: true }), { code: 'cleanup_unverified' });
+  await assert.rejects(cleanupAttempt(store, { attemptId: row.attemptId, fence: resumed.fence,
+    projection: cleanupProjection, verified: true }), { code: 'cleanup_unverified' });
   adapter.setCleanupVerified(true);
-  await cleanupAttempt(store, { attemptId: row.attemptId, fence: resumed.fence, verified: true });
+  await cleanupAttempt(store, { attemptId: row.attemptId, fence: resumed.fence,
+    projection: cleanupProjection, verified: true });
   assert.equal((await prepareAttempt(store, input('attempt-b', shaB))).attemptId, 'attempt-b');
+});
+
+test('cleanup stores a closed projection receipt before terminal state and ownership release', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const owner = await prepareAttempt(store, input());
+  await store.transition({ attemptId: owner.attemptId, fence: owner.fence,
+    from: 'collecting', to: 'cancelled' });
+
+  await store.cleanup({ attemptId: owner.attemptId, fence: owner.fence, projection: cleanupProjection });
+
+  const receipt = adapter.cleanupReceipts.get(owner.attemptId);
+  assert.equal(receipt.reservationId, owner.reservationId);
+  assert.equal(receipt.attemptId, owner.attemptId);
+  assert.equal(receipt.fence, owner.fence);
+  assert.deepEqual(receipt.environment, environment);
+  assert.deepEqual(receipt.projection, cleanupProjection);
+  assert.equal(receipt.digest, createHash('sha256').update(JSON.stringify(cleanupProjection)).digest('hex'));
+  assert.deepEqual(adapter.cleanupSteps, ['receipt', 'attempt', 'lease', 'resourceLocks']);
+  assert.equal((await store.getAttempt(owner.attemptId)).cleanupStatus, 'complete');
+  assert.equal(adapter.leases.size, 0);
+  assert.equal(adapter.resourceLocks.size, 0);
+  assert.equal(adapter.reservations.size, 1);
+  assert.equal(adapter.receipts.size, 0);
+});
+
+test('cleanup receipt insertion and resource-lock release failures preserve pending ownership atomically', async () => {
+  for (const failure of ['receipt', 'resourceLocks']) {
+    const adapter = fakeAdapter();
+    const store = createAttemptStore(adapter);
+    const owner = await prepareAttempt(store, input());
+    await store.transition({ attemptId: owner.attemptId, fence: owner.fence,
+      from: 'collecting', to: 'cancelled' });
+    if (failure === 'receipt') adapter.setCleanupReceiptFailure(true);
+    else adapter.setCleanupResourceLockFailure(true);
+
+    await assert.rejects(store.cleanup({ attemptId: owner.attemptId, fence: owner.fence,
+      projection: cleanupProjection }), { code: failure === 'receipt'
+      ? 'cleanup_receipt_insert_failed' : 'resource_lock_release_failed' });
+
+    assert.equal(adapter.cleanupReceipts.size, 0);
+    assert.equal((await store.getAttempt(owner.attemptId)).cleanupStatus, 'pending');
+    assert.equal(adapter.leases.get(JSON.stringify(owner.key)).fence, owner.fence);
+    assert.equal(adapter.resourceLocks.size, 2);
+    assert.equal(adapter.reservations.size, 1);
+    assert.equal(adapter.receipts.size, 0);
+  }
+});
+
+test('cleanup rejects projections with fields outside the receipt schema before releasing ownership', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const owner = await prepareAttempt(store, input());
+  await store.transition({ attemptId: owner.attemptId, fence: owner.fence,
+    from: 'collecting', to: 'cancelled' });
+
+  await assert.rejects(store.cleanup({ attemptId: owner.attemptId, fence: owner.fence,
+    projection: { ...cleanupProjection, callerFlag: true } }), { code: 'cleanup_receipt_invalid' });
+  assert.equal(adapter.cleanupReceipts.size, 0);
+  assert.equal((await store.getAttempt(owner.attemptId)).cleanupStatus, 'pending');
+  assert.equal(adapter.leases.get(JSON.stringify(owner.key)).fence, owner.fence);
+  assert.equal(adapter.resourceLocks.size, 2);
 });
 
 test('same attempt resumes recheck with a new fence only after terminal run and removed runner', async () => {
@@ -362,7 +469,8 @@ test('recovery handoff rotates the fence for read and reconciliation only while 
     idempotencyKey: providerIdempotencyKey(prior.attemptId, 'stripe', operation) });
   await store.transition({ attemptId: prior.attemptId, fence: prior.fence,
     from: 'collecting', to: 'cancelled' });
-  adapter.setRecovery({ runTerminal: true, runnerRemoved: true, cleanupComplete: false });
+  adapter.setRecovery({ runTerminal: true, runnerRemoved: true, cleanupComplete: false,
+    currentRun: { ...prior.workflow, runId: '200', runAttempt: 1 } });
   adapter.advance(61);
 
   const recovery = await store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
@@ -403,6 +511,75 @@ test('recovery handoff rotates the fence for read and reconciliation only while 
   assert.equal(adapter.reservations.size, 1);
   assert.equal(adapter.receipts.size, 0);
   assert.equal(adapter.attempts.get(prior.attemptId).cleanupStatus, 'pending');
+});
+
+test('interrupted Stripe recovery hands off repeatedly using the latest verified recovery run', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const prior = await prepareAttempt(store, input());
+  const operation = 'checkout:create:repeat-recovery';
+  const intent = await store.beginStripeIntent({ attemptId: prior.attemptId, fence: prior.fence,
+    candidateSha: prior.candidateSha, workflow: prior.workflow, environment: prior.environment,
+    action: 'checkout.replay', operation, requestDigest: 'd'.repeat(64),
+    idempotencyKey: providerIdempotencyKey(prior.attemptId, 'stripe', operation) });
+  await store.transition({ attemptId: prior.attemptId, fence: prior.fence,
+    from: 'collecting', to: 'cancelled' });
+  const firstRecoveryRun = { ...prior.workflow, runId: '200', runAttempt: 1 };
+  const secondRecoveryRun = { ...prior.workflow, runId: '300', runAttempt: 1 };
+  const recoveryChecks = [];
+  adapter.verifyRecovery = async (input) => {
+    recoveryChecks.push(input);
+    if (input.ownerRun.runId === '100') {
+      return { runTerminal: true, runnerRemoved: true, currentRun: firstRecoveryRun };
+    }
+    if (input.ownerRun.runId === '200') {
+      return { runTerminal: true, runnerRemoved: true, currentRun: secondRecoveryRun };
+    }
+    return { runTerminal: false, runnerRemoved: false, currentRun: secondRecoveryRun };
+  };
+
+  const first = await store.handoffStripeIntentRecovery({ attemptId: prior.attemptId, fence: prior.fence });
+  const second = await store.handoffStripeIntentRecovery({ attemptId: prior.attemptId, fence: first.fence });
+
+  assert.notEqual(first.fence, prior.fence);
+  assert.notEqual(second.fence, first.fence);
+  assert.deepEqual(recoveryChecks.map(({ ownerRun }) => ownerRun.runId), ['100', '200']);
+  assert.equal(adapter.leases.get(JSON.stringify(key)).ownerRunId, '300');
+  assert.ok([...adapter.resourceLocks.values()].every((lock) => lock.workflow.runId === '300' &&
+    lock.fence === second.fence));
+  assert.deepEqual((await store.listPendingStripeIntents({ attemptId: prior.attemptId,
+    fence: second.fence })).map(({ intentId }) => intentId), [intent.intentId]);
+  assert.equal(adapter.reservations.size, 1);
+  assert.equal(adapter.receipts.size, 0);
+  assert.equal(adapter.cleanupReceipts.size, 0);
+});
+
+test('intent recovery requires verifier-bound current run identity and ignores caller terminal flags', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const prior = await prepareAttempt(store, input());
+  const operation = 'checkout:create:missing-recovery-proof';
+  await store.beginStripeIntent({ attemptId: prior.attemptId, fence: prior.fence,
+    candidateSha: prior.candidateSha, workflow: prior.workflow, environment: prior.environment,
+    action: 'checkout.replay', operation, requestDigest: 'e'.repeat(64),
+    idempotencyKey: providerIdempotencyKey(prior.attemptId, 'stripe', operation) });
+  await store.transition({ attemptId: prior.attemptId, fence: prior.fence,
+    from: 'collecting', to: 'cancelled' });
+  adapter.advance(61);
+
+  adapter.setRecovery({ runTerminal: true, runnerRemoved: true });
+  await assert.rejects(store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+    fence: prior.fence, runTerminal: true, runnerRemoved: true,
+    currentRun: { ...prior.workflow, runId: '200', runAttempt: 1 } }), { code: 'recovery_unverified' });
+  adapter.setRecovery({ runTerminal: false, runnerRemoved: false,
+    currentRun: { ...prior.workflow, runId: '200', runAttempt: 1 } });
+  await assert.rejects(store.handoffStripeIntentRecovery({ attemptId: prior.attemptId,
+    fence: prior.fence, runTerminal: true, runnerRemoved: true }), { code: 'recovery_unverified' });
+
+  assert.equal(adapter.leases.get(JSON.stringify(key)).fence, prior.fence);
+  assert.equal(adapter.resourceLocks.size, 2);
+  assert.equal(adapter.reservations.size, 1);
+  assert.equal(adapter.cleanupReceipts.size, 0);
 });
 
 test('intent recovery refuses unless verifyRecovery confirms a terminal run and removed runner', async () => {
@@ -475,7 +652,7 @@ test('expired Test Clock observation cannot settle an intent or release its reso
     } }), { code: 'stripe_reconciliation_window_expired' });
   assert.equal(adapter.stripeReceipts.size, 0);
   await assert.rejects(cleanupAttempt(store, { attemptId: owner.attemptId,
-    fence: owner.fence, verified: true }), { code: 'cleanup_not_terminal' });
+    fence: owner.fence, projection: cleanupProjection, verified: true }), { code: 'cleanup_not_terminal' });
   assert.equal(adapter.resourceLocks.size, 2);
 });
 
@@ -491,7 +668,8 @@ test('store cleanup refuses a terminal attempt with any unresolved Stripe intent
   await store.transition({ attemptId: owner.attemptId, fence: owner.fence,
     from: 'collecting', to: 'cancelled' });
 
-  await assert.rejects(store.cleanup({ attemptId: owner.attemptId, fence: owner.fence }),
+  await assert.rejects(store.cleanup({ attemptId: owner.attemptId, fence: owner.fence,
+    projection: cleanupProjection }),
     { code: 'stripe_intent_unresolved' });
   assert.equal(adapter.leases.get(JSON.stringify(key)).fence, owner.fence);
   assert.equal(adapter.resourceLocks.size, 2);
@@ -525,7 +703,8 @@ test('stale owner cannot mutate a fixture, invoke an external mutation or releas
     from: 'cancelled', to: 'timed_out' }), { code: 'lease_fence_lost' });
   await assert.rejects(store.renew({ attemptId: old.attemptId, fence: old.fence, ttlSeconds: 60 }),
     { code: 'lease_fence_lost' });
-  await assert.rejects(cleanupAttempt(store, { attemptId: old.attemptId, fence: old.fence, verified: true }), { code: 'lease_fence_lost' });
+  await assert.rejects(cleanupAttempt(store, { attemptId: old.attemptId, fence: old.fence,
+    projection: cleanupProjection, verified: true }), { code: 'lease_fence_lost' });
   await assert.rejects(store.beginStripeIntent({ attemptId: old.attemptId, fence: old.fence,
     candidateSha: old.candidateSha, workflow: old.workflow, environment: old.environment,
     action: 'checkout.replay', operation: 'checkout:create:stale-after-takeover',
@@ -886,7 +1065,7 @@ test('caller-supplied cleanup flag cannot release a lease without a trusted veri
   await store.transition({ attemptId: row.attemptId, fence: row.fence,
     from: 'collecting', to: 'cancelled' });
   await assert.rejects(cleanupAttempt(store, { attemptId: row.attemptId,
-    fence: row.fence, verified: true }), { code: 'cleanup_unverified' });
+    fence: row.fence, projection: cleanupProjection, verified: true }), { code: 'cleanup_unverified' });
   await assert.rejects(prepareAttempt(store, input('attempt-b', shaB)), { code: 'lease_held' });
 });
 
@@ -898,7 +1077,7 @@ test('collected attempt cannot release its lease before recheck or cancellation'
   await store.transition({ attemptId: row.attemptId, fence: row.fence,
     from: 'collecting', to: 'collected', artifact });
   await assert.rejects(cleanupAttempt(store, { attemptId: row.attemptId,
-    fence: row.fence, verified: true }), { code: 'cleanup_not_terminal' });
+    fence: row.fence, projection: cleanupProjection, verified: true }), { code: 'cleanup_not_terminal' });
 });
 
 test('admission refuses missing, unbounded, zero, negative, fractional, or unknown retention quotas before writes', async () => {
@@ -933,7 +1112,8 @@ test('reservation succeeds exactly at every configured finite quota and refuses 
   await store.reconcileReservation({ reservationId: first.reservationId, outcome: 'cancelled', retained: writes });
   await store.transition({ attemptId: first.attemptId, fence: first.fence,
     from: 'collecting', to: 'cancelled' });
-  await cleanupAttempt(store, { attemptId: first.attemptId, fence: first.fence, verified: true });
+  await cleanupAttempt(store, { attemptId: first.attemptId, fence: first.fence,
+    projection: cleanupProjection, verified: true });
   const second = await prepareAttempt(store, { ...input('attempt-b', shaB, 'invoice-b'),
     retentionPolicy: policy, projection: writes });
   assert.deepEqual(second.capacity.projected, policy.quotas);
@@ -941,7 +1121,8 @@ test('reservation succeeds exactly at every configured finite quota and refuses 
   await store.reconcileReservation({ reservationId: second.reservationId, outcome: 'cancelled', retained: writes });
   await store.transition({ attemptId: second.attemptId, fence: second.fence,
     from: 'collecting', to: 'cancelled' });
-  await cleanupAttempt(store, { attemptId: second.attemptId, fence: second.fence, verified: true });
+  await cleanupAttempt(store, { attemptId: second.attemptId, fence: second.fence,
+    projection: cleanupProjection, verified: true });
   await assert.rejects(prepareAttempt(store, { ...input('attempt-c', shaA, 'invoice-c'),
     retentionPolicy: policy, projection: { ...writes, databaseRows: 1 } }),
   { code: 'retention_capacity_exceeded' });
