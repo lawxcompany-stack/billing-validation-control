@@ -153,7 +153,7 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - [x] Implement injectable offline adapters and fail-closed production adapter interfaces. No remote adapter is invoked by the test suite.
 - [x] Run focused fixture/runtime/observation tests and full npm test.
 - [ ] Obtain independent code-review verdict; the dispatched reviewer did not return before shutdown.
-- [ ] Commit locally as feat(billing): publish attempt-scoped synthetic billing fixtures.
+- [x] Commit Task 4 corrections locally (`efcf841`); no push or PR.
 
 ### Task 5: Executable signup, pricing, payment, and zero-total contracts
 
