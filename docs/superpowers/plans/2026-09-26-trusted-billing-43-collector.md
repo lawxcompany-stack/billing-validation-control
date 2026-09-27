@@ -177,7 +177,8 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - [ ] Keep all five signup IDs blocked until a verifier-owned signup policy and non-delivering isolated inbox, suppression of CRM/Mailchimp side effects, and an approved append-only identity/row retention path exist. `signup.expired-intent` and `signup.tampered-intent` must not mutate signed cookies; unit-only parser coverage is not Preview acceptance.
 - [ ] Coupon/progressive/combo/zero-total paths require explicit synthetic catalog values and price snapshots; payment paths require separately verified TEST resources, independent Stripe/database readback, and reversible-resource ownership. Ambiguous decline/abandon/timeout/two-tab semantics remain blocked until exact observable behavior and safe seams are specified.
 - [ ] Test invalid/missing adapters and unsupported endpoint/operation refuse before provider mutation; assert each contract stays within its maxWrites.
-- [ ] Confirm no blocked case can satisfy the canonical 43-result verifier; no local fake/adaptor result is reported as remote acceptance.
+- [ ] Confirm the trusted Task 5 runner cannot produce `passed` for a blocked case, and that a direct `status: 'blocked'` record is rejected by the canonical validator. Record the present validator boundary: `validateBilling43Results` is schema-only and cannot detect a caller that fabricates a structurally valid `passed` record; Task 9 must bind results to trusted execution receipts and must never translate blocked/refused to passed.
+- [ ] No local fake/adapter result is reported as remote acceptance.
 - [ ] Run the four domain test files and full npm test.
 - [ ] Commit as feat(billing): gate unvalidated signup pricing and payment flows (or implement only the cases that meet every safety/evidence gate).
 
