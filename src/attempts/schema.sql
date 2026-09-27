@@ -389,6 +389,103 @@ ALTER TABLE billing_validation_control.fixture_leases
 CREATE INDEX IF NOT EXISTS billing_validation_lease_expiry
   ON billing_validation_control.fixture_leases (expires_at);
 
+CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_case_claims (
+  attempt_id text NOT NULL REFERENCES billing_validation_control.attempts(attempt_id),
+  case_id text NOT NULL,
+  reservation_id text NOT NULL REFERENCES billing_validation_control.retention_reservations(reservation_id),
+  owner_fence uuid NOT NULL,
+  candidate_sha char(40) NOT NULL CHECK (candidate_sha ~ '^[a-f0-9]{40}$'),
+  namespace_id uuid NOT NULL,
+  project_ref char(20) NOT NULL,
+  branch_id text NOT NULL,
+  deployment_id text NOT NULL,
+  deployment_origin text NOT NULL,
+  stripe_account_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (attempt_id, case_id)
+);
+
+CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_resource_claims (
+  attempt_id text NOT NULL,
+  case_id text NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('catalog', 'billing_identity')),
+  fixture_id uuid NOT NULL UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (attempt_id, case_id, kind),
+  FOREIGN KEY (attempt_id, case_id)
+    REFERENCES billing_validation_control.fixture_case_claims(attempt_id, case_id)
+);
+
+CREATE OR REPLACE FUNCTION billing_validation_control.validate_fixture_case_claim()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  attempt billing_validation_control.attempts%ROWTYPE;
+  reservation billing_validation_control.retention_reservations%ROWTYPE;
+  lease billing_validation_control.fixture_leases%ROWTYPE;
+BEGIN
+  SELECT * INTO attempt
+  FROM billing_validation_control.attempts
+  WHERE attempt_id = NEW.attempt_id
+  FOR KEY SHARE;
+  SELECT * INTO reservation
+  FROM billing_validation_control.retention_reservations
+  WHERE reservation_id = NEW.reservation_id
+  FOR KEY SHARE;
+  SELECT * INTO lease
+  FROM billing_validation_control.fixture_leases
+  WHERE attempt_id = NEW.attempt_id AND fence = NEW.owner_fence
+    AND expires_at > clock_timestamp() AND recovery_only = false
+  FOR KEY SHARE;
+  IF attempt.attempt_id IS NULL OR reservation.reservation_id IS NULL OR lease.attempt_id IS NULL OR
+     attempt.state <> 'collecting' OR attempt.candidate_sha <> NEW.candidate_sha OR
+     attempt.database_project_ref <> NEW.project_ref OR attempt.branch_id <> NEW.branch_id OR
+     attempt.deployment_id <> NEW.deployment_id OR attempt.deployment_origin <> NEW.deployment_origin OR
+     attempt.stripe_account_id <> NEW.stripe_account_id OR
+     reservation.attempt_id <> NEW.attempt_id OR reservation.project_ref <> NEW.project_ref OR
+     reservation.branch_id <> NEW.branch_id OR reservation.stripe_account_id <> NEW.stripe_account_id OR
+     lease.attempt_id <> NEW.attempt_id OR lease.fence <> NEW.owner_fence THEN
+    RAISE EXCEPTION 'billing_fixture_case_claim_invalid' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS billing_validation_fixture_case_claim_valid
+  ON billing_validation_control.fixture_case_claims;
+CREATE TRIGGER billing_validation_fixture_case_claim_valid
+  BEFORE INSERT ON billing_validation_control.fixture_case_claims
+  FOR EACH ROW EXECUTE FUNCTION billing_validation_control.validate_fixture_case_claim();
+
+CREATE OR REPLACE FUNCTION billing_validation_control.reject_fixture_case_claim_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  RAISE EXCEPTION 'billing_fixture_case_claims_append_only' USING ERRCODE = '55000';
+END;
+$$;
+DO $$
+DECLARE
+  relation_name text;
+BEGIN
+  FOREACH relation_name IN ARRAY ARRAY['fixture_case_claims', 'fixture_resource_claims'] LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS %I ON billing_validation_control.%I',
+      'billing_validation_' || relation_name || '_immutable', relation_name);
+    EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE OR DELETE ON billing_validation_control.%I '
+      'FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_fixture_case_claim_mutation()',
+      'billing_validation_' || relation_name || '_immutable', relation_name);
+    EXECUTE format('DROP TRIGGER IF EXISTS %I ON billing_validation_control.%I',
+      'billing_validation_' || relation_name || '_no_truncate', relation_name);
+    EXECUTE format('CREATE TRIGGER %I BEFORE TRUNCATE ON billing_validation_control.%I '
+      'FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_fixture_case_claim_mutation()',
+      'billing_validation_' || relation_name || '_no_truncate', relation_name);
+  END LOOP;
+END;
+$$;
+
 CREATE TABLE IF NOT EXISTS billing_validation_control.cleanup_receipts (
   receipt_id text PRIMARY KEY,
   reservation_id text NOT NULL UNIQUE

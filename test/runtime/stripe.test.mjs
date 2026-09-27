@@ -3,7 +3,8 @@ import { test } from 'node:test';
 import { verifyStripeEnvironment } from '../../src/runtime/stripe.mjs';
 import * as stripeModule from '../../src/runtime/stripe.mjs';
 import { providerIdempotencyKey } from '../../src/attempts/prepare.mjs';
-import { deployment, policy } from './fixture.mjs';
+import { verifyDeploymentAttestation } from '../../src/runtime/vercel.mjs';
+import { candidate, deployment, fetchFixture, policy, signedAttestation } from './fixture.mjs';
 
 const key = 'sk_test_synthetic123';
 const account = { id: policy.stripe.accountId, object: 'account' };
@@ -157,9 +158,14 @@ const owner = Object.freeze({ attemptId: 'attempt-stripe-local',
     runnerLabel: `billing-validation-${'f'.repeat(32)}` }),
   environment: Object.freeze({ database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst',
     branchId: 'validation-branch-1' }),
-  deployment: Object.freeze({ id: 'dpl_candidate123', origin: 'https://candidate.vercel.app' }),
+  deployment,
   stripe: Object.freeze({ accountId: policy.stripe.accountId }) }),
   webhookEndpointId: policy.stripe.webhookEndpointId });
+const ownerCandidate = Object.freeze({ candidateSha: owner.candidateSha, treeSha: 'd'.repeat(40) });
+const ownerAttestation = await verifyDeploymentAttestation({ deployment: owner.environment.deployment,
+  candidate: ownerCandidate, policy,
+  fetchImpl: fetchFixture(signedAttestation({ overrides: { commit: ownerCandidate.candidateSha,
+    treeHash: ownerCandidate.treeSha } })).fetchImpl });
 const operation = 'checkout:create:local-session';
 const action = 'checkout.replay';
 const mutationInput = Object.freeze({ amount: 2500, currency: 'usd',
@@ -221,6 +227,7 @@ function localIntentStore({ currentFence = owner.fence } = {}) {
 
 function stripeIntentInput(attempts, adapter) {
   return { attempts, owner, action, operation, input: mutationInput, idempotencyKey, adapter,
+    deploymentAttestation: ownerAttestation, candidate: ownerCandidate,
     readers: { expectedEnvironment: owner.environment, expectedWebhookEndpointId: policy.stripe.webhookEndpointId,
       async assertReady() { return true; } },
     readerBinding: { attemptId: owner.attemptId, caseId: 'payment.approved',

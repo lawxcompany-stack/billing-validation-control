@@ -7,7 +7,7 @@ const operatorModule = await importIfMissing(() => import('../../src/operator/ru
 const contracts = await importIfMissing(() => import('../../src/billing/contracts.mjs'));
 const runCollect = (...args) => needExport(operatorModule, 'runCollect')(...args);
 
-const candidateSha = 'f'.repeat(40);
+const candidateSha = 'a'.repeat(40);
 
 function makeControlContext() {
   const parts = makeAttemptParts();
@@ -179,7 +179,8 @@ test('scenario preparation failure is sanitized and closes all operator resource
 
 test('operator collection refuses a Task 5 owner missing its candidate SHA binding', async () => {
   const parts = makeAttemptParts();
-  const controlContext = needExport(contracts, 'createVerifiedContext')(parts);
+  const admitted = needExport(contracts, 'createVerifiedContext')(parts);
+  const controlContext = { ...admitted, owner: { ...admitted.owner, candidateSha: undefined } };
   const { chromium, calls } = mockedChromium();
 
   await assert.rejects(runCollect({ chromium, candidateSha, controlContext,

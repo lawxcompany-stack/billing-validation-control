@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { BILLING_43_IDS } from '../contracts/billing-43.mjs';
 import { validArtifact, validResourceIds, validWorkflow, verifyRecheckSnapshot } from '../contracts/attempt.mjs';
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { providerIdempotencyKey, RETENTION_QUOTA_KEYS, validateRetentionConfiguration } from './prepare.mjs';
@@ -15,6 +16,9 @@ const transitions = {
   rechecking: new Set(['complete', 'cancelled', 'timed_out']),
 };
 const activeFixtureMutationTransactions = new WeakSet();
+const BILLING_CASE_SET = new Set(BILLING_43_IDS);
+const FIXTURE_KINDS = new Set(['catalog', 'billing_identity']);
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export function isActiveFixtureMutationTransaction(value) {
   return value !== null && typeof value === 'object' && activeFixtureMutationTransactions.has(value);
@@ -679,10 +683,13 @@ export function createAttemptStore(adapter) {
       });
     },
     async fixtureMutationWithReservation(request, mutation) {
-      const fields = exactDataRecord(request, ['attemptId', 'fence', 'reservationId', 'rows']);
+      const fields = exactDataRecord(request, ['attemptId', 'fence', 'reservationId', 'rows',
+        'caseId', 'namespaceId', 'fixtureId', 'kind']);
       const requested = exactDataRecord(fields?.rows, ['databaseRows']);
       if (!fields || !safeId(fields.attemptId) || typeof fields.fence !== 'string' ||
           !/^[0-9a-f-]{36}$/i.test(fields.fence) || !safeId(fields.reservationId) ||
+          !BILLING_CASE_SET.has(fields.caseId) || !UUID_V4.test(fields.namespaceId ?? '') ||
+          !UUID_V4.test(fields.fixtureId ?? '') || !FIXTURE_KINDS.has(fields.kind) ||
           !requested || !Number.isSafeInteger(requested.databaseRows) || requested.databaseRows < 1 ||
           typeof mutation !== 'function') refuse('fixture_mutation_invalid');
 
@@ -695,6 +702,7 @@ export function createAttemptStore(adapter) {
             typeof tx.getRetentionReceipt !== 'function' ||
             typeof tx.setRetentionFixtureRowsUsed !== 'function' ||
             typeof tx.fixtureMutation !== 'function') refuse('retention_store_unavailable');
+        if (typeof tx.claimFixtureCase !== 'function') refuse('fixture_claim_store_unavailable');
         await tx.lockResourceLocks(row.environment);
         const lease = await tx.getLease(row.key);
         const now = await tx.now();
@@ -718,6 +726,10 @@ export function createAttemptStore(adapter) {
         if (!Number.isSafeInteger(nextUsedRows) || nextUsedRows > projection.databaseRows) {
           refuse('fixture_reservation_insufficient');
         }
+        await tx.claimFixtureCase({ attemptId: fields.attemptId, caseId: fields.caseId,
+          reservationId: fields.reservationId, fence: fields.fence, candidateSha: row.candidateSha,
+          environment: row.environment, namespaceId: fields.namespaceId, fixtureId: fields.fixtureId,
+          kind: fields.kind });
         await tx.setRetentionFixtureRowsUsed({ reservationId: fields.reservationId,
           attemptId: fields.attemptId, expectedRows: usedRows, usedRows: nextUsedRows });
 

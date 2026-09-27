@@ -1,13 +1,41 @@
 import assert from 'node:assert/strict';
+import { generateKeyPairSync, sign } from 'node:crypto';
+import { verifyDeploymentAttestation } from '../../src/runtime/vercel.mjs';
 
 export const environment = Object.freeze({
   database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst', branchId: 'validation-child-123' }),
-  deployment: Object.freeze({ id: 'dpl_task6preview123', origin: 'https://lawx-task6-preview.vercel.app' }),
+  deployment: Object.freeze({ id: 'dpl_task6preview123', origin: 'https://lawx-abc123def-team.vercel.app' }),
   stripe: Object.freeze({ accountId: 'acct_task6test123' }),
+});
+
+export const candidate = Object.freeze({ candidateSha: 'a'.repeat(40), treeSha: 'b'.repeat(40) });
+const attestationKeys = generateKeyPairSync('ed25519');
+const attestationDocument = {
+  origin: environment.deployment.origin,
+  deploymentId: environment.deployment.id,
+  commit: candidate.candidateSha,
+  treeHash: candidate.treeSha,
+  env: 'billing-validation',
+  projectRef: environment.database.projectRef,
+  timestamp: new Date().toISOString(),
+};
+const signedAttestationDocument = { ...attestationDocument,
+  signature: sign(null, Buffer.from(JSON.stringify(attestationDocument)), attestationKeys.privateKey).toString('base64') };
+export const deploymentAttestation = await verifyDeploymentAttestation({
+  deployment: environment.deployment,
+  candidate,
+  policy: { database: { projectRef: environment.database.projectRef }, attestation: {
+    publicKeyPem: attestationKeys.publicKey.export({ type: 'spki', format: 'pem' }),
+  } },
+  fetchImpl: async () => new Response(JSON.stringify(signedAttestationDocument), {
+    status: 200, headers: { 'Content-Type': 'application/json' },
+  }),
 });
 
 export const preflight = Object.freeze({
   expectedEnvironment: environment,
+  candidate,
+  deploymentAttestation,
   providerVerification: Object.freeze({
     supabase: Object.freeze({ projectRef: environment.database.projectRef,
       parentProjectRef: 'zyxwvutsrqponmlkjihg', branchId: environment.database.branchId,

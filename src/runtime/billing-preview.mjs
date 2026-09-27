@@ -90,8 +90,9 @@ async function responseWithinLimit(response, { document = false } = {}) {
   } catch { return false; }
 }
 
-function boundedUi(page, isClosed) {
+function boundedUi(page, isClosed, assertUsable) {
   function getByRole(role, options) {
+    assertUsable();
     if (isClosed() || !UI_ROLES.has(role) || !exactKeys(options, ['name']) ||
         typeof options.name !== 'string' || options.name.trim().length === 0 ||
         options.name.length > 128 || /[\r\n\0]/u.test(options.name)) refuse('preview_interaction_invalid');
@@ -99,6 +100,7 @@ function boundedUi(page, isClosed) {
     try { locator = page.getByRole(role, { name: options.name, exact: true }); }
     catch { refuse('preview_interaction_unavailable'); }
     async function unique() {
+      assertUsable();
       if (isClosed() || typeof locator?.count !== 'function') refuse('preview_interaction_unavailable');
       let count;
       try { count = await locator.count(); } catch { refuse('preview_interaction_unavailable'); }
@@ -107,6 +109,7 @@ function boundedUi(page, isClosed) {
     }
     async function invoke(method, ...args) {
       const target = await unique();
+      assertUsable();
       if (typeof target[method] !== 'function') refuse('preview_interaction_unavailable');
       try { await target[method](...args, { timeout: TIMEOUT_MS }); }
       catch { refuse('preview_interaction_failed'); }
@@ -114,7 +117,9 @@ function boundedUi(page, isClosed) {
     }
     const handle = {
       async isVisible() {
+        assertUsable();
         const target = await unique();
+        assertUsable();
         try { return await target.isVisible(); } catch { refuse('preview_interaction_failed'); }
       },
       click() { return invoke('click'); },
@@ -148,25 +153,53 @@ function boundedUi(page, isClosed) {
  * catalogs must be added by a later reviewed scenario contract, never by input.
  */
 export async function createBillingPreviewBrowser(input = {}) {
-  const validInputKeys = exactKeys(input, ['deployment', 'candidate', 'chromium']) ||
-    exactKeys(input, ['deployment', 'candidate', 'deploymentAttestation', 'chromium']);
+  const validInputKeys = exactKeys(input, ['deployment', 'candidate', 'deploymentAttestation',
+    'attempts', 'owner', 'chromium']);
   if (!validInputKeys ||
       !validDeployment(input.deployment) ||
+      !record(input.owner) || typeof input.owner.attemptId !== 'string' ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(input.owner.attemptId) ||
+      typeof input.owner.fence !== 'string' || input.owner.fence.length < 2 ||
+      typeof input.owner.candidateSha !== 'string' || !/^[a-f0-9]{40}$/u.test(input.owner.candidateSha) ||
+      typeof input.attempts?.assertFence !== 'function' ||
       !record(input.chromium) || typeof input.chromium.launch !== 'function') {
     refuse('preview_transport_unavailable');
   }
-  const { deployment, candidate, deploymentAttestation, chromium } = input;
-  if (!isVerifiedDeploymentAttestation(deploymentAttestation, { deployment, candidate })) {
+  const { deployment, candidate, deploymentAttestation, attempts, owner, chromium } = input;
+  const assertDeploymentCurrent = () => {
+    if (candidate?.candidateSha !== owner.candidateSha ||
+        !isVerifiedDeploymentAttestation(deploymentAttestation, { deployment, candidate })) {
+      refuse('preview_deployment_unverified');
+    }
+  };
+  assertDeploymentCurrent();
+  let admitted;
+  try { admitted = await attempts.assertFence({ attemptId: owner.attemptId, fence: owner.fence }); }
+  catch { refuse('preview_deployment_unverified'); }
+  if (admitted?.attemptId !== owner.attemptId || admitted?.fence !== owner.fence ||
+      admitted?.candidateSha !== owner.candidateSha ||
+      admitted?.environment?.deployment?.id !== deployment.id ||
+      admitted?.environment?.deployment?.origin !== deployment.origin ||
+      owner.environment?.deployment?.id !== deployment.id ||
+      owner.environment?.deployment?.origin !== deployment.origin) {
     refuse('preview_deployment_unverified');
   }
+  // The database fence check may take time; freshness must hold at browser launch.
+  assertDeploymentCurrent();
   const origin = deployment.origin;
   let browser;
   let context;
   try {
     browser = await chromium.launch({ headless: true });
+    assertDeploymentCurrent();
     context = await browser.newContext({ acceptDownloads: false, serviceWorkers: 'block',
       javaScriptEnabled: true, ignoreHTTPSErrors: false });
     await context.route('**/*', async (route) => {
+      try { assertDeploymentCurrent(); }
+      catch {
+        try { await route.abort('blockedbyclient'); } catch { /* route already closed */ }
+        return;
+      }
       const request = route.request();
       if (!await requestAllowed(request, origin)) {
         try { await route.abort('blockedbyclient'); } catch { /* route already closed */ }
@@ -175,6 +208,7 @@ export async function createBillingPreviewBrowser(input = {}) {
       let headers;
       try { headers = await request.allHeaders(); }
       catch { refuse('preview_request_blocked'); }
+      assertDeploymentCurrent();
       try { await route.continue({ headers: { ...headers, 'accept-encoding': 'identity' } }); }
       catch { refuse('preview_request_blocked'); }
     });
@@ -198,6 +232,7 @@ export async function createBillingPreviewBrowser(input = {}) {
   }
 
   async function openRoute(routeId) {
+    assertDeploymentCurrent();
     if (closed || typeof routeId !== 'string' || !Object.hasOwn(ROUTES, routeId)) {
       refuse('preview_route_not_allowlisted');
     }
@@ -206,6 +241,7 @@ export async function createBillingPreviewBrowser(input = {}) {
     catch { refuse('preview_transport_unavailable'); }
     pages.add(page);
     try {
+      assertDeploymentCurrent();
       page.setDefaultNavigationTimeout?.(TIMEOUT_MS);
       page.setDefaultTimeout?.(TIMEOUT_MS);
       let responseViolation = false;
@@ -242,13 +278,15 @@ export async function createBillingPreviewBrowser(input = {}) {
         waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS,
       });
       await Promise.all([...pendingResponseChecks]);
+      assertDeploymentCurrent();
       if (responseViolation || !await checkResponse(response, true) ||
           typeof response.status !== 'function' || response.status() < 200 || response.status() >= 300) {
         try { await page.close(); } catch { /* best-effort disposal */ }
         pages.delete(page);
         refuse('preview_response_invalid');
       }
-      const ui = boundedUi(page, () => closed || page.isClosed?.() === true);
+      const ui = boundedUi(page, () => closed || page.isClosed?.() === true,
+        assertDeploymentCurrent);
       return Object.freeze({ routeId, ui });
     } catch (error) {
       try { await page.close(); } catch { /* best-effort disposal */ }

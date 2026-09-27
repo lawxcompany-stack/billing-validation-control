@@ -3,6 +3,7 @@ import { providerIdempotencyKey } from '../attempts/prepare.mjs';
 import { withStripeIntent } from '../attempts/lock.mjs';
 import { immutableVercelOrigin } from '../github/deployments.mjs';
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
+import { isVerifiedDeploymentAttestation } from './vercel.mjs';
 
 const API = 'https://api.stripe.com';
 const TEST_KEY = /^sk_test_[A-Za-z0-9]{8,}$/u;
@@ -571,7 +572,7 @@ export function stripeRequestDigest({ action, operation, input } = {}) {
 }
 
 export async function runStripeMutation({ attempts, owner, action, operation, input, idempotencyKey,
-  adapter, readers, readerBinding } = {}) {
+  adapter, readers, readerBinding, deploymentAttestation, candidate } = {}) {
   if (!attempts || typeof attempts.assertFence !== 'function' ||
       typeof attempts.beginStripeIntent !== 'function' || !owner ||
       typeof owner.attemptId !== 'string' || typeof owner.fence !== 'string' ||
@@ -600,10 +601,16 @@ export async function runStripeMutation({ attempts, owner, action, operation, in
   const current = await attempts.assertFence({ attemptId: owner.attemptId, fence: owner.fence });
   assertCurrentStripeOwner(current, owner);
   return withStripeIntent(attempts, owner, { action, operation, requestDigest, idempotencyKey },
-    (intent) => adapter.mutate({ intentId: intent.intentId, attemptId: intent.attemptId,
-      fence: intent.fence, candidateSha: intent.candidateSha, workflow: intent.workflow,
-      environment: intent.environment, accountId: owner.environment.stripe.accountId, livemode: false,
-      action, operation, requestDigest, idempotencyKey, input: safeInput }));
+    (intent) => {
+      if (candidate?.candidateSha !== owner.candidateSha ||
+          !isVerifiedDeploymentAttestation(deploymentAttestation, {
+            deployment: owner.environment.deployment, candidate,
+          })) refuse('stripe_deployment_unverified');
+      return adapter.mutate({ intentId: intent.intentId, attemptId: intent.attemptId,
+        fence: intent.fence, candidateSha: intent.candidateSha, workflow: intent.workflow,
+        environment: intent.environment, accountId: owner.environment.stripe.accountId, livemode: false,
+        action, operation, requestDigest, idempotencyKey, input: safeInput });
+    });
 }
 
 export async function reconcileStripeIntent({ attempts, owner, intentId, readObservation,

@@ -37,6 +37,13 @@ function input(attemptId = 'attempt-a', candidateSha = shaA, fixtureKey = 'invoi
   }, environment, ttlSeconds: 60, retentionPolicy, projection };
 }
 
+function fixtureRequest(owner, { caseId = 'payment.approved', rows = 1, suffix = '1' } = {}) {
+  const uuid = (number) => `00000000-0000-4000-8000-${String(number).padStart(12, '0')}`;
+  return { attemptId: owner.attemptId, fence: owner.fence, reservationId: owner.reservationId,
+    rows: { databaseRows: rows }, caseId, namespaceId: uuid(Number(suffix)),
+    fixtureId: uuid(100 + Number(suffix)), kind: 'catalog' };
+}
+
 function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true,
   trustedProviderReconciler = true } = {}) {
   const attempts = new Map();
@@ -47,6 +54,8 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
   const stripeIntents = new Map();
   const stripeReceipts = new Map();
   const cleanupReceipts = new Map();
+  const fixtureCaseClaims = new Map();
+  const fixtureResourceClaims = new Map();
   let clock = 1000;
   let recovery = { runTerminal: true, runnerRemoved: true, cleanupComplete: true };
   let cleanupVerified = true;
@@ -61,7 +70,9 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
   const snapshot = () => ({ attempts: structuredClone(attempts), leases: structuredClone(leases),
     reservations: structuredClone(reservations), receipts: structuredClone(receipts),
     resourceLocks: structuredClone(resourceLocks), stripeIntents: structuredClone(stripeIntents),
-    stripeReceipts: structuredClone(stripeReceipts), cleanupReceipts: structuredClone(cleanupReceipts) });
+    stripeReceipts: structuredClone(stripeReceipts), cleanupReceipts: structuredClone(cleanupReceipts),
+    fixtureCaseClaims: structuredClone(fixtureCaseClaims),
+    fixtureResourceClaims: structuredClone(fixtureResourceClaims) });
   const sameScope = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const resourceKeys = (value) => [
     { resourceType: 'supabase_branch', resourceId: `${value.database.projectRef}:${value.database.branchId}` },
@@ -75,7 +86,7 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
   };
   return {
     attempts, leases, reservations, receipts, resourceLocks, stripeIntents, stripeReceipts,
-    cleanupReceipts, cleanupSteps,
+    cleanupReceipts, fixtureCaseClaims, fixtureResourceClaims, cleanupSteps,
     recoveryInputs,
     advance: (seconds) => { clock += seconds; },
     transactionCount: () => transactionCount,
@@ -226,12 +237,29 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
           }
           receipts.set(row.reservationId, structuredClone(row));
         },
+        async claimFixtureCase(claim) {
+          const caseKey = `${claim.attemptId}:${claim.caseId}`;
+          const binding = { attemptId: claim.attemptId, caseId: claim.caseId,
+            reservationId: claim.reservationId, fence: claim.fence, candidateSha: claim.candidateSha,
+            environment: structuredClone(claim.environment), namespaceId: claim.namespaceId };
+          const existing = fixtureCaseClaims.get(caseKey);
+          if (existing && JSON.stringify(existing) !== JSON.stringify(binding)) {
+            throw Object.assign(new Error('fixture_case_duplicate'), { code: 'fixture_case_duplicate' });
+          }
+          if (!existing) fixtureCaseClaims.set(caseKey, binding);
+          const resourceKey = `${caseKey}:${claim.kind}`;
+          if (fixtureResourceClaims.has(resourceKey)) {
+            throw Object.assign(new Error('fixture_case_duplicate'), { code: 'fixture_case_duplicate' });
+          }
+          fixtureResourceClaims.set(resourceKey, { ...binding, kind: claim.kind, fixtureId: claim.fixtureId });
+        },
         fixtureMutation: async (f) => f(),
       };
       try { return await fn(tx); }
       catch (error) {
         attempts.clear(); leases.clear(); reservations.clear(); receipts.clear();
         resourceLocks.clear(); stripeIntents.clear(); stripeReceipts.clear(); cleanupReceipts.clear();
+        fixtureCaseClaims.clear(); fixtureResourceClaims.clear();
         for (const [k, v] of before.attempts) attempts.set(k, v);
         for (const [k, v] of before.leases) leases.set(k, v);
         for (const [k, v] of before.reservations) reservations.set(k, v);
@@ -240,6 +268,8 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
         for (const [k, v] of before.stripeIntents) stripeIntents.set(k, v);
         for (const [k, v] of before.stripeReceipts) stripeReceipts.set(k, v);
         for (const [k, v] of before.cleanupReceipts) cleanupReceipts.set(k, v);
+        for (const [k, v] of before.fixtureCaseClaims) fixtureCaseClaims.set(k, v);
+        for (const [k, v] of before.fixtureResourceClaims) fixtureResourceClaims.set(k, v);
         throw error;
       } finally { unlock(); }
     },
@@ -258,9 +288,8 @@ test('fixture reservation claims are serialized, persisted before the writer, an
   const adapter = fakeAdapter();
   const store = createAttemptStore(adapter);
   const owner = await prepareAttempt(store, { ...input(),
-    projection: { ...projection, databaseRows: 1 } });
-  const request = { attemptId: owner.attemptId, fence: owner.fence,
-    reservationId: owner.reservationId, rows: { databaseRows: 1 } };
+    projection: { ...projection, databaseRows: 2 } });
+  const request = fixtureRequest(owner);
   let writerCalls = 0;
 
   await assert.rejects(store.fixtureMutationWithReservation(request, async (transaction) => {
@@ -270,7 +299,7 @@ test('fixture reservation claims are serialized, persisted before the writer, an
     assert.equal(transaction.reservationValidated, true);
     assert.equal(transaction.reservationStatus, 'active');
     assert.equal(transaction.reservationSettled, false);
-    assert.equal(transaction.remainingDatabaseRows, 1);
+    assert.equal(transaction.remainingDatabaseRows, 2);
     throw new Error('ambiguous remote writer outcome');
   }), /ambiguous remote writer outcome/u);
 
@@ -279,7 +308,7 @@ test('fixture reservation claims are serialized, persisted before the writer, an
     writerCalls++;
   })]);
   assert.equal(retry[0].status, 'rejected');
-  assert.equal(retry[0].reason.code, 'fixture_reservation_insufficient');
+  assert.equal(retry[0].reason.code, 'fixture_case_duplicate');
   assert.equal(writerCalls, 1);
 });
 
@@ -315,9 +344,9 @@ test('fixture reservation validation refuses missing, settled, divergent, insuff
       projection: { ...projection, databaseRows: 1 } });
     scenario.prepare?.(adapter, owner);
     let writerCalls = 0;
-    await assert.rejects(store.fixtureMutationWithReservation({ attemptId: owner.attemptId,
-      fence: owner.fence, reservationId: owner.reservationId,
-      rows: scenario.rows ?? { databaseRows: 1 } }, async () => { writerCalls++; }),
+    await assert.rejects(store.fixtureMutationWithReservation(fixtureRequest(owner, {
+      rows: scenario.rows?.databaseRows ?? 1,
+    }), async () => { writerCalls++; }),
     { code: scenario.code }, scenario.name);
     assert.equal(writerCalls, 0, scenario.name);
   }
@@ -328,11 +357,12 @@ test('concurrent fixture reservation claims cannot exceed the persisted row allo
   const store = createAttemptStore(adapter);
   const owner = await prepareAttempt(store, { ...input(),
     projection: { ...projection, databaseRows: 1 } });
-  const request = { attemptId: owner.attemptId, fence: owner.fence,
-    reservationId: owner.reservationId, rows: { databaseRows: 1 } };
   let writerCalls = 0;
 
-  const results = await Promise.allSettled([1, 2].map(() => store.fixtureMutationWithReservation(request,
+  const results = await Promise.allSettled([
+    fixtureRequest(owner, { caseId: 'payment.approved', suffix: '1' }),
+    fixtureRequest(owner, { caseId: 'payment.declined', suffix: '2' }),
+  ].map((request) => store.fixtureMutationWithReservation(request,
     async () => { writerCalls++; return true; })));
 
   assert.equal(results.filter(({ status }) => status === 'fulfilled').length, 1);

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { verifyDeploymentAttestation } from '../../src/runtime/vercel.mjs';
+import { isVerifiedDeploymentAttestation, verifyDeploymentAttestation } from '../../src/runtime/vercel.mjs';
 import { candidate, deployment, fetchFixture, policy, signedAttestation } from './fixture.mjs';
 
 test('fetches identity only from immutable deployment origin with redirects, cache, and credentials disabled', async () => {
@@ -72,6 +72,24 @@ test('accepts inclusive maximum-age and future-skew timestamp boundaries', async
       fetchImpl: fetchFixture(signedAttestation({ timestamp: new Date(now + delta).toISOString() })).fetchImpl,
     });
   }
+});
+
+test('a verified deployment capability stops authorizing use after the five-minute freshness window', async () => {
+  const verifiedAt = Date.parse('2026-09-23T12:00:00.000Z');
+  const capability = await verifyDeploymentAttestation({
+    deployment,
+    candidate,
+    policy,
+    now: () => verifiedAt,
+    fetchImpl: fetchFixture(signedAttestation({ timestamp: new Date(verifiedAt).toISOString() })).fetchImpl,
+  });
+
+  assert.equal(isVerifiedDeploymentAttestation(capability, { deployment, candidate,
+    now: () => verifiedAt }), true);
+  assert.equal(isVerifiedDeploymentAttestation(capability, { deployment, candidate,
+    now: () => verifiedAt + 300_000 }), true);
+  assert.equal(isVerifiedDeploymentAttestation(capability, { deployment, candidate,
+    now: () => verifiedAt + 300_001 }), false);
 });
 
 test('rejects expired, future, and malformed timestamps', async () => {

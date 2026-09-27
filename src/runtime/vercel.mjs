@@ -104,13 +104,19 @@ function verifyTimestamp(value, now) {
   const currentTime = typeof now === 'function' ? now() : Date.now();
   if (!Number.isFinite(currentTime) || currentTime - timestamp > MAX_ATTESTATION_AGE_MS ||
       timestamp - currentTime > MAX_FUTURE_SKEW_MS) refuse('attestation_timestamp_invalid');
+  return timestamp;
 }
 
-export function isVerifiedDeploymentAttestation(capability, { deployment, candidate } = {}) {
+export function isVerifiedDeploymentAttestation(capability, { deployment, candidate, now } = {}) {
   const binding = capability !== null && typeof capability === 'object'
     ? VERIFIED_DEPLOYMENT_ATTESTATIONS.get(capability) : null;
-  return Boolean(binding && deployment?.id === binding.deploymentId && deployment?.origin === binding.origin &&
-    candidate?.candidateSha === binding.candidateSha && candidate?.treeSha === binding.treeSha);
+  if (!binding || deployment?.id !== binding.deploymentId || deployment?.origin !== binding.origin ||
+      candidate?.candidateSha !== binding.candidateSha || candidate?.treeSha !== binding.treeSha) return false;
+  let currentTime;
+  try { currentTime = typeof now === 'function' ? now() : Date.now(); }
+  catch { return false; }
+  return Number.isFinite(currentTime) && currentTime - binding.timestamp <= MAX_ATTESTATION_AGE_MS &&
+    binding.timestamp - currentTime <= MAX_FUTURE_SKEW_MS;
 }
 
 export async function verifyDeploymentAttestation(options = {}) {
@@ -163,12 +169,12 @@ export async function verifyDeploymentAttestation(options = {}) {
       document.origin !== origin || document.commit !== candidate.candidateSha ||
       document.treeHash !== candidate.treeSha || document.env !== 'billing-validation' ||
       document.projectRef !== policy.database.projectRef) refuse('attestation_identity_mismatch');
-  verifyTimestamp(document.timestamp, now);
+  const timestamp = verifyTimestamp(document.timestamp, now);
 
   const identity = {};
   for (const field of RESPONSE_FIELDS) identity[field] = document[field];
   const capability = Object.freeze(identity);
   VERIFIED_DEPLOYMENT_ATTESTATIONS.set(capability, Object.freeze({ deploymentId: document.deploymentId,
-    origin: document.origin, candidateSha: candidate.candidateSha, treeSha: candidate.treeSha }));
+    origin: document.origin, candidateSha: candidate.candidateSha, treeSha: candidate.treeSha, timestamp }));
   return capability;
 }

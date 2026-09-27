@@ -397,6 +397,36 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
           refuse('fixture_reservation_insufficient');
         }
       },
+      async claimFixtureCase(claim) {
+        const values = [claim.attemptId, claim.caseId, claim.reservationId, claim.fence,
+          claim.candidateSha, claim.namespaceId, claim.environment.database.projectRef,
+          claim.environment.database.branchId, claim.environment.deployment.id,
+          claim.environment.deployment.origin, claim.environment.stripe.accountId];
+        await queryClient.query(`INSERT INTO billing_validation_control.fixture_case_claims
+          (attempt_id, case_id, reservation_id, owner_fence, candidate_sha, namespace_id,
+           project_ref, branch_id, deployment_id, deployment_origin, stripe_account_id)
+          VALUES ($1,$2,$3,$4::uuid,$5,$6::uuid,$7,$8,$9,$10,$11)
+          ON CONFLICT (attempt_id, case_id) DO NOTHING`, values);
+        const result = await queryClient.query(`SELECT reservation_id, owner_fence, candidate_sha,
+          namespace_id, project_ref, branch_id, deployment_id, deployment_origin, stripe_account_id
+          FROM billing_validation_control.fixture_case_claims
+          WHERE attempt_id = $1 AND case_id = $2 FOR UPDATE`, [claim.attemptId, claim.caseId]);
+        const prior = result.rows?.[0];
+        if (!prior || prior.reservation_id !== claim.reservationId || prior.owner_fence !== claim.fence ||
+            prior.candidate_sha.trim() !== claim.candidateSha || prior.namespace_id !== claim.namespaceId ||
+            prior.project_ref.trim() !== claim.environment.database.projectRef ||
+            prior.branch_id !== claim.environment.database.branchId ||
+            prior.deployment_id !== claim.environment.deployment.id ||
+            prior.deployment_origin !== claim.environment.deployment.origin ||
+            prior.stripe_account_id !== claim.environment.stripe.accountId) {
+          refuse('fixture_case_duplicate');
+        }
+        const fixture = await queryClient.query(`INSERT INTO billing_validation_control.fixture_resource_claims
+          (attempt_id, case_id, kind, fixture_id)
+          VALUES ($1,$2,$3,$4::uuid) ON CONFLICT (attempt_id, case_id, kind) DO NOTHING`,
+        [claim.attemptId, claim.caseId, claim.kind, claim.fixtureId]);
+        if (fixture.rowCount !== 1) refuse('fixture_case_duplicate');
+      },
       async getRetentionReceipt(reservationId) {
         const result = await queryClient.query(`SELECT receipt_id, reservation_id, attempt_id, project_ref,
           branch_id, stripe_account_id, outcome, retained_usage,

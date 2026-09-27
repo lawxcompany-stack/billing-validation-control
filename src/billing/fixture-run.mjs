@@ -117,7 +117,8 @@ export function createAttemptFixtureRun({ context, publisher, readers, startedAt
       try {
         receipt = await context.attempts.fixtureMutationWithReservation({ attemptId: owner.attemptId,
           fence: owner.fence, reservationId: owner.reservationId,
-          rows: Object.freeze({ databaseRows: 1 }) }, async (transaction) => {
+          rows: Object.freeze({ databaseRows: 1 }), caseId, namespaceId, fixtureId, kind: input.kind },
+        async (transaction) => {
           if (!record(transaction) || transaction.attemptId !== owner.attemptId ||
               !isActiveFixtureMutationTransaction(transaction) ||
               transaction.fence !== owner.fence || transaction.reservationId !== owner.reservationId ||
@@ -131,7 +132,8 @@ export function createAttemptFixtureRun({ context, publisher, readers, startedAt
       } catch (error) {
         if (['lease_fence_lost', 'lease_expired', 'fixture_reservation_insufficient',
           'fixture_reservation_invalid', 'retention_reservation_missing', 'retention_attempt_settled',
-          'recovery_read_only', 'fixture_transaction_unavailable', 'fixture_mutation_ambiguous'].includes(error?.code)) {
+          'recovery_read_only', 'fixture_transaction_unavailable', 'fixture_claim_store_unavailable',
+          'fixture_case_duplicate', 'fixture_mutation_ambiguous'].includes(error?.code)) {
           refuse(error.code);
         }
         refuse('fixture_mutation_ambiguous');

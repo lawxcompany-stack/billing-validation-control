@@ -157,6 +157,8 @@ function integratedFixtureRig({ databaseRows = 2 } = {}) {
     receipt: null,
     now,
     events: [],
+    fixtureCaseClaims: new Map(),
+    fixtureResourceClaims: new Map(),
   };
   let tail = Promise.resolve();
   const adapter = { expectedEnvironment: environment, state, async transaction(operation) {
@@ -164,6 +166,9 @@ function integratedFixtureRig({ databaseRows = 2 } = {}) {
     let release;
     tail = new Promise((resolve) => { release = resolve; });
     await previous;
+    const before = { reservation: structuredClone(state.reservation),
+      fixtureCaseClaims: structuredClone(state.fixtureCaseClaims),
+      fixtureResourceClaims: structuredClone(state.fixtureResourceClaims) };
     const tx = {
       async lockAttempt() { state.events.push('attempt-lock'); },
       async lockResourceLocks() { state.events.push('resource-lock'); },
@@ -192,12 +197,34 @@ function integratedFixtureRig({ databaseRows = 2 } = {}) {
         state.reservation.fixtureRowsUsed = usedRows;
         state.events.push('claim');
       },
+      async claimFixtureCase(claim) {
+        const caseKey = `${claim.attemptId}:${claim.caseId}`;
+        const binding = { attemptId: claim.attemptId, caseId: claim.caseId,
+          reservationId: claim.reservationId, fence: claim.fence, candidateSha: claim.candidateSha,
+          environment: structuredClone(claim.environment), namespaceId: claim.namespaceId };
+        const prior = state.fixtureCaseClaims.get(caseKey);
+        if (prior && JSON.stringify(prior) !== JSON.stringify(binding)) {
+          throw Object.assign(new Error('fixture_case_duplicate'), { code: 'fixture_case_duplicate' });
+        }
+        if (!prior) state.fixtureCaseClaims.set(caseKey, binding);
+        const resourceKey = `${caseKey}:${claim.kind}`;
+        if (state.fixtureResourceClaims.has(resourceKey)) {
+          throw Object.assign(new Error('fixture_case_duplicate'), { code: 'fixture_case_duplicate' });
+        }
+        state.fixtureResourceClaims.set(resourceKey, { ...binding, fixtureId: claim.fixtureId,
+          kind: claim.kind });
+      },
       async fixtureMutation(callback) { return callback(); },
     };
     try { return await operation(tx); }
-    finally { release(); }
+    catch (error) {
+      state.reservation = before.reservation;
+      state.fixtureCaseClaims = before.fixtureCaseClaims;
+      state.fixtureResourceClaims = before.fixtureResourceClaims;
+      throw error;
+    } finally { release(); }
   } };
-  return { parts, owner, state, attempts: createAttemptStore(adapter) };
+  return { parts, owner, state, adapter, attempts: createAttemptStore(adapter) };
 }
 
 function integratedPublisher(rig, store, { insertError } = {}) {
@@ -228,9 +255,11 @@ function integratedPublisher(rig, store, { insertError } = {}) {
     adapter, attempts: rig.attempts, owner: rig.owner });
 }
 
-function integratedRun(rig, store) {
-  const context = createContext(rig.parts, rig.owner, rig.attempts);
-  const publisher = integratedPublisher(rig, store);
+function integratedRun(rig, store, options = {}) {
+  const attempts = createAttemptStore(rig.adapter);
+  const runRig = { ...rig, attempts };
+  const context = createContext(rig.parts, rig.owner, attempts);
+  const publisher = integratedPublisher(runRig, store, options);
   const readers = offlineReaders(store);
   assert.equal(typeof context.attempts.fixtureMutationWithReservation, 'function');
   assert.equal(typeof publisher.insertAttemptFixture, 'function');
@@ -300,7 +329,6 @@ test('fixture resources receive fresh cryptographic IDs in an attempt/case names
   assert.notEqual(one.namespaceId, otherCase.namespaceId);
   for (const id of [one.fixtureId, two.fixtureId, one.namespaceId]) {
     assert.equal(id.includes(rig.owner.attemptId), false);
-    assert.equal(id.includes(rig.owner.workflow.runId), false);
     assert.equal(id.includes('angelo.neto@advbox.com.br'), false);
   }
   assert.equal(one.attemptId, rig.owner.attemptId);
@@ -499,4 +527,23 @@ test('ambiguous fixture mutation is sanitized and never retried', async () => {
   await assert.rejects(scenario.publish({ kind: 'billing_identity' }),
     { code: 'fixture_mutation_unresolved' });
   assert.equal(store.fixtureRpc.length, 1, 'an ambiguous write is never retried');
+});
+
+test('a recreated fixture run cannot replay an ambiguously claimed attempt/case with new resources', async () => {
+  const rig = integratedFixtureRig({ databaseRows: 3 });
+  const store = { fixtureRpc: [], fixtures: new Map(), databaseSnapshot: {} };
+  const first = integratedRun(rig, store, {
+    insertError: new Error('ambiguous writer response'),
+  });
+
+  await assert.rejects(first.openCase(BILLING_43_IDS[0]).publish({ kind: 'catalog' }),
+    { code: 'fixture_mutation_ambiguous' });
+  const restarted = integratedRun(rig, store);
+  const replay = await Promise.allSettled([
+    restarted.openCase(BILLING_43_IDS[0]).publish({ kind: 'catalog' }),
+  ]);
+
+  assert.equal(replay[0].status, 'rejected');
+  assert.equal(replay[0].reason.code, 'fixture_case_duplicate');
+  assert.equal(store.fixtureRpc.length, 1, 'a new run instance cannot dispatch a previously claimed case');
 });

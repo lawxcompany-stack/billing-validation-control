@@ -1,6 +1,7 @@
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { providerIdempotencyKey } from '../attempts/prepare.mjs';
 import { runStripeMutation, stripeRequestDigest } from '../runtime/stripe.mjs';
+import { isVerifiedDeploymentAttestation } from '../runtime/vercel.mjs';
 
 export class BillingControlRefusal extends Error {
   constructor(code) { super(code); this.name = 'BillingControlRefusal'; this.code = code; }
@@ -36,6 +37,16 @@ function exactVerifiedEnvironment(preflight) {
     stripe.webhookUrl === `${expected.deployment.origin}/api/stripe/webhook`;
 }
 
+function hasCurrentDeploymentAttestation(preflight, candidateSha) {
+  const candidate = preflight?.candidate;
+  return typeof candidateSha === 'string' && /^[0-9a-f]{40}$/u.test(candidateSha) &&
+    candidate?.candidateSha === candidateSha &&
+    isVerifiedDeploymentAttestation(preflight?.deploymentAttestation, {
+      deployment: preflight?.expectedEnvironment?.deployment,
+      candidate,
+    });
+}
+
 function validReaderBinding(binding, attemptId) {
   return binding && binding.attemptId === attemptId &&
     typeof binding.caseId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(binding.caseId) &&
@@ -47,6 +58,7 @@ export function createVerifiedContext({ attempts, owner, preflight, mutationAdap
       typeof owner?.attemptId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(owner.attemptId) ||
       typeof owner.fence !== 'string' || owner.fence.length < 2 ||
       !exactVerifiedEnvironment(preflight) ||
+      !hasCurrentDeploymentAttestation(preflight, owner.candidateSha) ||
       canonical(owner.environment) !== canonical(preflight.expectedEnvironment) ||
       canonical(readers?.expectedEnvironment) !== canonical(preflight.expectedEnvironment) ||
       readers?.expectedWebhookEndpointId !== preflight.providerVerification.stripe.webhookEndpointId ||
@@ -81,6 +93,10 @@ export async function assertCurrentAttempt(context) {
   if (canonical(current.environment) !== canonical(preflight.expectedEnvironment)) {
     refuse('billing_environment_unverified');
   }
+  if (current.candidateSha !== owner.candidateSha ||
+      !hasCurrentDeploymentAttestation(preflight, owner.candidateSha)) {
+    refuse('billing_environment_unverified');
+  }
   return current;
 }
 
@@ -110,18 +126,27 @@ export async function mutateProvider(context, { provider = 'stripe', action, ope
 
   try {
     if (provider === 'stripe') {
+      if (!hasCurrentDeploymentAttestation(context.preflight, owner.candidateSha)) {
+        refuse('billing_environment_unverified');
+      }
       const stripeOwner = { attemptId: owner.attemptId, fence: owner.fence,
         candidateSha: current.candidateSha, workflow: current.workflow,
         environment: current.environment,
         webhookEndpointId: context.preflight.providerVerification.stripe.webhookEndpointId };
       const result = await runStripeMutation({ attempts, owner: stripeOwner, action, operation,
         input, idempotencyKey, adapter: context.mutationAdapter, readers: context.readers,
-        readerBinding: context.readerBinding });
+        readerBinding: context.readerBinding, deploymentAttestation: context.preflight.deploymentAttestation,
+        candidate: context.preflight.candidate });
       return Object.freeze({ operation, idempotencyKey, dispatched: true,
         intentId: result.intentId, requestDigest: result.requestDigest, state: result.state });
     }
     await attempts.fixtureMutation({ attemptId: owner.attemptId, fence: owner.fence },
-      (tx) => context.mutationAdapter.mutateInTransaction(request, tx));
+      (tx) => {
+        if (!hasCurrentDeploymentAttestation(context.preflight, owner.candidateSha)) {
+          refuse('billing_environment_unverified');
+        }
+        return context.mutationAdapter.mutateInTransaction(request, tx);
+      });
   } catch (error) {
     if (['lease_fence_lost', 'lease_expired'].includes(error?.code) ||
         (provider === 'stripe' && ['stripe_mutation_ambiguous', 'stripe_intent_unresolved',

@@ -22,7 +22,7 @@ function enableLocalStripeIntents(h) {
 
 function pinLocalStripeIdentity(h) {
   const priorAssertFence = h.attempts.assertFence;
-  const identity = { candidateSha: 'd'.repeat(40), workflow: {
+  const identity = { candidateSha: h.owner.candidateSha, workflow: {
     repository: 'lawxcompany-stack/billing-validation-control', ref: 'refs/heads/main',
     runId: '987654321', runAttempt: 3, runnerLabel: `billing-validation-${'e'.repeat(32)}` } };
   h.attempts.assertFence = async (request) => ({ ...await priorAssertFence(request), ...identity });
@@ -61,6 +61,79 @@ test('provider mutations bind the current fence, exact child and TEST identity, 
   assert.match(request.idempotencyKey, /^billing-validation-[0-9a-f]{64}$/);
   assert.equal(h.calls.assertions.length, 2);
   assert.equal(JSON.stringify(request).includes('sk_test_private_output'), false);
+});
+
+test('verified context requires verifier-issued deployment identity bound to the admitted candidate', () => {
+  const create = needExport(contracts, 'createVerifiedContext');
+  const h = makeAttemptParts();
+  const variants = [
+    { ...h, preflight: { ...h.preflight,
+      deploymentAttestation: { ...h.preflight.deploymentAttestation } } },
+    { ...h, preflight: { ...h.preflight, deploymentAttestation: undefined } },
+    { ...h, preflight: { ...h.preflight,
+      candidate: { ...h.preflight.candidate, treeSha: 'c'.repeat(40) } } },
+    { ...h, owner: { ...h.owner, candidateSha: 'c'.repeat(40) } },
+  ];
+
+  const refusals = variants.map((variant) => {
+    try { create(variant); return null; }
+    catch (error) { return error.code; }
+  });
+
+  assert.deepEqual(refusals, Array(variants.length).fill('billing_environment_unverified'));
+  assert.doesNotThrow(() => create(h));
+});
+
+test('verified context refuses a verifier-issued capability once its signed timestamp is stale', () => {
+  const create = needExport(contracts, 'createVerifiedContext');
+  const h = makeAttemptParts();
+  const originalNow = Date.now;
+  Date.now = () => Date.parse(h.preflight.deploymentAttestation.timestamp) + 300_001;
+  try {
+    assert.throws(() => create(h), { code: 'billing_environment_unverified' });
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test('provider mutation refuses when the admitted attempt candidate no longer matches its attestation', async () => {
+  const create = needExport(contracts, 'createVerifiedContext');
+  const mutate = needExport(contracts, 'mutateProvider');
+  const h = makeAttemptParts();
+  const context = create(h);
+  h.attempts.assertFence = async () => ({ ...h.owner, candidateSha: 'c'.repeat(40) });
+
+  await expectRefusal(mutate(context, { provider: 'stripe', action: 'checkout.replay',
+    operation: 'checkout-replay:candidate-drift', input: {} }), 'billing_environment_unverified');
+
+  assert.equal(h.calls.intentBegins.length, 0);
+  assert.equal(h.calls.mutations.length, 0);
+});
+
+test('Stripe dispatch rechecks attestation freshness after persisting its intent', async () => {
+  const create = needExport(contracts, 'createVerifiedContext');
+  const mutate = needExport(contracts, 'mutateProvider');
+  const h = makeAttemptParts();
+  const timestamp = Date.parse(h.preflight.deploymentAttestation.timestamp);
+  const originalNow = Date.now;
+  Date.now = () => timestamp;
+  try {
+    const context = create(h);
+    const begin = h.attempts.beginStripeIntent;
+    h.attempts.beginStripeIntent = async (request) => {
+      const intent = await begin(request);
+      Date.now = () => timestamp + 300_001;
+      return intent;
+    };
+
+    await expectRefusal(mutate(context, { provider: 'stripe', action: 'checkout.replay',
+      operation: 'checkout-replay:stale-at-dispatch', input: {} }), 'stripe_mutation_ambiguous');
+
+    assert.equal(h.calls.intentBegins.length, 1);
+    assert.equal(h.calls.mutations.length, 0);
+  } finally {
+    Date.now = originalNow;
+  }
 });
 
 test('provider mutation checks independent reader readiness before creating a Stripe intent or dispatching', async () => {
@@ -104,7 +177,7 @@ test('Stripe mutation intent binds the immutable SHA, workflow run identity and 
   const mutate = needExport(contracts, 'mutateProvider');
   const h = makeAttemptParts();
   const identity = {
-    candidateSha: 'd'.repeat(40),
+    candidateSha: h.owner.candidateSha,
     workflow: { repository: 'lawxcompany-stack/billing-validation-control',
       ref: 'refs/heads/main', runId: '987654321', runAttempt: 3,
       runnerLabel: `billing-validation-${'e'.repeat(32)}` },

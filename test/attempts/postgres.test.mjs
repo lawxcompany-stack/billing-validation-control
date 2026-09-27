@@ -46,6 +46,8 @@ function recordingClient() {
 
 function fixtureMutationClient({ mode = 'valid' } = {}) {
   const calls = [];
+  const fixtureCaseClaims = new Map();
+  const fixtureResourceClaims = new Set();
   const fence = '11111111-1111-4111-8111-111111111111';
   const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1,
@@ -98,11 +100,37 @@ function fixtureMutationClient({ mode = 'valid' } = {}) {
           outcome: 'completed', retained_usage: { ...projection, databaseRows: 0 },
           created_at_epoch: 950 }] : [] };
       }
+      if (sql.startsWith('INSERT INTO billing_validation_control.fixture_case_claims')) {
+        const [attemptId, caseId, reservationId, ownerFence, candidateSha, namespaceId,
+          projectRef, branchId, deploymentId, deploymentOrigin, stripeAccountId] = values;
+        const key = `${attemptId}:${caseId}`;
+        if (fixtureCaseClaims.has(key)) return { rows: [], rowCount: 0 };
+        fixtureCaseClaims.set(key, { reservation_id: reservationId, owner_fence: ownerFence,
+          candidate_sha: candidateSha, namespace_id: namespaceId, project_ref: projectRef,
+          branch_id: branchId, deployment_id: deploymentId, deployment_origin: deploymentOrigin,
+          stripe_account_id: stripeAccountId });
+        return { rows: [], rowCount: 1 };
+      }
+      if (sql.includes('FROM billing_validation_control.fixture_case_claims')) {
+        return { rows: [fixtureCaseClaims.get(`${values[0]}:${values[1]}`)].filter(Boolean) };
+      }
+      if (sql.startsWith('INSERT INTO billing_validation_control.fixture_resource_claims')) {
+        const key = `${values[0]}:${values[1]}:${values[2]}`;
+        if (fixtureResourceClaims.has(key)) return { rows: [], rowCount: 0 };
+        fixtureResourceClaims.add(key);
+        return { rows: [], rowCount: 1 };
+      }
       if (/SELECT extract\(epoch FROM clock_timestamp\(\)\)/u.test(sql)) return { rows: [{ now: 1000 }] };
       return { rows: [], rowCount: 1 };
     } });
   } };
-  return { client, fence, reservation };
+  return { client, fence, reservation, fixtureCaseClaims, fixtureResourceClaims };
+}
+
+function postgresFixtureRequest(fence, { caseId = 'payment.approved', namespaceId =
+  '00000000-0000-4000-8000-000000000001', fixtureId = '00000000-0000-4000-8000-000000000101' } = {}) {
+  return { attemptId: 'attempt-fixture', fence, reservationId: 'reservation-fixture',
+    rows: { databaseRows: 1 }, caseId, namespaceId, fixtureId, kind: 'catalog' };
 }
 
 function withGetter(source, key, getter) {
@@ -353,7 +381,9 @@ test('schema stores append-only retention reservations and terminal receipts wit
   assert.match(sql, /retained_usage ->> quota_key/);
   assert.match(sql, /REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control\.retention_reservations/);
   assert.match(sql, /REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control\.retention_receipts/);
-  assert.doesNotMatch(sql, /retention_reservations[\s\S]{0,500}expires_at/);
+  const reservationDefinition = sql.match(/CREATE TABLE IF NOT EXISTS billing_validation_control\.retention_reservations\s*\(([\s\S]*?)\n\);/u);
+  assert.ok(reservationDefinition);
+  assert.doesNotMatch(reservationDefinition[1], /expires_at/u);
 });
 
 test('schema persistently accounts fixture rows without mutating append-only reservations', () => {
@@ -538,8 +568,7 @@ test('PostgreSQL fixture reservation claim locks the exact owner and reservation
   const store = createPostgresAttemptStore({ client, preflight, target });
   const events = [];
 
-  const result = await store.fixtureMutationWithReservation({ attemptId: 'attempt-fixture', fence,
-    reservationId: 'reservation-fixture', rows: { databaseRows: 1 } }, async (transaction) => {
+  const result = await store.fixtureMutationWithReservation(postgresFixtureRequest(fence), async (transaction) => {
     events.push('writer');
     assert.equal(transaction.reservationLocked, true);
     assert.equal(transaction.reservationValidated, true);
@@ -562,8 +591,31 @@ test('PostgreSQL fixture reservation claim locks the exact owner and reservation
   const claimWrite = index(/INSERT INTO billing_validation_control\.fixture_reservation_claims/u);
   assert.ok(attemptLock >= 0 && attemptLock < resourceLock && resourceLock < scopeLock &&
     scopeLock < reservationRead && reservationRead < receiptRead && receiptRead < claimWrite);
+  const caseClaimWrite = index(/INSERT INTO billing_validation_control\.fixture_case_claims/u);
+  assert.deepEqual(client.calls[caseClaimWrite].values, ['attempt-fixture', 'payment.approved',
+    'reservation-fixture', fence, 'a'.repeat(40), '00000000-0000-4000-8000-000000000001',
+    database.projectRef, database.branchId, preflight.expectedEnvironment.deployment.id,
+    preflight.expectedEnvironment.deployment.origin, preflight.expectedEnvironment.stripe.accountId]);
   assert.equal(client.calls.filter(({ sql }) => /SET TRANSACTION ISOLATION LEVEL READ COMMITTED/u.test(sql)).length, 1);
   assert.deepEqual(events, ['writer']);
+});
+
+test('PostgreSQL fixture case claims survive store recreation and reject a second namespace before writer dispatch', async () => {
+  const { client, fence, fixtureCaseClaims } = fixtureMutationClient();
+  const firstStore = createPostgresAttemptStore({ client, preflight, target });
+  let writerCalls = 0;
+  await firstStore.fixtureMutationWithReservation(postgresFixtureRequest(fence), async () => {
+    writerCalls++;
+    return 'written';
+  });
+
+  const restartedStore = createPostgresAttemptStore({ client, preflight, target });
+  await assert.rejects(restartedStore.fixtureMutationWithReservation(postgresFixtureRequest(fence, {
+    namespaceId: '00000000-0000-4000-8000-000000000002',
+    fixtureId: '00000000-0000-4000-8000-000000000102',
+  }), async () => { writerCalls++; }), { code: 'fixture_case_duplicate' });
+  assert.equal(writerCalls, 1);
+  assert.equal(fixtureCaseClaims.size, 1);
 });
 
 test('PostgreSQL reservation, settlement, scope, capacity, expiry, and recovery refusals call no writer', async () => {
@@ -581,8 +633,8 @@ test('PostgreSQL reservation, settlement, scope, capacity, expiry, and recovery 
     const { client, fence } = fixtureMutationClient({ mode });
     const store = createPostgresAttemptStore({ client, preflight, target });
     let writerCalls = 0;
-    await assert.rejects(store.fixtureMutationWithReservation({ attemptId: 'attempt-fixture', fence,
-      reservationId: 'reservation-fixture', rows: { databaseRows: 1 } }, async () => { writerCalls++; }),
+    await assert.rejects(store.fixtureMutationWithReservation(postgresFixtureRequest(fence),
+      async () => { writerCalls++; }),
     { code }, mode);
     assert.equal(writerCalls, 0, mode);
     assert.equal(client.calls.some(({ sql }) => /(?:INSERT INTO|UPDATE) billing_validation_control\.fixture_reservation_claims/u.test(sql)), false, mode);
