@@ -117,7 +117,7 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 
 ### Task 4: Attempt-scoped synthetic fixture publisher and readers
 
-**Progress (2026-09-27):** Local implementation and automated acceptance criteria are green. Independent review did not return a verdict; keep the review and local-commit gates open. Signup stays fail-closed without a trusted policy/inbox adapter. Preview response bytes are checked from framing and Playwright request-size metadata after completion; this is not a strict in-flight network/memory cap.
+**Progress (2026-09-27):** Local focused/full suites pass (latest fix round 160/160 and 513/513); independent review and scoped re-review approved the implementation (`24b8e45..1fe5027`). Durable attempt/case claims and verifier-attestation freshness checks are included. Signup remains fail-closed without trusted policy/inbox and safe side-effect handling. Preview response bytes are checked after transfer; this is not a strict in-flight network/memory cap. Remote/real-DB/Preview acceptance remains open.
 
 **Files:**
 - Create: src/billing/fixture-run.mjs
@@ -152,10 +152,12 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - [x] Test independent read-only readers bind every observation to attempt, provider account, validation branch, run window, exact object IDs, Stripe TEST endpoint/event and Supabase webhook inbox/receipt; reader capability/configuration is verified before provider mutation dispatch, while event evidence is read after the flow. Sanitize identity and raw provider payload.
 - [x] Implement injectable offline adapters and fail-closed production adapter interfaces. No remote adapter is invoked by the test suite.
 - [x] Run focused fixture/runtime/observation tests and full npm test.
-- [ ] Obtain independent code-review verdict; the dispatched reviewer did not return before shutdown.
-- [x] Commit Task 4 corrections locally (`efcf841`); no push or PR.
+- [x] Obtain independent code-review verdict and clean scoped re-review (`24b8e45..1fe5027`).
+- [x] Commit Task 4 corrections locally (`efcf841`, `1fe5027`); no push or PR.
 
 ### Task 5: Executable signup, pricing, payment, and zero-total contracts
+
+**Progress (2026-09-27):** Read-only source mapping found that the existing signup harness uses prohibited Auth-admin/caller-signed-cookie/direct-SQL shortcuts and sends CRM/Mailchimp side effects; no safe inbox/finalizer/cleanup adapter exists. Pricing fixtures do not cover progressive/combo/coupon/zero inputs. Paid checkout has no approved independent cleanup/readback path; decline/abandon lack terminal application states, timeout is ambiguous, and two-tab coverage has no concurrency barrier. The current Preview transport allows only `GET /`. Implement only case paths with a fixed reviewed route/action, bounded effects, independent stored/provider oracle, and safe ownership/retention. Every other case must fail closed as blocked and cannot produce a passed result. Do not alter signed cookies, use Auth admin/direct SQL to create identities, call CRM/Mailchimp, or treat HTTP/UI/app output as evidence. The application repository's 45-entry acceptance validator is a separate integration gate; this control suite remains exactly 43.
 
 **Files:**
 - Create: src/billing/scenarios/signup.mjs
@@ -163,17 +165,21 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - Create: src/billing/scenarios/payment.mjs
 - Create: src/billing/scenarios/zero.mjs
 - Modify: src/billing/fixtures.mjs
+- Conditional only: src/runtime/billing-preview.mjs (extend only if a Task 5 case is proven safe; no generic POST/API access)
 - Test: test/billing/scenarios/signup.test.mjs
 - Test: test/billing/scenarios/pricing.test.mjs
 - Test: test/billing/scenarios/payment.test.mjs
 - Test: test/billing/scenarios/zero.test.mjs
 - Modify: package.json
 
-- [ ] For each of the 19 IDs, write red tests proving the exact UI/API transition, allowed provider effects, independent stored-state oracle, negative side-effect assertions, and cleanup ownership; include tampered/expired intent, coupon boundary, two-tab/idempotency and refresh cases.
-- [ ] Implement each case as an explicit registry contract using the shared Preview transport, fenced mutation adapter and independent readers; no scenario may infer a pass from HTTP 2xx, a UI label or an app-supplied value.
+- [ ] For each of the 19 IDs, define an explicit executable-or-blocked disposition. RED tests must prove exact transitions/effects/oracles/negative effects/cleanup for executable paths; blocked paths must refuse before Preview, fixture, CRM/Mailchimp, or provider effects and must never emit `passed`.
+- [ ] Implement contracts only for paths with fixed route/method/action allowlists, attempt/fence and write budgets, a distinct stored/provider-state reader, and ownership/retention rules. Extend transport narrowly from the audited app source only if at least one path passes those gates; otherwise preserve GET `/` as the only document route and prove all blocked cases are refused before transport use. Tests reject arbitrary URL/method/action and cross-origin requests. No scenario infers a pass from HTTP 2xx, a UI label or app-supplied value.
+- [ ] Keep all five signup IDs blocked until a verifier-owned signup policy and non-delivering isolated inbox, suppression of CRM/Mailchimp side effects, and an approved append-only identity/row retention path exist. `signup.expired-intent` and `signup.tampered-intent` must not mutate signed cookies; unit-only parser coverage is not Preview acceptance.
+- [ ] Coupon/progressive/combo/zero-total paths require explicit synthetic catalog values and price snapshots; payment paths require separately verified TEST resources, independent Stripe/database readback, and reversible-resource ownership. Ambiguous decline/abandon/timeout/two-tab semantics remain blocked until exact observable behavior and safe seams are specified.
 - [ ] Test invalid/missing adapters and unsupported endpoint/operation refuse before provider mutation; assert each contract stays within its maxWrites.
+- [ ] Confirm no blocked case can satisfy the canonical 43-result verifier; no local fake/adaptor result is reported as remote acceptance.
 - [ ] Run the four domain test files and full npm test.
-- [ ] Commit as feat(billing): implement signup pricing and payment journeys.
+- [ ] Commit as feat(billing): gate unvalidated signup pricing and payment flows (or implement only the cases that meet every safety/evidence gate).
 
 ### Task 6: Executable subscription, finance, access, and webhook contracts
 
