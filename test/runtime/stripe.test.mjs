@@ -50,8 +50,8 @@ test('binds the exact account, enabled TEST webhook and immutable Preview URL wi
 });
 
 test('exposes no mutation operation and refuses absent, Live, restricted, or malformed keys before requests', async () => {
-  assert.deepEqual(Object.keys(stripeModule).sort(), ['StripeRefusal', 'reconcileStripeIntent',
-    'runStripeMutation', 'stripeRequestDigest', 'verifyStripeEnvironment']);
+  assert.deepEqual(Object.keys(stripeModule).sort(), ['StripeRefusal', 'createStripeBillingReader',
+    'reconcileStripeIntent', 'runStripeMutation', 'stripeRequestDigest', 'verifyStripeEnvironment']);
   for (const badKey of [undefined, 'sk_live_synthetic123', 'rk_test_synthetic123', 'sk_test_', 'sk_test_bad\nheader']) {
     const network = fixture();
     await assert.rejects(verifyStripeEnvironment({ policy, deployment, key: badKey, fetchImpl: network.fetchImpl }), {

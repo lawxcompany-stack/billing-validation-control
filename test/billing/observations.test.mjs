@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { databaseSnapshot, importIfMissing, makeAttemptParts, makeReaders, needExport,
+import { databaseSnapshot, environment, importIfMissing, makeAttemptParts, makeReaders, needExport,
   paidDatabaseSnapshot, paidProviderState, paymentIdentity, startedAt } from './support.mjs';
 
 const contracts = await importIfMissing(() => import('../../src/billing/contracts.mjs'));
 const observations = await importIfMissing(() => import('../../src/billing/observations.mjs'));
+const supabaseRuntime = await importIfMissing(() => import('../../src/runtime/supabase.mjs'));
+const stripeRuntime = await importIfMissing(() => import('../../src/runtime/stripe.mjs'));
 
 test('observation rechecks only injected readers and strips provider secrets and browser fields', async () => {
   const create = needExport(contracts, 'createVerifiedContext');
@@ -31,6 +33,204 @@ test('delayed webhook initial evidence must be the exact trusted observation obj
     caseId: 'payment.approved', identity: paymentIdentity, readers: makeReaders(), startedAt });
   assert.equal(isTrusted(evidence), true);
   assert.equal(isTrusted(structuredClone(evidence)), false);
+});
+
+test('independent readers pin the validation branch, Stripe TEST account and webhook endpoint before dispatch; webhook evidence is read only after effect', async () => {
+  const createReaders = needExport(observations, 'createIndependentBillingReaders');
+  const createSupabaseReader = needExport(supabaseRuntime, 'createSupabaseBillingReader');
+  const createStripeReader = needExport(stripeRuntime, 'createStripeBillingReader');
+  const calls = [];
+  let effectApplied = false;
+  const supabaseIdentity = { projectRef: environment.database.projectRef,
+    branchId: environment.database.branchId, readOnly: true };
+  const stripeIdentity = { accountId: environment.stripe.accountId, webhookEndpointId: 'we_task6endpoint',
+    webhookUrl: `${environment.deployment.origin}/api/stripe/webhook`, livemode: false, readOnly: true };
+  const supabaseReader = createSupabaseReader({ expectedEnvironment: environment, source: {
+    identity: supabaseIdentity,
+    async readIdentity() { calls.push('supabase.identity'); return supabaseIdentity; },
+    async readBillingSnapshot() { return databaseSnapshot(); },
+    async listAttemptFixtures() { return []; },
+    async readSyntheticFixture() { return null; },
+    async readWebhookInbox(query) {
+      calls.push('supabase.inbox');
+      assert.equal(effectApplied, true);
+      assert.equal(query.eventId, 'evt_task4');
+      return { attemptId: query.attemptId, caseId: query.caseId,
+        branchId: environment.database.branchId, eventId: 'evt_task4', objectId: 'in_task4', status: 'processed',
+        secret: 'do-not-return', cookie: 'do-not-return' };
+    },
+    async readWebhookReceipts(query) {
+      calls.push('supabase.receipts');
+      assert.equal(effectApplied, true);
+      assert.equal(query.eventId, 'evt_task4');
+      return [{ id: 'receipt_task4', attemptId: query.attemptId, caseId: query.caseId,
+        branchId: environment.database.branchId, eventId: 'evt_task4', objectId: 'in_task4',
+        status: 'processed', rawBody: 'private' }];
+    },
+  } });
+  const stripeReader = createStripeReader({ expectedEnvironment: environment,
+    expectedWebhookEndpointId: 'we_task6endpoint', source: {
+    identity: stripeIdentity,
+    async readIdentity() { calls.push('stripe.identity'); return stripeIdentity; },
+    async retrieve() { return null; },
+    async retrieveWebhookEndpoint() { calls.push('stripe.endpoint'); return { id: 'we_task6endpoint',
+      url: `${environment.deployment.origin}/api/stripe/webhook`, livemode: false,
+      created: Math.floor(Date.parse(startedAt) / 1000) - 1, enabledEvents: ['invoice.paid'] }; },
+    async listEvents(query) {
+      calls.push('stripe.events');
+      assert.equal(effectApplied, true);
+      assert.equal(query.eventId, 'evt_task4');
+      assert.equal(query.objectId, 'in_task4');
+      return [{ id: 'evt_task4', eventType: 'invoice.paid', livemode: false,
+        created: Math.floor(Date.parse(startedAt) / 1000) + 1,
+        objectId: 'in_task4', payload: 'private event body', client_secret: 'pi_secret_private' }];
+    },
+  } });
+  const readers = createReaders({ expectedEnvironment: environment, expectedWebhookEndpointId: 'we_task6endpoint',
+    supabase: supabaseReader, stripe: stripeReader });
+  const request = { attemptId: 'attempt-task4', caseId: 'payment.approved', startedAt,
+    action: 'checkout.replay', operation: 'task4-reader-gate' };
+  await readers.assertReady(request);
+  calls.push('provider.dispatch');
+  effectApplied = true;
+  assert.deepEqual(calls, ['supabase.identity', 'stripe.identity', 'stripe.endpoint', 'provider.dispatch']);
+  const evidence = await readers.readWebhookEvidence({ attemptId: request.attemptId, caseId: request.caseId,
+    startedAt, eventId: 'evt_task4', objectId: 'in_task4' });
+  assert.deepEqual(calls.slice(4), ['supabase.identity', 'stripe.identity', 'stripe.endpoint',
+    'stripe.events', 'stripe.endpoint', 'supabase.inbox', 'supabase.receipts']);
+  assert.deepEqual(evidence, { eventId: 'evt_task4', eventObserved: true,
+    inboxStatus: 'processed', receiptCount: 1 });
+  assert.equal(JSON.stringify(evidence).includes('private'), false);
+  assert.equal(JSON.stringify(evidence).includes('cookie'), false);
+});
+
+test('missing or mismatched readonly identities refuse readiness before provider dispatch', async () => {
+  const createReaders = needExport(observations, 'createIndependentBillingReaders');
+  const createSupabaseReader = needExport(supabaseRuntime, 'createSupabaseBillingReader');
+  const createStripeReader = needExport(stripeRuntime, 'createStripeBillingReader');
+  const validSupabase = { projectRef: environment.database.projectRef,
+    branchId: environment.database.branchId, readOnly: true };
+  const validStripe = { accountId: environment.stripe.accountId, webhookEndpointId: 'we_task6endpoint',
+    webhookUrl: `${environment.deployment.origin}/api/stripe/webhook`, livemode: false, readOnly: true };
+  for (const mismatch of [
+    { provider: 'supabase', identity: { ...validSupabase, branchId: 'wrong-validation-branch' } },
+    { provider: 'stripe', identity: { ...validStripe, accountId: 'acct_wrong' } },
+    { provider: 'stripe', identity: { ...validStripe, webhookEndpointId: 'we_wrong' } },
+    { provider: 'stripe', identity: { ...validStripe, livemode: true } },
+  ]) {
+    let dispatches = 0;
+    const supabaseReader = createSupabaseReader({ expectedEnvironment: environment,
+      source: { identity: validSupabase, async readIdentity() {
+        return mismatch.provider === 'supabase' ? mismatch.identity : validSupabase;
+      }, async readBillingSnapshot() { return databaseSnapshot(); }, async listAttemptFixtures() { return []; },
+      async readSyntheticFixture() { return null; }, async readWebhookInbox() { return null; },
+      async readWebhookReceipts() { return []; } } });
+    const stripeReader = createStripeReader({ expectedEnvironment: environment,
+      expectedWebhookEndpointId: 'we_task6endpoint',
+      source: { identity: validStripe, async readIdentity() {
+        return mismatch.provider === 'stripe' ? mismatch.identity : validStripe;
+      }, async retrieve() { return null; }, async listEvents() { return []; },
+      async retrieveWebhookEndpoint() { return { id: validStripe.webhookEndpointId,
+        url: validStripe.webhookUrl, livemode: false, created: 1, enabledEvents: [] }; } } });
+    const readers = createReaders({ expectedEnvironment: environment, expectedWebhookEndpointId: 'we_task6endpoint',
+      supabase: supabaseReader, stripe: stripeReader });
+    const dispatchAfterReadiness = async () => {
+      await readers.assertReady({ attemptId: 'attempt-task4', caseId: 'payment.approved', startedAt });
+      dispatches += 1;
+    };
+    await assert.rejects(dispatchAfterReadiness());
+    assert.equal(dispatches, 0);
+  }
+});
+
+test('Stripe readonly reader projects only billing fields and never returns raw secrets or event payloads', async () => {
+  const createStripeReader = needExport(stripeRuntime, 'createStripeBillingReader');
+  const identity = { accountId: environment.stripe.accountId, webhookEndpointId: 'we_task4safe',
+    webhookUrl: `${environment.deployment.origin}/api/stripe/webhook`, livemode: false, readOnly: true };
+  let wrongEventAccount = false;
+  const reader = createStripeReader({ expectedEnvironment: environment,
+    expectedWebhookEndpointId: identity.webhookEndpointId, source: {
+      identity,
+      async readIdentity() { return identity; },
+      async retrieve(type) {
+        if (type === 'payment_intent') return { id: 'pi_task4safe', livemode: false,
+          customer: 'cus_task4safe', latest_charge: 'ch_task4safe', amount_received: 2500,
+          currency: 'brl', status: 'succeeded',
+          last_payment_error: { code: 'declined', decline_code: 'generic_decline', message: 'private' },
+          client_secret: 'pi_secret_do_not_return', metadata: { operator: 'private' } };
+        assert.equal(type, 'charge');
+        return { id: 'ch_task4safe', livemode: false, customer: 'cus_task4safe',
+          payment_intent: 'pi_task4safe', currency: 'brl', paid: true, amount_captured: 2500,
+          payment_method_details: { card: { three_d_secure: { authentication_flow: null,
+            result: 'authenticated', result_reason: null, transaction_id: 'private' } } },
+          metadata: { operator: 'private' } };
+      },
+      async listEvents() {
+        return [{ id: 'evt_task4safe', type: 'invoice.paid', livemode: false, created: 100,
+          pending_webhooks: 0, api_version: '2025-01-01',
+          account: wrongEventAccount ? 'acct_unexpected' : environment.stripe.accountId,
+          data: { object: { id: 'in_task4safe', customer: 'cus_task4safe', client_secret: 'private',
+            metadata: { session: 'private' } } }, payload: 'private event body' }];
+      },
+      async retrieveWebhookEndpoint() { return { id: identity.webhookEndpointId, url: identity.webhookUrl,
+        livemode: false, created: 1, enabledEvents: ['invoice.paid'] }; },
+    } });
+
+  const intent = await reader.retrieve('payment_intent', 'pi_task4safe');
+  assert.deepEqual(intent, { id: 'pi_task4safe', livemode: false, customer: 'cus_task4safe',
+    latest_charge: 'ch_task4safe', amount_received: 2500, currency: 'brl', status: 'succeeded',
+    last_payment_error: { code: 'declined', decline_code: 'generic_decline' } });
+  const charge = await reader.retrieve('charge', 'ch_task4safe');
+  assert.deepEqual(charge, { id: 'ch_task4safe', livemode: false, customer: 'cus_task4safe',
+    payment_intent: 'pi_task4safe', currency: 'brl', paid: true, amount_captured: 2500,
+    payment_method_details: { card: { three_d_secure: {
+      authentication_flow: null, result: 'authenticated', result_reason: null,
+    } } } });
+  await assert.rejects(reader.retrieve('payment_intent', 'pi_task4other'),
+    { code: 'stripe_reader_response_invalid' });
+  await assert.rejects(reader.retrieve('payment_intent', 'pi_task4safe', { apiKey: 'private' }),
+    { code: 'stripe_reader_input_invalid' });
+  const events = await reader.listEvents({ eventId: 'evt_task4safe' });
+  assert.deepEqual(events, [{ id: 'evt_task4safe', eventType: 'invoice.paid', livemode: false, created: 100,
+    objectId: 'in_task4safe', pendingWebhooks: 0, apiVersion: '2025-01-01',
+    accountId: environment.stripe.accountId, customerId: 'cus_task4safe' }]);
+  assert.equal(JSON.stringify({ intent, charge, events }).includes('private'), false);
+  assert.equal(JSON.stringify({ intent, charge, events }).includes('secret'), false);
+  wrongEventAccount = true;
+  await assert.rejects(reader.listEvents({ eventId: 'evt_task4safe' }),
+    { code: 'stripe_reader_response_invalid' });
+});
+
+test('Supabase fixture and webhook readers enforce the exact branch and attempt binding', async () => {
+  const createSupabaseReader = needExport(supabaseRuntime, 'createSupabaseBillingReader');
+  const identity = { projectRef: environment.database.projectRef,
+    branchId: environment.database.branchId, readOnly: true };
+  let fixtureReads = 0;
+  let webhookReads = 0;
+  const reader = createSupabaseReader({ expectedEnvironment: environment, source: {
+    async readIdentity() { return identity; },
+    async readBillingSnapshot() { return databaseSnapshot(); },
+    async listAttemptFixtures() {
+      fixtureReads += 1;
+      return [{ fixtureId: '96b09fd4-2d1a-4a59-8e90-2f17e3113e1d',
+        namespaceId: '1189f183-f7e4-4d08-b16d-c7aeaa82d71f', attemptId: 'attempt-other',
+        caseId: 'payment.approved', kind: 'catalog',
+        marker: 'lawx-billing-validation-synthetic-v1', synthetic: true }];
+    },
+    async readSyntheticFixture() { return null; },
+    async readWebhookInbox() { webhookReads += 1; return null; },
+    async readWebhookReceipts() { webhookReads += 1; return []; },
+  } });
+
+  await assert.rejects(reader.listAttemptFixtures({ attemptId: 'attempt-task4', caseId: 'payment.approved',
+    namespaceId: '1189f183-f7e4-4d08-b16d-c7aeaa82d71f', environment }),
+  { code: 'supabase_fixture_response_invalid' });
+  await assert.rejects(reader.readWebhookInbox('evt_task4'), { code: 'supabase_reader_input_invalid' });
+  await assert.rejects(reader.readWebhookInbox({ attemptId: 'attempt-task4', caseId: 'payment.approved',
+    branchId: 'branch_wrong', eventId: 'evt_task4', objectId: 'in_task4' }),
+  { code: 'supabase_reader_input_invalid' });
+  assert.equal(fixtureReads, 1);
+  assert.equal(webhookReads, 0);
 });
 
 test('invoice retrieval requests expansion for payments.data.payment.payment_intent', async () => {

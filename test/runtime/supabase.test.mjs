@@ -68,8 +68,10 @@ test('rejects a production-labelled branch pin before any provider request', asy
   assert.equal(network.calls.length, 0);
 });
 
-test('exposes no mutation operation and refuses equal parent and child refs without fetching', async () => {
-  assert.deepEqual(Object.keys(supabaseModule).sort(), ['SupabaseRefusal', 'verifySupabaseEnvironment']);
+test('exposes only the safe reader and append-only fixture factory; refuses equal refs without fetching', async () => {
+  assert.deepEqual(Object.keys(supabaseModule).sort(), ['SupabaseRefusal', 'createSupabaseBillingReader',
+    'createSupabaseFixturePublisher', 'verifySupabaseEnvironment']);
+  assert.equal(Object.hasOwn(supabaseModule, 'mutateBillingData'), false);
   const network = fixture();
   await assert.rejects(verifySupabaseEnvironment({
     policy: { ...policy, database: { ...policy.database, parentProjectRef: policy.database.projectRef } },

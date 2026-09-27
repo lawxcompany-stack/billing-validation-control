@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { providerIdempotencyKey } from '../attempts/prepare.mjs';
 import { withStripeIntent } from '../attempts/lock.mjs';
 import { immutableVercelOrigin } from '../github/deployments.mjs';
+import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 
 const API = 'https://api.stripe.com';
 const TEST_KEY = /^sk_test_[A-Za-z0-9]{8,}$/u;
@@ -194,6 +195,370 @@ export async function verifyStripeEnvironment({ policy, deployment, key, fetchIm
   }
   return Object.freeze({ accountId: stripe.accountId, webhookEndpointId: stripe.webhookEndpointId,
     webhookUrl, livemode: false });
+}
+
+// Keep the Task 4 reader deliberately narrow: these are the only provider objects
+// consumed by the current financial observation flow.
+const READABLE_OBJECTS = new Set(['invoice', 'payment_intent', 'charge']);
+const STRIPE_OBJECT_ID = /^(?:cus|in|pi|sub|price|prod|evt|ch|re|pm|seti|cs)_[A-Za-z0-9_]{1,120}$/u;
+
+function plainRecord(value) {
+  if (!object(value)) return false;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch { return false; }
+}
+
+function ownValue(value, key) {
+  let descriptor;
+  try { descriptor = Object.getOwnPropertyDescriptor(value, key); }
+  catch { refuse('stripe_reader_response_invalid'); }
+  if (!descriptor) return { present: false };
+  if (!Object.hasOwn(descriptor, 'value') || descriptor.enumerable !== true) refuse('stripe_reader_response_invalid');
+  return { present: true, value: descriptor.value };
+}
+
+function reference(value, prefix) {
+  if (value === null) return null;
+  if (typeof value === 'string') {
+    if (!STRIPE_OBJECT_ID.test(value) || prefix && !value.startsWith(`${prefix}_`)) refuse('stripe_reader_response_invalid');
+    return value;
+  }
+  if (!plainRecord(value)) refuse('stripe_reader_response_invalid');
+  const id = ownValue(value, 'id');
+  if (!id.present || typeof id.value !== 'string' || !STRIPE_OBJECT_ID.test(id.value) ||
+      prefix && !id.value.startsWith(`${prefix}_`)) refuse('stripe_reader_response_invalid');
+  return id.value;
+}
+
+function selectField(source, target, key, validate, transform = (value) => value) {
+  const field = ownValue(source, key);
+  if (!field.present) return;
+  if (!validate(field.value)) refuse('stripe_reader_response_invalid');
+  target[key] = transform(field.value);
+}
+
+function selectReference(source, target, key, prefix) {
+  const field = ownValue(source, key);
+  if (field.present) target[key] = reference(field.value, prefix);
+}
+
+function projectPaymentIntent(value) {
+  if (!plainRecord(value)) refuse('stripe_reader_response_invalid');
+  const result = {};
+  selectField(value, result, 'id', (field) => typeof field === 'string' && /^pi_[A-Za-z0-9_]{1,120}$/u.test(field));
+  selectField(value, result, 'livemode', (field) => field === false);
+  selectReference(value, result, 'customer', 'cus');
+  selectReference(value, result, 'latest_charge', 'ch');
+  selectField(value, result, 'amount_received', (field) => Number.isSafeInteger(field) && field >= 0);
+  selectField(value, result, 'currency', (field) => typeof field === 'string' && /^[a-z]{3}$/u.test(field));
+  selectField(value, result, 'status', (field) => typeof field === 'string' && /^[a-z_]{1,64}$/u.test(field));
+  const error = ownValue(value, 'last_payment_error');
+  if (error.present) {
+    if (error.value === null) result.last_payment_error = null;
+    else {
+      if (!plainRecord(error.value)) refuse('stripe_reader_response_invalid');
+      const projected = {};
+      selectField(error.value, projected, 'code', (field) => typeof field === 'string' && /^[a-z0-9_]{1,128}$/u.test(field));
+      selectField(error.value, projected, 'decline_code', (field) => typeof field === 'string' && /^[a-z0-9_]{1,128}$/u.test(field));
+      result.last_payment_error = projected;
+    }
+  }
+  if (result.id === undefined || result.livemode !== false) refuse('stripe_reader_response_invalid');
+  return Object.freeze(result);
+}
+
+function projectInvoice(value) {
+  if (!plainRecord(value)) refuse('stripe_reader_response_invalid');
+  const result = {};
+  selectField(value, result, 'id', (field) => typeof field === 'string' && /^in_[A-Za-z0-9_]{1,120}$/u.test(field));
+  selectField(value, result, 'livemode', (field) => field === false);
+  selectReference(value, result, 'customer', 'cus');
+  selectReference(value, result, 'subscription', 'sub');
+  selectReference(value, result, 'payment_intent', 'pi');
+  for (const key of ['amount_due', 'amount_paid', 'amount_remaining']) {
+    selectField(value, result, key, (field) => Number.isSafeInteger(field) && field >= 0);
+  }
+  selectField(value, result, 'currency', (field) => typeof field === 'string' && /^[a-z]{3}$/u.test(field));
+  selectField(value, result, 'status', (field) => typeof field === 'string' && /^[a-z_]{1,64}$/u.test(field));
+  const payments = ownValue(value, 'payments');
+  if (payments.present) {
+    if (payments.value === null) result.payments = null;
+    else {
+      if (!plainRecord(payments.value)) refuse('stripe_reader_response_invalid');
+      const data = ownValue(payments.value, 'data');
+      const hasMore = ownValue(payments.value, 'has_more');
+      if (!data.present || !Array.isArray(data.value) || data.value.length > 100 ||
+          !hasMore.present || typeof hasMore.value !== 'boolean') refuse('stripe_reader_response_invalid');
+      const projectedRows = data.value.map((entry) => {
+        if (!plainRecord(entry)) refuse('stripe_reader_response_invalid');
+        const payment = ownValue(entry, 'payment');
+        if (!payment.present || !plainRecord(payment.value)) refuse('stripe_reader_response_invalid');
+        const intent = ownValue(payment.value, 'payment_intent');
+        return Object.freeze({ payment: Object.freeze({
+          ...(intent.present ? { payment_intent: reference(intent.value, 'pi') } : {}),
+        }) });
+      });
+      result.payments = Object.freeze({ data: Object.freeze(projectedRows), has_more: hasMore.value });
+    }
+  }
+  const parent = ownValue(value, 'parent');
+  if (parent.present) {
+    if (parent.value === null) result.parent = null;
+    else {
+      if (!plainRecord(parent.value)) refuse('stripe_reader_response_invalid');
+      const details = ownValue(parent.value, 'subscription_details');
+      if (details.present && details.value !== null) {
+        if (!plainRecord(details.value)) refuse('stripe_reader_response_invalid');
+        const subscription = ownValue(details.value, 'subscription');
+        result.parent = Object.freeze({ subscription_details: Object.freeze({
+          ...(subscription.present ? { subscription: reference(subscription.value, 'sub') } : {}),
+        }) });
+      } else result.parent = Object.freeze({});
+    }
+  }
+  if (result.id === undefined || result.livemode !== false) refuse('stripe_reader_response_invalid');
+  return Object.freeze(result);
+}
+
+function projectCharge(value) {
+  if (!plainRecord(value)) refuse('stripe_reader_response_invalid');
+  const result = {};
+  selectField(value, result, 'id', (field) => typeof field === 'string' && /^ch_[A-Za-z0-9_]{1,120}$/u.test(field));
+  selectField(value, result, 'livemode', (field) => field === false);
+  selectReference(value, result, 'customer', 'cus');
+  selectReference(value, result, 'payment_intent', 'pi');
+  selectField(value, result, 'currency', (field) => typeof field === 'string' && /^[a-z]{3}$/u.test(field));
+  selectField(value, result, 'paid', (field) => typeof field === 'boolean');
+  selectField(value, result, 'amount_captured', (field) => Number.isSafeInteger(field) && field >= 0);
+  const details = ownValue(value, 'payment_method_details');
+  if (details.present) {
+    if (details.value === null) result.payment_method_details = null;
+    else {
+      if (!plainRecord(details.value)) refuse('stripe_reader_response_invalid');
+      const card = ownValue(details.value, 'card');
+      if (card.present && card.value !== null) {
+        if (!plainRecord(card.value)) refuse('stripe_reader_response_invalid');
+        const threeDSecure = ownValue(card.value, 'three_d_secure');
+        if (threeDSecure.present && threeDSecure.value !== null) {
+          if (!plainRecord(threeDSecure.value)) refuse('stripe_reader_response_invalid');
+          const projected = {};
+          for (const key of ['authentication_flow', 'result', 'result_reason']) {
+            selectField(threeDSecure.value, projected, key, (field) => field === null ||
+              typeof field === 'string' && /^[a-z0-9_-]{1,64}$/iu.test(field));
+          }
+          result.payment_method_details = Object.freeze({ card: Object.freeze({ three_d_secure: Object.freeze(projected) }) });
+        }
+      }
+    }
+  }
+  if (result.id === undefined || result.livemode !== false) refuse('stripe_reader_response_invalid');
+  return Object.freeze(result);
+}
+
+function projectBillingObject(type, value) {
+  if (type === 'invoice') return projectInvoice(value);
+  if (type === 'payment_intent') return projectPaymentIntent(value);
+  if (type === 'charge') return projectCharge(value);
+  refuse('stripe_reader_input_invalid');
+}
+
+function projectStripeEvent(value) {
+  if (!plainRecord(value)) refuse('stripe_reader_response_invalid');
+  const id = ownValue(value, 'id');
+  const eventType = ownValue(value, 'eventType');
+  const type = ownValue(value, 'type');
+  const livemode = ownValue(value, 'livemode');
+  const created = ownValue(value, 'created');
+  if (!id.present || typeof id.value !== 'string' || !/^evt_[A-Za-z0-9_]{1,120}$/u.test(id.value) ||
+      !livemode.present || livemode.value !== false || !created.present ||
+      !Number.isSafeInteger(created.value) || created.value < 1) refuse('stripe_reader_response_invalid');
+  const eventName = eventType.present ? eventType.value : type.value;
+  if (typeof eventName !== 'string' || !/^[a-z][a-z0-9_.]{1,127}$/u.test(eventName) ||
+      eventType.present && type.present && eventType.value !== type.value) refuse('stripe_reader_response_invalid');
+  const objectId = ownValue(value, 'objectId');
+  const customerId = ownValue(value, 'customerId');
+  const data = ownValue(value, 'data');
+  let projectedObjectId = objectId.present ? reference(objectId.value) : null;
+  let projectedCustomerId = customerId.present ? reference(customerId.value, 'cus') : null;
+  if (data.present) {
+    if (!plainRecord(data.value)) refuse('stripe_reader_response_invalid');
+    const objectValue = ownValue(data.value, 'object');
+    if (!objectValue.present || !plainRecord(objectValue.value)) refuse('stripe_reader_response_invalid');
+    const nestedId = ownValue(objectValue.value, 'id');
+    const nestedCustomer = ownValue(objectValue.value, 'customer');
+    if (nestedId.present) {
+      const valueId = reference(nestedId.value);
+      if (projectedObjectId && projectedObjectId !== valueId) refuse('stripe_reader_response_invalid');
+      projectedObjectId = valueId;
+    }
+    if (nestedCustomer.present) {
+      const valueCustomer = reference(nestedCustomer.value, 'cus');
+      if (projectedCustomerId && projectedCustomerId !== valueCustomer) refuse('stripe_reader_response_invalid');
+      projectedCustomerId = valueCustomer;
+    }
+  }
+  if (!projectedObjectId) refuse('stripe_reader_response_invalid');
+  const result = { id: id.value, eventType: eventName, livemode: false, created: created.value,
+    objectId: projectedObjectId };
+  const pending = ownValue(value, 'pendingWebhooks');
+  const pendingSnake = ownValue(value, 'pending_webhooks');
+  if (pending.present && pendingSnake.present && pending.value !== pendingSnake.value) refuse('stripe_reader_response_invalid');
+  const pendingValue = pending.present ? pending.value : pendingSnake.value;
+  if (pending.present || pendingSnake.present) {
+    if (!Number.isSafeInteger(pendingValue) || pendingValue < 0) refuse('stripe_reader_response_invalid');
+    result.pendingWebhooks = pendingValue;
+  }
+  const apiVersion = ownValue(value, 'apiVersion');
+  const apiVersionSnake = ownValue(value, 'api_version');
+  if (apiVersion.present && apiVersionSnake.present && apiVersion.value !== apiVersionSnake.value) refuse('stripe_reader_response_invalid');
+  const apiVersionValue = apiVersion.present ? apiVersion.value : apiVersionSnake.value;
+  if (apiVersion.present || apiVersionSnake.present) {
+    if (apiVersionValue !== null && (typeof apiVersionValue !== 'string' || apiVersionValue.length > 64)) refuse('stripe_reader_response_invalid');
+    result.apiVersion = apiVersionValue;
+  }
+  const account = ownValue(value, 'accountId');
+  const accountSnake = ownValue(value, 'account');
+  if (account.present && accountSnake.present && account.value !== accountSnake.value) refuse('stripe_reader_response_invalid');
+  const accountValue = account.present ? account.value : accountSnake.value;
+  if (account.present || accountSnake.present) {
+    if (accountValue !== null && (typeof accountValue !== 'string' || !/^acct_[A-Za-z0-9_]+$/u.test(accountValue))) {
+      refuse('stripe_reader_response_invalid');
+    }
+    result.accountId = accountValue;
+  }
+  if (projectedCustomerId) result.customerId = projectedCustomerId;
+  return Object.freeze(result);
+}
+
+function exactRecord(value, keys) {
+  if (!object(value)) return false;
+  let ownKeys;
+  try { ownKeys = Reflect.ownKeys(value); } catch { return false; }
+  return ownKeys.length === keys.length && ownKeys.every((key) => typeof key === 'string' && keys.includes(key)) &&
+    keys.every((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return descriptor && Object.hasOwn(descriptor, 'value') && descriptor.enumerable === true;
+    });
+}
+
+function billingReadIdentity(value, expectedEnvironment, expectedWebhookEndpointId) {
+  return exactRecord(value, ['accountId', 'webhookEndpointId', 'webhookUrl', 'livemode', 'readOnly']) &&
+    value.accountId === expectedEnvironment.stripe.accountId &&
+    value.webhookEndpointId === expectedWebhookEndpointId &&
+    value.webhookUrl === `${expectedEnvironment.deployment.origin}/api/stripe/webhook` &&
+    value.livemode === false && value.readOnly === true;
+}
+
+/** Read-only Stripe TEST reader. A remote client/schema is never created here. */
+export function createStripeBillingReader({ expectedEnvironment, expectedWebhookEndpointId, source } = {}) {
+  if (!isValidExpectedEnvironment(expectedEnvironment) || !ENDPOINT.test(expectedWebhookEndpointId ?? '') ||
+      !object(source) || ['readIdentity', 'retrieve', 'listEvents', 'retrieveWebhookEndpoint']
+        .some((method) => typeof source[method] !== 'function')) refuse('stripe_reader_unavailable');
+  const identity = Object.freeze({ accountId: expectedEnvironment.stripe.accountId,
+    webhookEndpointId: expectedWebhookEndpointId,
+    webhookUrl: `${expectedEnvironment.deployment.origin}/api/stripe/webhook`,
+    livemode: false, readOnly: true });
+
+  async function readIdentity() {
+    let actual;
+    try { actual = await source.readIdentity(); } catch { refuse('stripe_reader_unavailable'); }
+    if (!billingReadIdentity(actual, expectedEnvironment, expectedWebhookEndpointId)) {
+      refuse('stripe_reader_identity_mismatch');
+    }
+    return identity;
+  }
+
+  return Object.freeze({
+    identity,
+    readIdentity,
+    async retrieve(type, id, params = {}) {
+      const expectedPrefix = type === 'invoice' ? 'in' : type === 'payment_intent' ? 'pi' : 'ch';
+      if (!READABLE_OBJECTS.has(type) || typeof id !== 'string' ||
+          !id.startsWith(`${expectedPrefix}_`) || !STRIPE_OBJECT_ID.test(id) || !plainRecord(params)) {
+        refuse('stripe_reader_input_invalid');
+      }
+      let safeParams = {};
+      const keys = Reflect.ownKeys(params);
+      if (keys.length > 0) {
+        const expand = ownValue(params, 'expand');
+        if (type !== 'invoice' || keys.length !== 1 || !expand.present || !Array.isArray(expand.value) ||
+            expand.value.length !== 1 || expand.value[0] !== 'payments.data.payment.payment_intent') {
+          refuse('stripe_reader_input_invalid');
+        }
+        safeParams = { expand: Object.freeze(['payments.data.payment.payment_intent']) };
+      }
+      let value;
+      try { value = await source.retrieve(type, id, Object.freeze(safeParams)); }
+      catch { refuse('stripe_reader_unavailable'); }
+      if (value === null) return null;
+      const projected = projectBillingObject(type, value);
+      if (projected.id !== id) refuse('stripe_reader_response_invalid');
+      return projected;
+    },
+    async listEvents(query) {
+      const allowed = new Set(['customerId', 'objectId', 'types', 'created', 'eventId', 'attemptId', 'caseId']);
+      if (!plainRecord(query) || Reflect.ownKeys(query).some((key) => typeof key !== 'string' || !allowed.has(key))) {
+        refuse('stripe_reader_input_invalid');
+      }
+      const safeQuery = {};
+      for (const [key, prefix] of [['customerId', 'cus'], ['objectId', null], ['eventId', 'evt']]) {
+        const field = ownValue(query, key);
+        if (field.present) safeQuery[key] = reference(field.value, prefix);
+      }
+      for (const key of ['attemptId', 'caseId']) {
+        const field = ownValue(query, key);
+        if (field.present) {
+          if (typeof field.value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(field.value)) {
+            refuse('stripe_reader_input_invalid');
+          }
+          safeQuery[key] = field.value;
+        }
+      }
+      const types = ownValue(query, 'types');
+      if (types.present) {
+        if (!Array.isArray(types.value) || types.value.length > 100 ||
+            !types.value.every((value) => typeof value === 'string' && /^[a-z][a-z0-9_.]{1,127}$/u.test(value))) {
+          refuse('stripe_reader_input_invalid');
+        }
+        safeQuery.types = Object.freeze([...types.value]);
+      }
+      const created = ownValue(query, 'created');
+      if (created.present) {
+        if (!plainRecord(created.value)) refuse('stripe_reader_input_invalid');
+        const gte = ownValue(created.value, 'gte');
+        if (!gte.present || !Number.isSafeInteger(gte.value) || gte.value < 1 || Reflect.ownKeys(created.value).length !== 1) {
+          refuse('stripe_reader_input_invalid');
+        }
+        safeQuery.created = Object.freeze({ gte: gte.value });
+      }
+      let events;
+      try { events = await source.listEvents(Object.freeze({ ...safeQuery,
+        accountId: identity.accountId, webhookEndpointId: identity.webhookEndpointId, livemode: false })); }
+      catch { refuse('stripe_reader_unavailable'); }
+      if (!Array.isArray(events) || events.length > 100) refuse('stripe_reader_response_invalid');
+      return Object.freeze(events.map((event) => {
+        const projected = projectStripeEvent(event);
+        if (projected.accountId !== undefined && projected.accountId !== null &&
+            projected.accountId !== identity.accountId) refuse('stripe_reader_response_invalid');
+        return projected;
+      }));
+    },
+    async retrieveWebhookEndpoint(id) {
+      if (id !== identity.webhookEndpointId) refuse('stripe_reader_input_invalid');
+      let endpoint;
+      try { endpoint = await source.retrieveWebhookEndpoint(identity.webhookEndpointId); }
+      catch { refuse('stripe_reader_unavailable'); }
+      if (!object(endpoint) || endpoint.id !== identity.webhookEndpointId || endpoint.livemode !== false ||
+          endpoint.url !== identity.webhookUrl || !Number.isSafeInteger(endpoint.created) ||
+          !Array.isArray(endpoint.enabledEvents) || endpoint.enabledEvents.some((type) => typeof type !== 'string')) {
+        refuse('stripe_reader_identity_mismatch');
+      }
+      return Object.freeze({ id: endpoint.id, url: endpoint.url, livemode: false,
+        created: endpoint.created, enabledEvents: Object.freeze([...endpoint.enabledEvents]) });
+    },
+  });
 }
 
 export function stripeRequestDigest({ action, operation, input } = {}) {

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { assertCurrentAttempt } from './contracts.mjs';
+import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 
 const TABLES = Object.freeze(['attempts', 'contexts', 'contracts', 'settlements', 'grants', 'revisions', 'usage']);
 const ROW_KEYS = Object.freeze({
@@ -31,6 +32,100 @@ function canonical(value) {
   return JSON.stringify(value);
 }
 function digest(value) { return createHash('sha256').update(canonical(value), 'utf8').digest('hex'); }
+
+/** Compose independently configured readonly sources without inventing their remote schemas. */
+export function createIndependentBillingReaders({ expectedEnvironment, expectedWebhookEndpointId,
+  supabase, stripe } = {}) {
+  const supabaseMethods = ['readIdentity', 'readBillingSnapshot', 'listAttemptFixtures',
+    'readSyntheticFixture', 'readWebhookInbox', 'readWebhookReceipts'];
+  const stripeMethods = ['readIdentity', 'retrieve', 'listEvents', 'retrieveWebhookEndpoint'];
+  if (!isValidExpectedEnvironment(expectedEnvironment) ||
+      typeof expectedWebhookEndpointId !== 'string' || !/^we_[A-Za-z0-9]+$/u.test(expectedWebhookEndpointId) ||
+      supabaseMethods.some((method) => typeof supabase?.[method] !== 'function') ||
+      stripeMethods.some((method) => typeof stripe?.[method] !== 'function') ||
+      supabase.identity?.projectRef !== expectedEnvironment.database.projectRef ||
+      supabase.identity?.branchId !== expectedEnvironment.database.branchId ||
+      supabase.identity?.readOnly !== true || stripe.identity?.accountId !== expectedEnvironment.stripe.accountId ||
+      stripe.identity?.webhookEndpointId !== expectedWebhookEndpointId ||
+      stripe.identity?.webhookUrl !== `${expectedEnvironment.deployment.origin}/api/stripe/webhook` ||
+      stripe.identity?.livemode !== false || stripe.identity?.readOnly !== true) {
+    refuse('observation_readers_unavailable');
+  }
+
+  async function assertReady(binding) {
+    if (!isObject(binding) || !safeToken(binding.attemptId) || !safeToken(binding.caseId) ||
+        dateMs(binding.startedAt) === null) refuse('observation_reader_binding_invalid');
+    try {
+      const database = await supabase.readIdentity();
+      const provider = await stripe.readIdentity();
+      if (database?.projectRef !== expectedEnvironment.database.projectRef ||
+          database?.branchId !== expectedEnvironment.database.branchId || database?.readOnly !== true ||
+          provider?.accountId !== expectedEnvironment.stripe.accountId ||
+          provider?.webhookEndpointId !== expectedWebhookEndpointId ||
+          provider?.webhookUrl !== `${expectedEnvironment.deployment.origin}/api/stripe/webhook` ||
+          provider?.livemode !== false || provider?.readOnly !== true) refuse('observation_reader_identity_mismatch');
+      const endpoint = await stripe.retrieveWebhookEndpoint(expectedWebhookEndpointId);
+      if (endpoint?.id !== expectedWebhookEndpointId ||
+          endpoint.url !== `${expectedEnvironment.deployment.origin}/api/stripe/webhook` ||
+          endpoint.livemode !== false || !Number.isSafeInteger(endpoint.created) ||
+          !Array.isArray(endpoint.enabledEvents)) refuse('observation_reader_identity_mismatch');
+    } catch { refuse('observation_reader_identity_mismatch'); }
+    return true;
+  }
+
+  async function readWebhookEvidence(input) {
+    const keys = ['attemptId', 'caseId', 'startedAt', 'eventId', 'objectId'];
+    if (!isObject(input) || Reflect.ownKeys(input).length !== keys.length ||
+        keys.some((key) => !Object.hasOwn(input, key)) || !safeToken(input.attemptId) ||
+        !safeToken(input.caseId) || !safeToken(input.eventId) || !safeToken(input.objectId) ||
+        dateMs(input.startedAt) === null) refuse('observation_reader_binding_invalid');
+    await assertReady(input);
+    const started = Math.floor(dateMs(input.startedAt) / 1000);
+    let events;
+    try {
+      events = await stripe.listEvents({ eventId: input.eventId, objectId: input.objectId,
+        attemptId: input.attemptId, caseId: input.caseId, created: { gte: started } });
+    } catch { refuse('observation_read_failed'); }
+    if (!Array.isArray(events) || events.length > 100) refuse('observation_evidence_invalid');
+    const eventMatches = events.filter((event) => event?.id === input.eventId &&
+      typeof event.eventType === 'string' && event.livemode === false && event.objectId === input.objectId &&
+      Number.isSafeInteger(event.created) && event.created >= started &&
+      event.created <= Math.floor(Date.now() / 1000));
+    if (eventMatches.length !== 1) refuse('observation_evidence_invalid');
+    let endpoint;
+    try { endpoint = await stripe.retrieveWebhookEndpoint(expectedWebhookEndpointId); }
+    catch { refuse('observation_read_failed'); }
+    const event = eventMatches[0];
+    if (endpoint?.id !== expectedWebhookEndpointId ||
+        endpoint.url !== `${expectedEnvironment.deployment.origin}/api/stripe/webhook` ||
+        endpoint.livemode !== false || !Number.isSafeInteger(endpoint.created) ||
+        endpoint.created > event.created || !Array.isArray(endpoint.enabledEvents) ||
+        !endpoint.enabledEvents.includes(event.eventType)) refuse('observation_evidence_invalid');
+
+    let inbox;
+    let receipts;
+    try {
+      const query = Object.freeze({ attemptId: input.attemptId, caseId: input.caseId,
+        branchId: expectedEnvironment.database.branchId, eventId: input.eventId, objectId: input.objectId });
+      [inbox, receipts] = await Promise.all([
+        supabase.readWebhookInbox(query), supabase.readWebhookReceipts(query),
+      ]);
+    } catch { refuse('observation_read_failed'); }
+    const inboxMatches = isObject(inbox) && inbox.attemptId === input.attemptId &&
+      inbox.caseId === input.caseId && inbox.branchId === expectedEnvironment.database.branchId &&
+      inbox.eventId === input.eventId && inbox.objectId === input.objectId && inbox.status === 'processed';
+    const receiptCount = Array.isArray(receipts) ? receipts.filter((receipt) => isObject(receipt) &&
+      receipt.attemptId === input.attemptId && receipt.caseId === input.caseId &&
+      receipt.branchId === expectedEnvironment.database.branchId && receipt.eventId === input.eventId &&
+      receipt.objectId === input.objectId && receipt.status === 'processed').length : 0;
+    if (!inboxMatches || receiptCount < 1) refuse('observation_evidence_invalid');
+    return Object.freeze({ eventId: input.eventId, eventObserved: true,
+      inboxStatus: 'processed', receiptCount });
+  }
+
+  return Object.freeze({ expectedEnvironment, expectedWebhookEndpointId, supabase, stripe,
+    assertReady, readWebhookEvidence });
+}
 
 export function sanitizeDatabaseSnapshot(snapshot) {
   if (!isObject(snapshot) || Object.keys(snapshot).length !== TABLES.length + 1 ||
@@ -124,6 +219,20 @@ function collectEventEvidence(event, inbox, receipts, endpoint, expectedEndpoint
     endpointWindowVerified: endpointWindow, endpointAttribution: 'configuration-window-only' };
 }
 
+function eventForEvidence(event) {
+  if (!isObject(event) || typeof event.eventType !== 'string' || typeof event.objectId !== 'string') return event;
+  return {
+    id: event.id,
+    type: event.eventType,
+    livemode: event.livemode,
+    created: event.created,
+    pending_webhooks: event.pendingWebhooks,
+    api_version: event.apiVersion,
+    account: event.accountId,
+    data: { object: { id: event.objectId, ...(event.customerId ? { customer: event.customerId } : {}) } },
+  };
+}
+
 async function readObservation(operation) {
   try { return await operation(); }
   catch { refuse('observation_read_failed'); }
@@ -206,7 +315,8 @@ export async function observeFinancialEvidence({ context, caseId, identity, read
   let webhook = { eventId: null, processed: false, inboxStatus: null, receiptCount: 0,
     pendingWebhooks: null, providerCreatedAt: null, receivedAt: null, processedAt: null,
     endpointWindowVerified: false, endpointAttribution: 'configuration-window-only' };
-  for (const event of Array.isArray(rawEvents) ? rawEvents : []) {
+  for (const rawEvent of Array.isArray(rawEvents) ? rawEvents : []) {
+    const event = eventForEvidence(rawEvent);
     if (event?.type !== 'invoice.paid' || event.data?.object?.id !== identity.invoiceId ||
         ref(event.data.object.customer) !== identity.customerId || event.livemode !== false) continue;
     const [inbox, receipts, endpoint] = await readObservation(() => Promise.all([
