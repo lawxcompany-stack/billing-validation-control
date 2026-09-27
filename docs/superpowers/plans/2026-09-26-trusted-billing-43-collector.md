@@ -211,6 +211,7 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - [ ] Test retained database/Auth/Stripe history, exact owned resource inventory, pre-existing baseline preservation, reversibly expiring open checkout and cancelling only owned subscriptions.
 - [ ] Test active access, unowned delta, missing reader, open reversible resource, ambiguous provider intent, stale fence, expired clock and failed append-only receipt all retain lease and full reservation.
 - [ ] Test successful retention returns databaseBaselineRestored=false and fixtureReusable=false, persists immutable cleanup/retention receipt, then atomically releases lease and settles capacity.
+- [ ] Provide a trusted cleanup-projection verifier using Task 4's independent Supabase/Stripe/webhook readers; it must verify exact attempt ownership, retained history, no active access, and terminal reversible-resource states before authorizing the receipt/release transaction. A missing/unavailable verifier fails closed.
 - [ ] Run cleanup/recheck/attempt tests and full npm test.
 - [ ] Commit as fix(billing): reconcile append-only financial cleanup.
 
@@ -229,6 +230,7 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - [ ] Test order: validate protected control workflow identity; resolve exact immutable Preview and SHA/tree; read-only Supabase/Stripe preflight; finite retention reserve and global lock; activation verification; then fixture writes and contracts. Any failure before admission makes zero provider/database mutations.
 - [ ] Test all 43 contracts run exactly once and collector fails on first required contract error but still invokes safe reconciliation; no result exists until cleanup and retention receipt pass.
 - [ ] Test full-context mismatch, mutable deployment alias, production/parent/live identity, missing migrations/fingerprints/webhook and runner mismatch fail before secrets or external mutation.
+- [ ] Wire the recovery verifier to independently bind the persisted latest lease owner run, terminal Actions run/attempt status, runner removal, and authenticated current protected run; missing/ambiguous proof fails closed, and lease expiry alone never authorizes takeover. Wire cleanup verification to the independent readers/projection verifier from Task 8; recovery/cleanup remain unavailable if those trusted adapters are missing.
 - [ ] Implement only fixed control-owned module imports and injected adapters. Never checkout or dynamically execute candidate content; keep provider credentials scoped to single adapter call.
 - [ ] Run focused collector/operator/runtime tests and full npm test.
 - [ ] Commit as feat(billing): orchestrate trusted 43-case collection.
