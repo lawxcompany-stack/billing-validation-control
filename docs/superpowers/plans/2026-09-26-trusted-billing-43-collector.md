@@ -192,8 +192,8 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - [x] The trusted Task 5 runners throw without returning any result for blocked cases; a direct `status: 'blocked'` result is rejected by the canonical validator. `validateBilling43Results` remains schema-only and accepts structurally valid caller-fabricated `passed` records; Task 9 must bind results to trusted execution receipts and never translate blocked/refused to `passed`.
 - [x] No local fake/adapter result is reported as remote acceptance.
 - [x] Fix-round verification (`npm run test:task5 -- --test-reporter=dot`: 90/90; `npm test -- --test-reporter=dot`: 517/517; `git diff --check`).
-- [ ] Obtain clean independent review after fix round and rerun the focused/full suites.
-- [x] Commit initial Task 5 implementation locally (`3798822`); no push or PR.
+- [x] Obtain independent review after fix round (all Critical/Important findings addressed; one Minor deferred in the SDD ledger) and rerun the focused/full suites.
+- [x] Commit Task 5 implementation/fix locally (`3798822`, `63de374`); no push or PR.
 
 ### Task 6: Executable subscription, finance, access, and webhook contracts
 
