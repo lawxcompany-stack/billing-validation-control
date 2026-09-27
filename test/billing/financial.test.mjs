@@ -130,10 +130,9 @@ test('payment.3ds is excluded from the canonical 43 and remains in the supervise
   assert.equal(parts.calls.assertions.length, 0);
 });
 
-test('unsupported generic unpaid and settled categories fail closed before any reads', async () => {
+test('unknown financial categories fail closed before any reads', async () => {
   const reconcile = needExport(financial, 'reconcileFinancialCase');
-  for (const caseId of ['webhook.invalid-signature',
-    'webhook.wrong-account', 'webhook.wrong-mode', 'subscription.add-area', 'finance.delinquency']) {
+  for (const caseId of ['not-a-case']) {
     const readers = makeReaders();
     await expectRefusal(reconcile({ context: needExport(contracts, 'createVerifiedContext')(makeAttemptParts()),
       caseId, identity: paymentIdentity, readers, startedAt }), 'financial_scenario_unsupported');
@@ -151,6 +150,21 @@ test('financial reconciliation refuses all blocked Task 5 cases before invoking 
       caseId, expectedOutcome: 'paid', expectedAccess: { contractId: 'contract_task6', areas: ['area_task6'] },
       identity: paymentIdentity, readers, startedAt }), contract.reasonCode);
     assert.equal(readers.calls.length, 0, `${caseId} must not inspect financial evidence`);
+  }
+});
+
+test('financial reconciliation refuses all blocked Task 6 cases before readers or stale fence checks', async () => {
+  const reconcile = needExport(financial, 'reconcileFinancialCase');
+  const blocked = needValue(fixtures, 'TASK6_BLOCKED_SCENARIO_CONTRACTS');
+  for (const [caseId, contract] of Object.entries(blocked)) {
+    const parts = makeAttemptParts({ currentFence: '22222222-2222-4222-8222-222222222222' });
+    const readers = makeReaders();
+    await expectRefusal(reconcile({ context: needExport(contracts, 'createVerifiedContext')(parts),
+      caseId, expectedOutcome: 'settled', identity: paymentIdentity, readers, startedAt }),
+    contract.reasonCode);
+    assert.equal(readers.calls.length, 0, `${caseId} must not inspect financial evidence`);
+    assert.equal(parts.calls.assertions.length, 0, `${caseId} must not continue past the block`);
+    assert.equal(parts.calls.mutations.length, 0, `${caseId} must not mutate`);
   }
 });
 

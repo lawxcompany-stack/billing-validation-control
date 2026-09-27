@@ -10,6 +10,7 @@ const EFFECTS = Object.freeze([
   'sendMailchimp',
   'reconcileFinancialEvidence',
   'unsupportedOperation',
+  'assertFence',
 ]);
 
 export function assertBlockedDomain({ contracts, expected, run } = {}) {
@@ -43,6 +44,8 @@ export function assertBlockedDomain({ contracts, expected, run } = {}) {
       method: 'POST',
       action: 'stripe.charge',
     });
+    effects.context = Object.freeze({ owner: Object.freeze({ fence: 'stale-fence' }),
+      attempts: Object.freeze({ assertFence: effects.assertFence }) });
     let returned;
     let thrown;
     try { returned = run(item.id, effects); }

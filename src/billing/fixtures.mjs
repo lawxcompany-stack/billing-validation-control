@@ -3,6 +3,10 @@ import { SIGNUP_SCENARIOS } from './scenarios/signup.mjs';
 import { PRICING_SCENARIOS } from './scenarios/pricing.mjs';
 import { PAYMENT_SCENARIOS } from './scenarios/payment.mjs';
 import { ZERO_SCENARIOS } from './scenarios/zero.mjs';
+import { SUBSCRIPTION_SCENARIOS } from './scenarios/subscription.mjs';
+import { FINANCE_SCENARIOS } from './scenarios/finance.mjs';
+import { ACCESS_SCENARIOS } from './scenarios/access.mjs';
+import { WEBHOOK_SCENARIOS } from './scenarios/webhook.mjs';
 
 const task5Entries = [SIGNUP_SCENARIOS, PRICING_SCENARIOS, PAYMENT_SCENARIOS, ZERO_SCENARIOS]
   .flatMap((domain) => Object.values(domain));
@@ -22,6 +26,27 @@ if (task5Entries.length !== BILLING_43_TASK5_IDS.length ||
 export const TASK5_BLOCKED_SCENARIO_CONTRACTS = Object.freeze(Object.fromEntries(
   task5Ids.map((id) => [id, task5ById[id]])));
 export const TASK5_BLOCKED_SCENARIO_IDS = Object.freeze(task5Ids);
+
+const task6Entries = [SUBSCRIPTION_SCENARIOS, FINANCE_SCENARIOS, ACCESS_SCENARIOS,
+  WEBHOOK_SCENARIOS].flatMap((domain) => Object.values(domain));
+const task6ById = Object.create(null);
+for (const contract of task6Entries) {
+  if (!BILLING_43_IDS.includes(contract.id) || Object.hasOwn(task6ById, contract.id) ||
+      Object.hasOwn(task5ById, contract.id)) {
+    throw new Error('billing_task6_registry_invalid');
+  }
+  task6ById[contract.id] = contract;
+}
+const task6Ids = BILLING_43_IDS.filter((id) => Object.hasOwn(task6ById, id));
+const expectedTask6Ids = BILLING_43_IDS.slice(BILLING_43_TASK5_IDS.length);
+if (task6Entries.length !== expectedTask6Ids.length ||
+    task6Ids.some((id, index) => id !== expectedTask6Ids[index])) {
+  throw new Error('billing_task6_registry_invalid');
+}
+
+export const TASK6_BLOCKED_SCENARIO_CONTRACTS = Object.freeze(Object.fromEntries(
+  task6Ids.map((id) => [id, task6ById[id]])));
+export const TASK6_BLOCKED_SCENARIO_IDS = Object.freeze(task6Ids);
 
 export const FINANCIAL_SCENARIOS = BILLING_43_IDS;
 

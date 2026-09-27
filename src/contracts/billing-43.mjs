@@ -26,6 +26,7 @@ export const BILLING_43_ALLOWED_OPERATIONS = Object.freeze([
 
 const ID_SET = new Set(BILLING_43_IDS);
 const TASK5_BLOCKED_ID_SET = new Set(BILLING_43_TASK5_IDS);
+const TASK6_BLOCKED_ID_SET = new Set(BILLING_43_IDS.slice(BILLING_43_TASK5_IDS.length));
 const EVIDENCE_SET = new Set(BILLING_43_EVIDENCE_KINDS);
 const OPERATION_SET = new Set(BILLING_43_ALLOWED_OPERATIONS);
 const CONTRACT_KEYS = Object.freeze([
@@ -183,7 +184,7 @@ export function assertCompleteBilling43Contracts(domainContracts) {
 export async function runBilling43Scenario({ id, contracts, createFixture, context } = {}) {
   const registry = assertCompleteBilling43Contracts(contracts);
   if (!ID_SET.has(id) || typeof createFixture !== 'function') refuse('billing_contract_invalid');
-  if (TASK5_BLOCKED_ID_SET.has(id)) refuse('billing_scenario_blocked');
+  if (TASK5_BLOCKED_ID_SET.has(id) || TASK6_BLOCKED_ID_SET.has(id)) refuse('billing_scenario_blocked');
 
   const contract = registry[id];
   const fixture = await createFixture({ id, contract });

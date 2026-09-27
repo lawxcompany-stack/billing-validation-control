@@ -156,24 +156,40 @@ test('operation array index accessors are refused before fixture creation or exe
   assert.equal(providerMutations, 0);
 });
 
-test('scenario execution gives contracts the frozen validated registry', async () => {
+test('canonical executor blocks all 24 Task 6 cases before fixture creation or caller contract execution', async () => {
   const ids = needValue(billing43, 'BILLING_43_IDS');
+  const blockedIds = needValue(fixtures, 'TASK6_BLOCKED_SCENARIO_IDS');
   const runBilling43Scenario = needExport(billing43, 'runBilling43Scenario');
-  let observedContracts;
+  assert.deepEqual(blockedIds, ids.slice(19));
+  let fixtureCreations = 0;
+  let contractRuns = 0;
   const contracts = completeTestContracts(ids).map((contract) => ({
     ...contract,
-    async run(context) {
-      observedContracts = context.contracts;
-      return { passed: true };
-    },
+    async run() { contractRuns += 1; return { passed: true }; },
   }));
+  for (const id of blockedIds) {
+    await assert.rejects(runBilling43Scenario({ id, contracts,
+      async createFixture() { fixtureCreations += 1; return {}; },
+      context: { attempts: { assertFence() { throw new Error('stale fence'); } } },
+    }), { code: 'billing_scenario_blocked' });
+  }
+  assert.equal(fixtureCreations, 0);
+  assert.equal(contractRuns, 0);
+});
 
-  await runBilling43Scenario({ id: ids[19], contracts,
-    async createFixture() { return {}; }, context: { attemptId: 'attempt-safe' } });
-
-  assert.deepEqual(Object.keys(observedContracts ?? {}), ids);
-  assert.equal(Object.isFrozen(observedContracts), true);
-  assert.equal(observedContracts[ids[19]].id, ids[19]);
+test('the 43 canonical IDs resolve to one explicit domain block, with no default contract', () => {
+  const task5 = needValue(fixtures, 'TASK5_BLOCKED_SCENARIO_CONTRACTS');
+  const task6 = needValue(fixtures, 'TASK6_BLOCKED_SCENARIO_CONTRACTS');
+  const ids = needValue(billing43, 'BILLING_43_IDS');
+  const all = [...Object.keys(task5), ...Object.keys(task6)];
+  assert.deepEqual(all, ids);
+  assert.equal(new Set(all).size, 43);
+  assert.equal(Object.hasOwn(task6, 'subscription.unknown'), false);
+  assert.equal(Object.hasOwn(task6, 'default'), false);
+  assert.equal(Object.isFrozen(task6), true);
+  for (const id of ids) {
+    assert.equal((Number(Object.hasOwn(task5, id)) + Number(Object.hasOwn(task6, id))), 1);
+  }
 });
 
 test('contract completeness requires valid evidence, bounded writes, closed operations, and callable run', () => {
