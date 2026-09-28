@@ -66,6 +66,40 @@ const IDENTITY_SQL = `SELECT current_setting('transaction_read_only') AS transac
   ) AS all_relation_writes_denied,
   NOT EXISTS (
     SELECT 1
+    FROM pg_catalog.pg_proc AS routines
+    JOIN pg_catalog.pg_namespace AS routine_schemas
+      ON routine_schemas.oid = routines.pronamespace
+    WHERE routine_schemas.nspname !~ '^pg_' AND routine_schemas.nspname <> 'information_schema'
+      AND pg_catalog.has_function_privilege(current_user, routines.oid, 'EXECUTE')
+  ) AS all_non_system_routine_executes_denied,
+  NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_largeobject_metadata AS objects
+    WHERE pg_catalog.has_largeobject_privilege(current_user, objects.oid, 'UPDATE')
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc AS large_object_routines
+    JOIN pg_catalog.pg_namespace AS routine_schemas
+      ON routine_schemas.oid = large_object_routines.pronamespace
+    WHERE routine_schemas.nspname = 'pg_catalog'
+      AND large_object_routines.proname IN
+        ('lo_creat', 'lo_create', 'lo_from_bytea', 'lo_put', 'lo_truncate', 'lo_truncate64', 'lowrite', 'lo_unlink', 'lo_import', 'lo_import_with_oid', 'lo_export')
+      AND pg_catalog.has_function_privilege(current_user, large_object_routines.oid, 'EXECUTE')
+  ) AS all_large_object_write_capabilities_denied,
+  CASE
+    WHEN pg_catalog.current_setting('server_version_num')::integer >= 170000 THEN NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_class AS maintainable_relations
+      JOIN pg_catalog.pg_namespace AS schemas ON schemas.oid = maintainable_relations.relnamespace
+      WHERE schemas.nspname !~ '^pg_' AND schemas.nspname <> 'information_schema'
+        AND maintainable_relations.relkind IN ('r', 'p', 'v', 'm', 'f')
+        AND pg_catalog.has_table_privilege(current_user, maintainable_relations.oid, 'MAINTAIN')
+    )
+    ELSE true
+  END AS all_relation_maintain_denied,
+  NOT EXISTS (
+    SELECT 1
     FROM pg_catalog.pg_class AS relations
     JOIN pg_catalog.pg_namespace AS schemas ON schemas.oid = relations.relnamespace
     WHERE schemas.nspname !~ '^pg_' AND schemas.nspname <> 'information_schema'
@@ -143,6 +177,8 @@ const IDENTITY_KEYS = Object.freeze([
   'transaction_read_only', 'role_name', 'is_superuser', 'bypass_rls', 'can_create_database',
   'can_create_role', 'replication', 'no_role_memberships', 'database_create_denied', 'database_temp_denied',
   'non_system_schema_create_denied', 'allowed_schema_usage', 'all_relation_writes_denied',
+  'all_non_system_routine_executes_denied', 'all_large_object_write_capabilities_denied',
+  'all_relation_maintain_denied',
   'unapproved_relation_reads_denied', 'evidence_relation_select_denied', 'evidence_rls_visibility_granted',
   'evidence_columns_granted', 'other_evidence_columns_denied', 'all_sequence_privileges_denied',
 ]);
@@ -232,7 +268,9 @@ function validateIdentityResult(result) {
       identity.replication !== false || identity.no_role_memberships !== true ||
       identity.database_create_denied !== true || identity.database_temp_denied !== true ||
       identity.non_system_schema_create_denied !== true || identity.allowed_schema_usage !== true ||
-      identity.all_relation_writes_denied !== true || identity.unapproved_relation_reads_denied !== true ||
+      identity.all_relation_writes_denied !== true || identity.all_non_system_routine_executes_denied !== true ||
+      identity.all_large_object_write_capabilities_denied !== true || identity.all_relation_maintain_denied !== true ||
+      identity.unapproved_relation_reads_denied !== true ||
       identity.evidence_relation_select_denied !== true || identity.evidence_rls_visibility_granted !== true ||
       identity.evidence_columns_granted !== true || identity.other_evidence_columns_denied !== true ||
       identity.all_sequence_privileges_denied !== true) {

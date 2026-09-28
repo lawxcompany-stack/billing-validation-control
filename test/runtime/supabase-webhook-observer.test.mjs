@@ -33,6 +33,9 @@ const allowedIdentity = Object.freeze({
   non_system_schema_create_denied: true,
   allowed_schema_usage: true,
   all_relation_writes_denied: true,
+  all_non_system_routine_executes_denied: true,
+  all_large_object_write_capabilities_denied: true,
+  all_relation_maintain_denied: true,
   unapproved_relation_reads_denied: true,
   evidence_relation_select_denied: true,
   evidence_rls_visibility_granted: true,
@@ -245,6 +248,9 @@ test('refuses wrong identity and any elevated role or table/schema write privile
     { ...allowedIdentity, non_system_schema_create_denied: false },
     { ...allowedIdentity, allowed_schema_usage: false },
     { ...allowedIdentity, all_relation_writes_denied: false },
+    { ...allowedIdentity, all_non_system_routine_executes_denied: false },
+    { ...allowedIdentity, all_large_object_write_capabilities_denied: false },
+    { ...allowedIdentity, all_relation_maintain_denied: false },
     { ...allowedIdentity, unapproved_relation_reads_denied: false },
     { ...allowedIdentity, evidence_relation_select_denied: false },
     { ...allowedIdentity, evidence_columns_granted: false },
@@ -371,6 +377,15 @@ test('audits application schemas, column-level writes, exact evidence columns, a
   assert.match(query, /(?:pg_catalog\.)?has_any_column_privilege\([^)]*'INSERT'\)/u);
   assert.match(query, /(?:pg_catalog\.)?has_any_column_privilege\([^)]*'UPDATE'\)/u);
   assert.match(query, /(?:pg_catalog\.)?has_any_column_privilege\([^)]*'REFERENCES'\)/u);
+  assert.match(query, /(?:pg_catalog\.)?has_function_privilege\(current_user, routines\.oid, 'EXECUTE'\)/u);
+  assert.match(query, /all_non_system_routine_executes_denied/u);
+  assert.match(query, /pg_largeobject_metadata/u);
+  assert.match(query, /has_largeobject_privilege\(current_user, objects\.oid, 'UPDATE'\)/u);
+  assert.match(query, /all_large_object_write_capabilities_denied/u);
+  assert.match(query, /large_object_routines\.proname IN\s*\('lo_creat', 'lo_create', 'lo_from_bytea', 'lo_put', 'lo_truncate', 'lo_truncate64', 'lowrite', 'lo_unlink', 'lo_import', 'lo_import_with_oid', 'lo_export'\)/u);
+  assert.match(query, /current_setting\('server_version_num'\)::integer\s*>=\s*170000/u);
+  assert.match(query, /has_table_privilege\(current_user, maintainable_relations\.oid, 'MAINTAIN'\)/u);
+  assert.match(query, /all_relation_maintain_denied/u);
   assert.match(query, /(?:pg_catalog\.)?has_sequence_privilege\([^)]*'USAGE'\)/u);
   assert.match(query, /(?:pg_catalog\.)?has_sequence_privilege\([^)]*'SELECT'\)/u);
   assert.match(query, /(?:pg_catalog\.)?has_sequence_privilege\([^)]*'UPDATE'\)/u);
@@ -397,6 +412,9 @@ test('rejects effective privileges outside the exact read-only evidence scope', 
     { ...allowedIdentity, non_system_schema_create_denied: false },
     { ...allowedIdentity, allowed_schema_usage: false },
     { ...allowedIdentity, all_relation_writes_denied: false },
+    { ...allowedIdentity, all_non_system_routine_executes_denied: false },
+    { ...allowedIdentity, all_large_object_write_capabilities_denied: false },
+    { ...allowedIdentity, all_relation_maintain_denied: false },
     { ...allowedIdentity, unapproved_relation_reads_denied: false },
     { ...allowedIdentity, evidence_relation_select_denied: false },
     { ...allowedIdentity, evidence_rls_visibility_granted: false },
