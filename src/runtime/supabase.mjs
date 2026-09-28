@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { BILLING_43_IDS } from '../contracts/billing-43.mjs';
-import { sanitizeDatabaseSnapshot } from '../billing/observations.mjs';
+import { sanitizeDatabaseSnapshot, sanitizeInstalledSchemaState, sanitizeSqlConcurrencyProof } from '../billing/observations.mjs';
 import { isActiveFixtureMutationTransaction } from '../attempts/store.mjs';
 
 const API = 'https://api.supabase.com';
@@ -12,6 +12,8 @@ const VERSION = /^[0-9]{1,32}$/u;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const PRODUCTION_BRANCH_PART = /(?:^|[-_.])(?:main|master|prod|production|primary|default)(?:$|[-_.])/u;
 const REQUEST_TIMEOUT_MS = 10_000;
+const SQL_READER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u;
+const SQL_BARRIER_IDS = new Set(['billing-sql-barrier-a', 'billing-sql-barrier-b']);
 
 export class SupabaseRefusal extends Error {
   constructor(code) {
@@ -174,6 +176,18 @@ function validateWebhookReaderBinding(input, expectedEnvironment) {
   }
 }
 
+function validateSqlReaderBinding(input, expectedEnvironment, withBarrier = false) {
+  const keys = ['projectRef', 'parentProjectRef', 'branchId', 'branchName', ...(withBarrier ? ['barrierId'] : [])];
+  if (!exactRecord(input, keys) || input.projectRef !== expectedEnvironment.database.projectRef ||
+      input.branchId !== expectedEnvironment.database.branchId || !REF.test(input.parentProjectRef) ||
+      input.parentProjectRef === input.projectRef || !BRANCH.test(input.branchId) ||
+      !BRANCH.test(input.branchName) || PRODUCTION_BRANCH_PART.test(input.branchId.toLowerCase()) ||
+      PRODUCTION_BRANCH_PART.test(input.branchName.toLowerCase()) ||
+      withBarrier && !SQL_BARRIER_IDS.has(input.barrierId)) refuse('supabase_sql_reader_input_invalid');
+  return Object.freeze({ projectRef: input.projectRef, parentProjectRef: input.parentProjectRef,
+    branchId: input.branchId, branchName: input.branchName, ...(withBarrier ? { barrierId: input.barrierId } : {}) });
+}
+
 const WEBHOOK_FIELDS = Object.freeze(['id', 'attemptId', 'caseId', 'branchId', 'eventId', 'eventType',
   'objectId', 'accountId', 'livemode', 'status', 'attempts', 'apiVersion', 'receivedAt', 'processedAt']);
 
@@ -233,6 +247,11 @@ export function createSupabaseBillingReader({ expectedEnvironment, source } = {}
       required.some((method) => typeof source[method] !== 'function')) {
     refuse('supabase_reader_unavailable');
   }
+  const readerIdDescriptor = Object.getOwnPropertyDescriptor(source, 'trustedReaderId');
+  const candidateReaderId = readerIdDescriptor && Object.hasOwn(readerIdDescriptor, 'value')
+    ? readerIdDescriptor.value : null;
+  const trustedReaderId = typeof candidateReaderId === 'string' && SQL_READER_ID.test(candidateReaderId)
+    ? candidateReaderId : null;
   const identity = Object.freeze({ projectRef: expectedEnvironment.database.projectRef,
     branchId: expectedEnvironment.database.branchId, readOnly: true });
 
@@ -247,6 +266,7 @@ export function createSupabaseBillingReader({ expectedEnvironment, source } = {}
 
   return Object.freeze({
     identity,
+    trustedReaderId,
     readIdentity,
     async readBillingSnapshot(input) {
       validateReaderBinding(input, expectedEnvironment);
@@ -303,6 +323,48 @@ export function createSupabaseBillingReader({ expectedEnvironment, source } = {}
         if (error instanceof SupabaseRefusal) throw error;
         refuse('supabase_reader_unavailable');
       }
+    },
+    async readInstalledSchemaState(input) {
+      if (!trustedReaderId || typeof source.readInstalledSchemaState !== 'function') {
+        refuse('supabase_sql_reader_unavailable');
+      }
+      const target = validateSqlReaderBinding(input, expectedEnvironment);
+      await readIdentity();
+      let raw;
+      try {
+        raw = await source.readInstalledSchemaState(Object.freeze({ ...target, readerId: trustedReaderId, readOnly: true }));
+      } catch {
+        refuse('supabase_sql_reader_unavailable');
+      }
+      let state;
+      try { state = sanitizeInstalledSchemaState(raw); }
+      catch { refuse('supabase_sql_response_invalid'); }
+      if (state.readerId !== trustedReaderId || state.projectRef !== target.projectRef ||
+          state.parentProjectRef !== target.parentProjectRef || state.branchId !== target.branchId ||
+          state.branchName !== target.branchName) refuse('supabase_sql_response_invalid');
+      return state;
+    },
+    async readConcurrencyProof(input) {
+      if (!trustedReaderId || typeof source.readConcurrencyProof !== 'function') {
+        refuse('supabase_sql_reader_unavailable');
+      }
+      const target = validateSqlReaderBinding(input, expectedEnvironment, true);
+      await readIdentity();
+      let raw;
+      try {
+        raw = await source.readConcurrencyProof(Object.freeze({ ...target, readerId: trustedReaderId, readOnly: true }));
+      } catch {
+        refuse('supabase_sql_reader_unavailable');
+      }
+      let proof;
+      try { proof = sanitizeSqlConcurrencyProof(raw); }
+      catch { refuse('supabase_sql_response_invalid'); }
+      if (proof.readerId !== trustedReaderId || proof.projectRef !== target.projectRef ||
+          proof.parentProjectRef !== target.parentProjectRef || proof.branchId !== target.branchId ||
+          proof.branchName !== target.branchName || proof.barrierId !== target.barrierId) {
+        refuse('supabase_sql_response_invalid');
+      }
+      return proof;
     },
   });
 }

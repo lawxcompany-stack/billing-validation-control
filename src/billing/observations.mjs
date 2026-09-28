@@ -3,6 +3,13 @@ import { assertCurrentAttempt } from './contracts.mjs';
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 
 const TABLES = Object.freeze(['attempts', 'contexts', 'contracts', 'settlements', 'grants', 'revisions', 'usage']);
+const SQL_ASSERTION_IDS = Object.freeze(['checkout_rls', 'catalog_version_audit', 'usage_reservation_replay',
+  'legacy_plan_webhook_compatibility', 'settlement_lock_order', 'stale_completion_renewal_fencing']);
+const SQL_RACE_IDS = Object.freeze(['coupon_capacity', 'checkout_payment_context_idempotency', 'plan_change', 'adjustment']);
+const SQL_BARRIER_IDS = new Set(['billing-sql-barrier-a', 'billing-sql-barrier-b']);
+const SQL_DIGEST = /^[0-9a-f]{64}$/u;
+const SQL_PROJECT_REF = /^[a-z0-9]{20}$/u;
+const SQL_BRANCH = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const ROW_KEYS = Object.freeze({
   attempts: ['id', 'quoteId', 'status'],
   contexts: ['sessionId', 'attemptId', 'status'],
@@ -21,6 +28,21 @@ export class BillingObservationRefusal extends Error {
 function refuse(code) { throw new BillingObservationRefusal(code); }
 function isObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function safeToken(value) { return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(value) && !/(?:secret|cookie|token|session_state)/iu.test(value); }
+function dataRecord(value, keys) {
+  if (!isObject(value)) return false;
+  let ownKeys;
+  try { ownKeys = Reflect.ownKeys(value); } catch { return false; }
+  if (ownKeys.length !== keys.length || ownKeys.some((key) => typeof key !== 'string' || !keys.includes(key))) return false;
+  const result = {};
+  try {
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || descriptor.enumerable !== true) return false;
+      result[key] = descriptor.value;
+    }
+  } catch { return false; }
+  return result;
+}
 function ref(value) { return typeof value === 'string' ? value : value?.id; }
 function dateMs(value) { const result = Date.parse(value); return Number.isFinite(result) ? result : null; }
 function clean(value) { return typeof value === 'string' && /^[a-z_]{1,64}$/u.test(value) ? value : null; }
@@ -174,6 +196,61 @@ export function sanitizeDatabaseSnapshot(snapshot) {
     }).sort((a, b) => canonical(a).localeCompare(canonical(b)));
   }
   return cleanSnapshot;
+}
+
+/** Project an independently read installed-schema receipt into a closed, digest-only form. */
+export function sanitizeInstalledSchemaState(value) {
+  const keys = ['version', 'readerId', 'projectRef', 'parentProjectRef', 'branchId', 'branchName', 'isDefaultBranch',
+    'schemaFingerprintSha256', 'migrationHistorySha256', 'triggerDigestSha256', 'aclDigestSha256',
+    'privilegeDigestSha256'];
+  const state = dataRecord(value, keys);
+  if (!state || state.version !== 1 || !safeToken(state.readerId) ||
+      !SQL_PROJECT_REF.test(state.projectRef) || !SQL_PROJECT_REF.test(state.parentProjectRef) ||
+      !SQL_BRANCH.test(state.branchId) || !SQL_BRANCH.test(state.branchName) ||
+      typeof state.isDefaultBranch !== 'boolean' ||
+      ['schemaFingerprintSha256', 'migrationHistorySha256', 'triggerDigestSha256', 'aclDigestSha256',
+        'privilegeDigestSha256'].some((key) => !SQL_DIGEST.test(state[key] ?? ''))) {
+    refuse('sql_schema_observation_invalid');
+  }
+  return Object.freeze(state);
+}
+
+/** Validate the fixed Task 7 assertion and race receipt shape without retaining raw database rows. */
+export function sanitizeSqlConcurrencyProof(value) {
+  const keys = ['version', 'readerId', 'projectRef', 'parentProjectRef', 'branchId', 'branchName', 'barrierId',
+    'assertionDigests', 'races'];
+  const proof = dataRecord(value, keys);
+  const assertionDigests = proof && dataRecord(proof.assertionDigests, SQL_ASSERTION_IDS);
+  const observedRaces = proof && dataRecord(proof.races, SQL_RACE_IDS);
+  if (!proof || proof.version !== 1 || !safeToken(proof.readerId) ||
+      !SQL_PROJECT_REF.test(proof.projectRef) || !SQL_PROJECT_REF.test(proof.parentProjectRef) ||
+      !SQL_BRANCH.test(proof.branchId) || !SQL_BRANCH.test(proof.branchName) ||
+      !SQL_BARRIER_IDS.has(proof.barrierId) || !assertionDigests ||
+      SQL_ASSERTION_IDS.some((id) => !SQL_DIGEST.test(assertionDigests[id] ?? '')) || !observedRaces) {
+    refuse('sql_concurrency_observation_invalid');
+  }
+
+  const races = {};
+  for (const id of SQL_RACE_IDS) {
+    const race = dataRecord(observedRaces[id], ['committedOwnerCount', 'committedOwnerDigest', 'loserStateDigest']);
+    if (!race ||
+        race.committedOwnerCount !== 1 || !SQL_DIGEST.test(race.committedOwnerDigest ?? '') ||
+        !SQL_DIGEST.test(race.loserStateDigest ?? '')) refuse('sql_concurrency_observation_invalid');
+    races[id] = Object.freeze({ committedOwnerCount: 1,
+      committedOwnerDigest: race.committedOwnerDigest, loserStateDigest: race.loserStateDigest });
+  }
+
+  return Object.freeze({
+    version: 1,
+    readerId: proof.readerId,
+    projectRef: proof.projectRef,
+    parentProjectRef: proof.parentProjectRef,
+    branchId: proof.branchId,
+    branchName: proof.branchName,
+    barrierId: proof.barrierId,
+    assertionDigests: Object.freeze(assertionDigests),
+    races: Object.freeze(races),
+  });
 }
 
 function snapshotFacts(snapshot) {

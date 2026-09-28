@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
-import { verifySupabaseEnvironment } from '../../src/runtime/supabase.mjs';
+import { createSupabaseBillingReader, verifySupabaseEnvironment } from '../../src/runtime/supabase.mjs';
 import * as supabaseModule from '../../src/runtime/supabase.mjs';
+import { environment as billingEnvironment } from '../billing/support.mjs';
 import { policy } from './fixture.mjs';
 
 const token = 'synthetic-read-token';
@@ -192,4 +193,112 @@ test('rejects oversized migration and generated-types bodies at their own respon
     await assert.rejects(verifySupabaseEnvironment({ policy, token, fetchImpl }), { code: 'supabase_response_invalid' });
     assert.equal(calls.length, target === 'migrations' ? 2 : 3);
   }
+});
+
+test('Supabase SQL reader exposes only pinned read-only schema and concurrency reads', async () => {
+  const target = {
+    projectRef: billingEnvironment.database.projectRef,
+    parentProjectRef: 'zyxwvutsrqponmlkjihg',
+    branchId: billingEnvironment.database.branchId,
+    branchName: 'billing-validation-child',
+  };
+  const assertionDigests = {
+    checkout_rls: '1'.repeat(64),
+    catalog_version_audit: '2'.repeat(64),
+    usage_reservation_replay: '3'.repeat(64),
+    legacy_plan_webhook_compatibility: '4'.repeat(64),
+    settlement_lock_order: '5'.repeat(64),
+    stale_completion_renewal_fencing: '6'.repeat(64),
+  };
+  const races = {
+    coupon_capacity: { committedOwnerCount: 1, committedOwnerDigest: '7'.repeat(64), loserStateDigest: '8'.repeat(64) },
+    checkout_payment_context_idempotency: { committedOwnerCount: 1, committedOwnerDigest: '9'.repeat(64), loserStateDigest: 'a'.repeat(64) },
+    plan_change: { committedOwnerCount: 1, committedOwnerDigest: 'b'.repeat(64), loserStateDigest: 'c'.repeat(64) },
+    adjustment: { committedOwnerCount: 1, committedOwnerDigest: 'd'.repeat(64), loserStateDigest: 'e'.repeat(64) },
+  };
+  const schemaState = {
+    version: 1,
+    readerId: 'sql-reader-a',
+    ...target,
+    isDefaultBranch: false,
+    schemaFingerprintSha256: 'a'.repeat(64),
+    migrationHistorySha256: 'b'.repeat(64),
+    triggerDigestSha256: 'c'.repeat(64),
+    aclDigestSha256: 'd'.repeat(64),
+    privilegeDigestSha256: 'e'.repeat(64),
+  };
+  const concurrencyProof = (barrierId) => ({
+    version: 1,
+    readerId: 'sql-reader-a',
+    ...target,
+    barrierId,
+    assertionDigests,
+    races,
+  });
+  const sourceCalls = [];
+  const source = {
+    trustedReaderId: 'sql-reader-a',
+    async readIdentity() {
+      return { projectRef: billingEnvironment.database.projectRef,
+        branchId: billingEnvironment.database.branchId, readOnly: true };
+    },
+    async readBillingSnapshot() { return {}; },
+    async listAttemptFixtures() { return []; },
+    async readSyntheticFixture() { return null; },
+    async readWebhookInbox() { return null; },
+    async readWebhookReceipts() { return []; },
+    async readInstalledSchemaState(input) {
+      sourceCalls.push({ method: 'schema', input });
+      return schemaState;
+    },
+    async readConcurrencyProof(input) {
+      sourceCalls.push({ method: 'barrier', input });
+      return concurrencyProof(input.barrierId);
+    },
+  };
+  const reader = createSupabaseBillingReader({ expectedEnvironment: billingEnvironment, source });
+
+  assert.equal(reader.trustedReaderId, 'sql-reader-a');
+  assert.equal(typeof reader.readInstalledSchemaState, 'function');
+  assert.equal(typeof reader.readConcurrencyProof, 'function');
+  assert.deepEqual(await reader.readInstalledSchemaState(target), schemaState);
+  assert.deepEqual(await reader.readConcurrencyProof({ ...target, barrierId: 'billing-sql-barrier-a' }),
+    concurrencyProof('billing-sql-barrier-a'));
+  assert.deepEqual(sourceCalls.map(({ method }) => method), ['schema', 'barrier']);
+  assert.deepEqual(sourceCalls[0].input, { ...target, readerId: 'sql-reader-a', readOnly: true });
+  assert.deepEqual(sourceCalls[1].input, { ...target, readerId: 'sql-reader-a', readOnly: true,
+    barrierId: 'billing-sql-barrier-a' });
+  assert.equal(sourceCalls.some(({ input }) => Object.hasOwn(input, 'sql') ||
+    Object.hasOwn(input, 'candidateSha') || Object.hasOwn(input, 'script')), false);
+  await assert.rejects(reader.readInstalledSchemaState({ ...target, candidateSql: 'SELECT 1' }),
+    { code: 'supabase_sql_reader_input_invalid' });
+  await assert.rejects(reader.readConcurrencyProof({ ...target, barrierId: 'billing-sql-barrier-a',
+    applyCandidateSql: true }), { code: 'supabase_sql_reader_input_invalid' });
+  assert.equal(sourceCalls.length, 2);
+});
+
+test('missing trusted installed-schema or concurrency readers refuse without a generic query fallback', async () => {
+  const source = {
+    trustedReaderId: 'sql-reader-unavailable',
+    async readIdentity() {
+      return { projectRef: billingEnvironment.database.projectRef,
+        branchId: billingEnvironment.database.branchId, readOnly: true };
+    },
+    async readBillingSnapshot() { return {}; },
+    async listAttemptFixtures() { return []; },
+    async readSyntheticFixture() { return null; },
+    async readWebhookInbox() { return null; },
+    async readWebhookReceipts() { return []; },
+    async query() { throw new Error('generic query must not be used'); },
+  };
+  const reader = createSupabaseBillingReader({ expectedEnvironment: billingEnvironment, source });
+  const target = { projectRef: billingEnvironment.database.projectRef,
+    parentProjectRef: 'zyxwvutsrqponmlkjihg', branchId: billingEnvironment.database.branchId,
+    branchName: 'billing-validation-child' };
+
+  assert.equal(typeof reader.readInstalledSchemaState, 'function');
+  assert.equal(typeof reader.readConcurrencyProof, 'function');
+  await assert.rejects(reader.readInstalledSchemaState(target), { code: 'supabase_sql_reader_unavailable' });
+  await assert.rejects(reader.readConcurrencyProof({ ...target, barrierId: 'billing-sql-barrier-a' }),
+    { code: 'supabase_sql_reader_unavailable' });
 });

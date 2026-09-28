@@ -298,6 +298,65 @@ test('invoice retrieval requests expansion for payments.data.payment.payment_int
   assert.deepEqual(params, { expand: ['payments.data.payment.payment_intent'] });
 });
 
+test('installed SQL and concurrency observations accept only complete versioned digest receipts', () => {
+  const sanitizeSchema = needExport(observations, 'sanitizeInstalledSchemaState');
+  const sanitizeConcurrency = needExport(observations, 'sanitizeSqlConcurrencyProof');
+  const schema = {
+    version: 1,
+    readerId: 'sql-reader-a',
+    projectRef: 'abcdefghijklmnopqrst',
+    parentProjectRef: 'zyxwvutsrqponmlkjihg',
+    branchId: 'validation-child-123',
+    branchName: 'billing-validation-child',
+    isDefaultBranch: false,
+    schemaFingerprintSha256: 'a'.repeat(64),
+    migrationHistorySha256: 'b'.repeat(64),
+    triggerDigestSha256: 'c'.repeat(64),
+    aclDigestSha256: 'd'.repeat(64),
+    privilegeDigestSha256: 'e'.repeat(64),
+  };
+  const assertionDigests = {
+    checkout_rls: '1'.repeat(64),
+    catalog_version_audit: '2'.repeat(64),
+    usage_reservation_replay: '3'.repeat(64),
+    legacy_plan_webhook_compatibility: '4'.repeat(64),
+    settlement_lock_order: '5'.repeat(64),
+    stale_completion_renewal_fencing: '6'.repeat(64),
+  };
+  const races = {
+    coupon_capacity: { committedOwnerCount: 1, committedOwnerDigest: '7'.repeat(64), loserStateDigest: '8'.repeat(64) },
+    checkout_payment_context_idempotency: { committedOwnerCount: 1, committedOwnerDigest: '9'.repeat(64), loserStateDigest: 'a'.repeat(64) },
+    plan_change: { committedOwnerCount: 1, committedOwnerDigest: 'b'.repeat(64), loserStateDigest: 'c'.repeat(64) },
+    adjustment: { committedOwnerCount: 1, committedOwnerDigest: 'd'.repeat(64), loserStateDigest: 'e'.repeat(64) },
+  };
+  const proof = {
+    version: 1,
+    readerId: 'sql-reader-a',
+    projectRef: schema.projectRef,
+    parentProjectRef: schema.parentProjectRef,
+    branchId: schema.branchId,
+    branchName: schema.branchName,
+    barrierId: 'billing-sql-barrier-a',
+    assertionDigests,
+    races,
+  };
+
+  assert.deepEqual(sanitizeSchema(schema), schema);
+  assert.deepEqual(sanitizeConcurrency(proof), proof);
+  for (const invalidSchema of [
+    { ...schema, migrationHistorySha256: undefined },
+    { ...schema, schemaFingerprintSha256: undefined },
+    { ...schema, triggerDigestSha256: 'not-a-digest' },
+    { ...schema, rawCatalog: 'must not escape' },
+  ]) assert.throws(() => sanitizeSchema(invalidSchema));
+  for (const invalidProof of [
+    { ...proof, assertionDigests: { ...assertionDigests, checkout_rls: undefined } },
+    { ...proof, races: { ...races, coupon_capacity: { ...races.coupon_capacity, committedOwnerCount: 2 } } },
+    { ...proof, races: { ...races, adjustment: { ...races.adjustment, loserStateDigest: 'invalid' } } },
+    { ...proof, sql: 'candidate SQL must not escape' },
+  ]) assert.throws(() => sanitizeConcurrency(invalidProof));
+});
+
 test('invoice payment intent identity rejects missing, mismatched, multiple, and partial-page relationships', async () => {
   const observe = needExport(observations, 'observeFinancialEvidence');
   const invalidInvoices = [

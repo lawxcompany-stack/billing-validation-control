@@ -234,12 +234,12 @@ Manifest interface: canonical manifest contains exact source/run/attempt identit
 - Test: test/runtime/supabase.test.mjs
 - Modify: package.json
 
-- [ ] Test a read-only installed-schema verifier rejects missing migration/fingerprint, wrong parent/child branch, disallowed main, trigger/ACL/privilege drift and any request to apply candidate SQL.
-- [ ] Test two independent backend barriers verify coupon capacity, checkout/payment-context idempotency, plan-change and adjustment races; require one committed owner and exact loser state rather than timing-only assertions.
-- [ ] Test dedicated assertions for checkout RLS, catalog version audit, usage reservation/replay, legacy plan/webhook compatibility, settlement lock order and stale completion/renewal fencing.
+- [x] Test a read-only installed-schema verifier rejects missing migration/fingerprint, wrong parent/child branch, disallowed main, trigger/ACL/privilege drift and any request to apply candidate SQL.
+- [x] Test two independent backend barriers verify coupon capacity, checkout/payment-context idempotency, plan-change and adjustment races; require one committed owner and exact loser state rather than timing-only assertions.
+- [x] Test dedicated assertions for checkout RLS, catalog version audit, usage reservation/replay, legacy plan/webhook compatibility, settlement lock order and stale completion/renewal fencing.
 - [ ] Implement a trusted gate interface that consumes versioned expected invariants and independent DB readers only. It must never execute scripts, migrations, SQL files or artifacts from the candidate SHA; no supabase db push or DDL.
-- [ ] Run gate tests with local Postgres fakes/fixtures only plus full npm test.
-- [ ] Commit as test(billing): preserve trusted SQL and concurrency gates.
+- [x] Run gate tests with local Postgres fakes/fixtures only plus full npm test.
+- [x] Commit as test(billing): preserve trusted SQL and concurrency gates.
 
 ### Task 8: Append-only reconciliation and retention receipt cleanup
 
