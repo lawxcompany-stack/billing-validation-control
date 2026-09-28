@@ -11,6 +11,8 @@ const ISO_UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/
 const MAX_ATTESTATION_AGE_MS = 300_000;
 const MAX_FUTURE_SKEW_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_ATTESTATION_RESPONSE_BYTES = 64 * 1024;
+const VERIFIED_DEPLOYMENT_ATTESTATIONS = new WeakMap();
 
 export class AttestationRefusal extends Error {
   constructor(code) {
@@ -22,6 +24,40 @@ export class AttestationRefusal extends Error {
 
 function refuse(code) {
   throw new AttestationRefusal(code);
+}
+
+async function readBoundedAttestationJson(response) {
+  const contentType = response.headers?.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
+  if (contentType !== 'application/json') refuse('attestation_response_invalid');
+  const contentLength = response.headers.get('content-length');
+  if (contentLength !== null && (!/^(?:0|[1-9][0-9]*)$/u.test(contentLength) ||
+      Number(contentLength) > MAX_ATTESTATION_RESPONSE_BYTES)) refuse('attestation_response_invalid');
+  if (!response.body || typeof response.body.getReader !== 'function') refuse('attestation_response_invalid');
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array)) refuse('attestation_response_invalid');
+      totalBytes += value.byteLength;
+      if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_ATTESTATION_RESPONSE_BYTES) {
+        try { await reader.cancel(); } catch { /* response already closed */ }
+        refuse('attestation_response_invalid');
+      }
+      chunks.push(Buffer.from(value));
+    }
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, totalBytes));
+    return JSON.parse(text);
+  } catch (error) {
+    try { await reader.cancel(); } catch { /* response already closed */ }
+    if (error instanceof AttestationRefusal) throw error;
+    refuse('attestation_response_invalid');
+  } finally {
+    try { reader.releaseLock(); } catch { /* an outstanding read still owns the lock */ }
+  }
 }
 
 function isObject(value) {
@@ -68,6 +104,19 @@ function verifyTimestamp(value, now) {
   const currentTime = typeof now === 'function' ? now() : Date.now();
   if (!Number.isFinite(currentTime) || currentTime - timestamp > MAX_ATTESTATION_AGE_MS ||
       timestamp - currentTime > MAX_FUTURE_SKEW_MS) refuse('attestation_timestamp_invalid');
+  return timestamp;
+}
+
+export function isVerifiedDeploymentAttestation(capability, { deployment, candidate, now } = {}) {
+  const binding = capability !== null && typeof capability === 'object'
+    ? VERIFIED_DEPLOYMENT_ATTESTATIONS.get(capability) : null;
+  if (!binding || deployment?.id !== binding.deploymentId || deployment?.origin !== binding.origin ||
+      candidate?.candidateSha !== binding.candidateSha || candidate?.treeSha !== binding.treeSha) return false;
+  let currentTime;
+  try { currentTime = typeof now === 'function' ? now() : Date.now(); }
+  catch { return false; }
+  return Number.isFinite(currentTime) && currentTime - binding.timestamp <= MAX_ATTESTATION_AGE_MS &&
+    binding.timestamp - currentTime <= MAX_FUTURE_SKEW_MS;
 }
 
 export async function verifyDeploymentAttestation(options = {}) {
@@ -92,12 +141,13 @@ export async function verifyDeploymentAttestation(options = {}) {
   } catch {
     refuse('attestation_unavailable');
   }
-  if (!response || response.ok !== true || typeof response.json !== 'function') refuse('attestation_unavailable');
+  if (!response || response.ok !== true) refuse('attestation_unavailable');
 
   let document;
   try {
-    document = await response.json();
-  } catch {
+    document = await readBoundedAttestationJson(response);
+  } catch (error) {
+    if (error instanceof AttestationRefusal) throw error;
     refuse('attestation_unavailable');
   }
   validateDocumentShape(document);
@@ -119,9 +169,12 @@ export async function verifyDeploymentAttestation(options = {}) {
       document.origin !== origin || document.commit !== candidate.candidateSha ||
       document.treeHash !== candidate.treeSha || document.env !== 'billing-validation' ||
       document.projectRef !== policy.database.projectRef) refuse('attestation_identity_mismatch');
-  verifyTimestamp(document.timestamp, now);
+  const timestamp = verifyTimestamp(document.timestamp, now);
 
   const identity = {};
   for (const field of RESPONSE_FIELDS) identity[field] = document[field];
-  return Object.freeze(identity);
+  const capability = Object.freeze(identity);
+  VERIFIED_DEPLOYMENT_ATTESTATIONS.set(capability, Object.freeze({ deploymentId: document.deploymentId,
+    origin: document.origin, candidateSha: candidate.candidateSha, treeSha: candidate.treeSha, timestamp }));
+  return capability;
 }

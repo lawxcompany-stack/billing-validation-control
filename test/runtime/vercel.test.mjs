@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { verifyDeploymentAttestation } from '../../src/runtime/vercel.mjs';
+import { isVerifiedDeploymentAttestation, verifyDeploymentAttestation } from '../../src/runtime/vercel.mjs';
 import { candidate, deployment, fetchFixture, policy, signedAttestation } from './fixture.mjs';
 
 test('fetches identity only from immutable deployment origin with redirects, cache, and credentials disabled', async () => {
@@ -74,6 +74,24 @@ test('accepts inclusive maximum-age and future-skew timestamp boundaries', async
   }
 });
 
+test('a verified deployment capability stops authorizing use after the five-minute freshness window', async () => {
+  const verifiedAt = Date.parse('2026-09-23T12:00:00.000Z');
+  const capability = await verifyDeploymentAttestation({
+    deployment,
+    candidate,
+    policy,
+    now: () => verifiedAt,
+    fetchImpl: fetchFixture(signedAttestation({ timestamp: new Date(verifiedAt).toISOString() })).fetchImpl,
+  });
+
+  assert.equal(isVerifiedDeploymentAttestation(capability, { deployment, candidate,
+    now: () => verifiedAt }), true);
+  assert.equal(isVerifiedDeploymentAttestation(capability, { deployment, candidate,
+    now: () => verifiedAt + 300_000 }), true);
+  assert.equal(isVerifiedDeploymentAttestation(capability, { deployment, candidate,
+    now: () => verifiedAt + 300_001 }), false);
+});
+
 test('rejects expired, future, and malformed timestamps', async () => {
   const now = Date.parse('2026-09-23T12:00:00.000Z');
   for (const timestamp of [
@@ -115,5 +133,37 @@ test('rejects extra attestation fields and noncanonical signatures', async () =>
     await assert.rejects(verifyDeploymentAttestation({
       deployment, candidate, policy, fetchImpl: fetchFixture(document).fetchImpl,
     }), { code: document === noncanonicalSignature ? 'attestation_signature_invalid' : 'attestation_shape_invalid' });
+  }
+});
+
+test('bounds signed deployment-identity responses before parsing and does not use buffered response.json()', async () => {
+  const valid = signedAttestation();
+  for (const mode of [
+    { contentLength: String(64 * 1024 + 1), chunk: Buffer.from(JSON.stringify(valid)) },
+    { contentLength: null, chunk: Buffer.alloc(64 * 1024 + 1, 97) },
+  ]) {
+    const calls = { reads: 0, cancels: 0, json: 0 };
+    const body = new ReadableStream({
+      start(controller) { controller.enqueue(mode.chunk); controller.close(); },
+      cancel() { calls.cancels += 1; },
+    });
+    const getReader = body.getReader.bind(body);
+    body.getReader = (...args) => { calls.reads += 1; return getReader(...args); };
+    const response = {
+      ok: true,
+      status: 200,
+      headers: { get(name) {
+        if (name.toLowerCase() === 'content-type') return 'application/json';
+        if (name.toLowerCase() === 'content-length') return mode.contentLength;
+        return null;
+      } },
+      body,
+      async json() { calls.json += 1; return valid; },
+    };
+
+    await assert.rejects(verifyDeploymentAttestation({ deployment, candidate, policy,
+      fetchImpl: async () => response }), { code: 'attestation_response_invalid' });
+    assert.equal(calls.json, 0);
+    if (mode.contentLength !== null) assert.equal(calls.reads, 0);
   }
 });

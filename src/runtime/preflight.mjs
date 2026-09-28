@@ -102,7 +102,7 @@ export async function preflightRuntime(options = {}) {
   }
 
   const deployment = await resolvePreviewDeployment({ api, candidate, policy });
-  await verifyDeploymentAttestation({ deployment, candidate, policy, fetchImpl, now });
+  const deploymentAttestation = await verifyDeploymentAttestation({ deployment, candidate, policy, fetchImpl, now });
 
   const expectedEnvironment = Object.freeze({
     database: Object.freeze({ projectRef: policy.database.projectRef, branchId: policy.database.branchId }),
@@ -113,5 +113,7 @@ export async function preflightRuntime(options = {}) {
 
   const supabase = await verifySupabaseEnvironment({ policy, token: supabaseToken, fetchImpl });
   const stripe = await verifyStripeEnvironment({ policy, deployment, key: stripeKey, fetchImpl });
-  return Object.freeze({ expectedEnvironment, providerVerification: Object.freeze({ supabase, stripe }) });
+  return Object.freeze({ expectedEnvironment, providerVerification: Object.freeze({ supabase, stripe }),
+    candidate: Object.freeze({ candidateSha: candidate.candidateSha, treeSha: candidate.treeSha }),
+    deploymentAttestation });
 }

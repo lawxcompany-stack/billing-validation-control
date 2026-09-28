@@ -1,13 +1,56 @@
-export const FINANCIAL_SCENARIOS = Object.freeze([
-  'signup.native', 'signup.join', 'signup.advbox', 'signup.expired-intent', 'signup.tampered-intent', 'signup.replay',
-  'pricing.base-agents', 'pricing.progressive', 'pricing.combo', 'pricing.coupon-allowed', 'pricing.coupon-rejected', 'pricing.zero-total',
-  'payment.approved', 'payment.declined', 'payment.3ds', 'payment.abandoned', 'payment.timeout', 'payment.refresh', 'payment.two-tabs',
-  'zero.authorized', 'zero.replay',
-  'subscription.add-area', 'subscription.upgrade', 'subscription.downgrade', 'subscription.proration', 'subscription.renewal', 'subscription.cancellation',
-  'finance.delinquency', 'finance.recovery', 'finance.partial-refund', 'finance.partial-credit', 'finance.concurrent-adjustment',
-  'access.contracted', 'access.uncontracted', 'access.other-team', 'access.extras-preprocedural', 'access.hub-blocked', 'access.custom-blocked',
-  'webhook.invalid-signature', 'webhook.wrong-account', 'webhook.wrong-mode', 'webhook.replay', 'webhook.reverse-order', 'webhook.retry', 'webhook.takeover',
-]);
+import { BILLING_43_IDS, BILLING_43_TASK5_IDS } from '../contracts/billing-43.mjs';
+import { SIGNUP_SCENARIOS } from './scenarios/signup.mjs';
+import { PRICING_SCENARIOS } from './scenarios/pricing.mjs';
+import { PAYMENT_SCENARIOS } from './scenarios/payment.mjs';
+import { ZERO_SCENARIOS } from './scenarios/zero.mjs';
+import { SUBSCRIPTION_SCENARIOS } from './scenarios/subscription.mjs';
+import { FINANCE_SCENARIOS } from './scenarios/finance.mjs';
+import { ACCESS_SCENARIOS } from './scenarios/access.mjs';
+import { WEBHOOK_SCENARIOS } from './scenarios/webhook.mjs';
+
+const task5Entries = [SIGNUP_SCENARIOS, PRICING_SCENARIOS, PAYMENT_SCENARIOS, ZERO_SCENARIOS]
+  .flatMap((domain) => Object.values(domain));
+const task5ById = Object.create(null);
+for (const contract of task5Entries) {
+  if (!BILLING_43_IDS.includes(contract.id) || Object.hasOwn(task5ById, contract.id)) {
+    throw new Error('billing_task5_registry_invalid');
+  }
+  task5ById[contract.id] = contract;
+}
+const task5Ids = BILLING_43_IDS.filter((id) => Object.hasOwn(task5ById, id));
+if (task5Entries.length !== BILLING_43_TASK5_IDS.length ||
+    task5Ids.some((id, index) => id !== BILLING_43_TASK5_IDS[index])) {
+  throw new Error('billing_task5_registry_invalid');
+}
+
+export const TASK5_BLOCKED_SCENARIO_CONTRACTS = Object.freeze(Object.fromEntries(
+  task5Ids.map((id) => [id, task5ById[id]])));
+export const TASK5_BLOCKED_SCENARIO_IDS = Object.freeze(task5Ids);
+
+const task6Entries = [SUBSCRIPTION_SCENARIOS, FINANCE_SCENARIOS, ACCESS_SCENARIOS,
+  WEBHOOK_SCENARIOS].flatMap((domain) => Object.values(domain));
+const task6ById = Object.create(null);
+for (const contract of task6Entries) {
+  if (!BILLING_43_IDS.includes(contract.id) || Object.hasOwn(task6ById, contract.id) ||
+      Object.hasOwn(task5ById, contract.id)) {
+    throw new Error('billing_task6_registry_invalid');
+  }
+  task6ById[contract.id] = contract;
+}
+const task6Ids = BILLING_43_IDS.filter((id) => Object.hasOwn(task6ById, id));
+const expectedTask6Ids = BILLING_43_IDS.slice(BILLING_43_TASK5_IDS.length);
+if (task6Entries.length !== expectedTask6Ids.length ||
+    task6Ids.some((id, index) => id !== expectedTask6Ids[index])) {
+  throw new Error('billing_task6_registry_invalid');
+}
+
+export const TASK6_BLOCKED_SCENARIO_CONTRACTS = Object.freeze(Object.fromEntries(
+  task6Ids.map((id) => [id, task6ById[id]])));
+export const TASK6_BLOCKED_SCENARIO_IDS = Object.freeze(task6Ids);
+
+export const FINANCIAL_SCENARIOS = BILLING_43_IDS;
+
+export const SUPERVISED_FINANCIAL_SCENARIOS = Object.freeze(['signup.advbox', 'payment.3ds']);
 
 export const THREE_DS_SCENARIOS = Object.freeze([
   'initial.challenge.success', 'initial.challenge.cancel', 'initial.challenge.failure',
@@ -57,11 +100,11 @@ const settlement = Object.freeze([...read, 'stripe', 'webhook', 'worker']);
 const negativeWebhook = Object.freeze([...read, 'webhook']);
 
 export const FINANCIAL_EVIDENCE_REQUIREMENTS = Object.freeze({
-  'signup.native': read, 'signup.join': read, 'signup.advbox': Object.freeze([...read, 'browser']),
+  'signup.native': read, 'signup.join': read,
   'signup.expired-intent': read, 'signup.tampered-intent': read, 'signup.replay': read,
   'pricing.base-agents': read, 'pricing.progressive': read, 'pricing.combo': read,
   'pricing.coupon-allowed': read, 'pricing.coupon-rejected': read, 'pricing.zero-total': read,
-  'payment.approved': payment, 'payment.declined': rejectedPayment, 'payment.3ds': payment,
+  'payment.approved': payment, 'payment.declined': rejectedPayment,
   'payment.abandoned': rejectedPayment, 'payment.timeout': rejectedPayment,
   'payment.refresh': payment, 'payment.two-tabs': payment,
   'zero.authorized': read, 'zero.replay': read,
@@ -82,7 +125,6 @@ const scenarioContract = (outcome) => Object.freeze({ outcome });
 export const FINANCIAL_SCENARIO_CONTRACTS = Object.freeze({
   'payment.approved': Object.freeze({ ...scenarioContract('paid'), contextCount: 1 }),
   'payment.declined': Object.freeze({ ...scenarioContract('unpaid'), negativeState: 'declined' }),
-  'payment.3ds': Object.freeze({ ...scenarioContract('paid'), contextCount: 1, challenge: true }),
   'payment.refresh': Object.freeze({ ...scenarioContract('paid'), contextCount: 1, singleEffect: true }),
   'payment.two-tabs': Object.freeze({ ...scenarioContract('paid'), contextCount: 1, singleEffect: true }),
 });

@@ -1,9 +1,12 @@
-import { FINANCIAL_EVIDENCE_REQUIREMENTS, FINANCIAL_SCENARIOS, FINANCIAL_SCENARIO_CONTRACTS } from './fixtures.mjs';
+import { FINANCIAL_EVIDENCE_REQUIREMENTS, FINANCIAL_SCENARIO_CONTRACTS,
+  TASK5_BLOCKED_SCENARIO_CONTRACTS, TASK6_BLOCKED_SCENARIO_CONTRACTS } from './fixtures.mjs';
+import { BILLING_43_IDS, assertCompleteBilling43Contracts } from '../contracts/billing-43.mjs';
 import { assertCurrentAttempt, mutateProvider, BillingControlRefusal } from './contracts.mjs';
 import { databaseSnapshotDigest, databaseSnapshotsEqual, expectedGrantCount, matchingSettlementCount,
   hasVerifiedDeclineState, isTrustedFinancialObservation, isValidExpectedAccess,
   observeFinancialEvidence } from './observations.mjs';
 import { verifyChallengeCapability, verifyOpaqueCapability } from './witnesses.mjs';
+import { reconcileStripeIntent } from '../runtime/stripe.mjs';
 
 export { FINANCIAL_EVIDENCE_REQUIREMENTS };
 
@@ -21,22 +24,38 @@ function timestampMs(value) {
 }
 
 export function requiredFinancialEvidence(caseId) {
-  if (!FINANCIAL_SCENARIOS.includes(caseId) || !Object.hasOwn(FINANCIAL_EVIDENCE_REQUIREMENTS, caseId)) {
+  if (!BILLING_43_IDS.includes(caseId) || !Object.hasOwn(FINANCIAL_EVIDENCE_REQUIREMENTS, caseId)) {
     refuse('financial_scenario_unsupported');
   }
   return FINANCIAL_EVIDENCE_REQUIREMENTS[caseId];
 }
 
-export async function replayCheckoutRequest({ context, applicationRequest } = {}) {
+export async function replayCheckoutRequest({ context, applicationRequest, readStripeIntentObservation,
+  contracts = context?.contracts } = {}) {
+  assertCompleteBilling43Contracts(contracts);
   if (!applicationRequest || typeof applicationRequest !== 'object' || Array.isArray(applicationRequest) ||
       Object.keys(applicationRequest).length !== 3 ||
       !safeId(applicationRequest.quoteId) || typeof applicationRequest.idempotencyKey !== 'string' ||
       !/^[A-Za-z0-9_-]{16,128}$/u.test(applicationRequest.idempotencyKey) ||
       !applicationRequest.sessionParams || typeof applicationRequest.sessionParams !== 'object' ||
       Array.isArray(applicationRequest.sessionParams)) refuse('checkout_replay_request_invalid');
-  await mutateProvider(context, { provider: 'stripe', action: 'checkout.replay',
+  if (typeof readStripeIntentObservation !== 'function') refuse('checkout_replay_reconciliation_unavailable');
+  const request = structuredClone(applicationRequest);
+  const mutation = await mutateProvider(context, { provider: 'stripe', action: 'checkout.replay',
     operation: `checkout-replay:${applicationRequest.quoteId}`,
-    input: { applicationRequest: structuredClone(applicationRequest) } });
+    input: { applicationRequest: request } });
+  if (!mutation || typeof mutation.intentId !== 'string' || typeof mutation.operation !== 'string') {
+    refuse('checkout_replay_intent_unavailable');
+  }
+  const receipt = await reconcileStripeIntent({ attempts: context.attempts, owner: context.owner,
+    intentId: mutation.intentId,
+    readObservation: (intent) => readStripeIntentObservation({ intent, applicationRequest: request,
+      attemptId: context.owner.attemptId, fence: context.owner.fence,
+      environment: context.preflight.expectedEnvironment }) });
+  if (!receipt || typeof receipt.receiptId !== 'string') refuse('checkout_replay_reconciliation_failed');
+  return Object.freeze({ intentId: mutation.intentId, operation: mutation.operation,
+    requestDigest: mutation.requestDigest, idempotencyKey: mutation.idempotencyKey,
+    state: 'reconciled', receiptId: receipt.receiptId });
 }
 
 function replayStateValid(state, event, context) {
@@ -311,8 +330,11 @@ export async function verifyDelayedWebhookDelivery({ context, caseId, identity, 
 
 export async function reconcileFinancialCase({ context, caseId, expectedOutcome, expectedAccess,
   identity, readers, startedAt, challengeWitnessProvider, challengeVerifier } = {}) {
+  const blockedContract = TASK5_BLOCKED_SCENARIO_CONTRACTS[caseId] ??
+    TASK6_BLOCKED_SCENARIO_CONTRACTS[caseId];
+  if (blockedContract) refuse(blockedContract.reasonCode);
   const contract = FINANCIAL_SCENARIO_CONTRACTS[caseId];
-  if (!FINANCIAL_SCENARIOS.includes(caseId) || !contract || !['paid', 'unpaid', 'settled'].includes(contract.outcome)) {
+  if (!BILLING_43_IDS.includes(caseId) || !contract || !['paid', 'unpaid', 'settled'].includes(contract.outcome)) {
     refuse('financial_scenario_unsupported');
   }
   if (expectedOutcome !== undefined && expectedOutcome !== contract.outcome) refuse('financial_outcome_mismatch');

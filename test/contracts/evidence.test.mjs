@@ -2,12 +2,22 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { parseEvidenceArchive } from '../../src/contracts/evidence.mjs';
+import { importIfMissing, needExport, needValue } from '../billing/support.mjs';
 import {
   acceptanceDocument,
   expectedAcceptanceIdentity,
   finalAcceptanceDocument,
   makeZip,
 } from '../github/zip-fixture.mjs';
+
+const evidenceContracts = await importIfMissing(() => import('../../src/contracts/evidence.mjs'));
+const billing43 = await importIfMissing(() => import('../../src/contracts/billing-43.mjs'));
+const fixtures = await importIfMissing(() => import('../../src/billing/fixtures.mjs'));
+function canonicalResults() {
+  const ids = needValue(billing43, 'BILLING_43_IDS');
+  const requirements = needValue(fixtures, 'FINANCIAL_EVIDENCE_REQUIREMENTS');
+  return ids.map((id) => ({ id, status: 'passed', evidence: [...requirements[id]], resourceIds: [] }));
+}
 
 function archiveFor(entries, options) {
   return makeZip(entries, options);
@@ -53,6 +63,278 @@ function reverseObjectKeys(value) {
   }
   return value;
 }
+
+test('canonical result validation accepts exactly the ordered 43 passed results', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const results = canonicalResults();
+  const accepted = validate(results);
+  assert.equal(accepted.length, 43);
+  assert.deepEqual(accepted, results);
+  assert.equal(Object.isFrozen(accepted), true);
+});
+
+test('canonical result validation rejects skipped, neutral, unknown, duplicate, and additional results', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const cases = [
+    (results) => { results[0].status = 'skipped'; },
+    (results) => { results[0].status = 'neutral'; },
+    (results) => { results[0].id = 'unknown.scenario'; },
+    (results) => { results[0].id = results[1].id; },
+    (results) => { results.push(structuredClone(results[0])); },
+  ];
+  for (const mutate of cases) {
+    const results = canonicalResults();
+    mutate(results);
+    assert.throws(() => validate(results), { code: 'billing_result_invalid' });
+  }
+});
+
+test('canonical result validation rejects a direct blocked status', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const results = canonicalResults();
+  results[0].status = 'blocked';
+  assert.throws(() => validate(results), { code: 'billing_result_invalid' });
+});
+
+test('canonical result validation checks schema only and does not authenticate caller-fabricated passes', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const callerFabricated = canonicalResults();
+  assert.equal(validate(callerFabricated).length, 43);
+});
+
+test('canonical result validation rejects extra keys, unknown evidence, and PII-like fields', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const cases = [
+    (results) => { results[0].email = 'person@example.invalid'; },
+    (results) => { results[0][Symbol('unexpected')] = true; },
+    (results) => { results[0].evidence.push('raw-provider-payload'); },
+    (results) => { results[0].resourceIds.push('person@example.invalid'); },
+    (results) => { results[0].status = 200; },
+    (results) => { results[0].appResponse = { status: 200, body: { success: true } }; },
+  ];
+  for (const mutate of cases) {
+    const results = canonicalResults();
+    mutate(results);
+    assert.throws(() => validate(results), { code: 'billing_result_invalid' });
+  }
+});
+
+for (const field of ['id', 'status', 'evidence', 'resourceIds']) {
+  test(`canonical result validation refuses an accessor result field (${field}) without invoking it`, () => {
+    const validate = needExport(evidenceContracts, 'validateBilling43Results');
+    const results = canonicalResults();
+    const result = results[0];
+    const validValue = result[field];
+    let getterReads = 0;
+    delete result[field];
+    Object.defineProperty(result, field, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterReads += 1;
+        return validValue;
+      },
+    });
+
+    assert.throws(() => validate(results), { code: 'billing_result_invalid' });
+    assert.equal(getterReads, 0);
+  });
+}
+
+test('canonical result validation refuses an evidence index accessor without invoking it', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const results = canonicalResults();
+  const evidence = results[0].evidence;
+  const validFirstKind = evidence[0];
+  let getterReads = 0;
+  Object.defineProperty(evidence, '0', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      return validFirstKind;
+    },
+  });
+
+  assert.throws(() => validate(results), { code: 'billing_result_invalid' });
+  assert.equal(getterReads, 0);
+});
+
+test('canonical result validation refuses a result-list index accessor without invoking it', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const results = canonicalResults();
+  const validResult = results[0];
+  let getterReads = 0;
+  Object.defineProperty(results, '0', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      return validResult;
+    },
+  });
+
+  assert.throws(() => validate(results), { code: 'billing_result_invalid' });
+  assert.equal(getterReads, 0);
+});
+
+test('canonical result validation refuses a resource ID index accessor without invoking it', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const results = canonicalResults();
+  const resourceIds = ['cus_allowed'];
+  let getterReads = 0;
+  Object.defineProperty(resourceIds, '0', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      return getterReads <= 2 ? 'cus_allowed' : 'cus_intruder';
+    },
+  });
+  results[0].resourceIds = resourceIds;
+
+  assert.throws(() => validate(results, { ownedResourceIds: ['cus_allowed'] }), {
+    code: 'billing_result_invalid',
+  });
+  assert.equal(getterReads, 0);
+});
+
+test('canonical result validation refuses an owned-resource option accessor without invoking it', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const results = canonicalResults();
+  results[0].resourceIds = ['cus_allowed'];
+  let getterReads = 0;
+  const options = {};
+  Object.defineProperty(options, 'ownedResourceIds', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      return ['cus_allowed'];
+    },
+  });
+
+  assert.throws(() => validate(results, options), { code: 'billing_result_invalid' });
+  assert.equal(getterReads, 0);
+});
+
+test('canonical result validation refuses an owned-resource index accessor without invoking it', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const results = canonicalResults();
+  results[0].resourceIds = ['cus_allowed'];
+  const ownedResourceIds = ['cus_allowed'];
+  let getterReads = 0;
+  Object.defineProperty(ownedResourceIds, '0', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      return 'cus_allowed';
+    },
+  });
+
+  assert.throws(() => validate(results, { ownedResourceIds }), { code: 'billing_result_invalid' });
+  assert.equal(getterReads, 0);
+});
+
+test('canonical result validation rejects sparse, extra, and symbol-keyed inputs', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const invalidInputs = [
+    () => {
+      const results = canonicalResults();
+      delete results[0];
+      return [results];
+    },
+    () => {
+      const results = canonicalResults();
+      results.extra = true;
+      return [results];
+    },
+    () => {
+      const results = canonicalResults();
+      Object.defineProperty(results, Symbol('unexpected'), { value: true });
+      return [results];
+    },
+    () => {
+      const results = canonicalResults();
+      results[0].evidence = ['http', ,];
+      return [results];
+    },
+    () => {
+      const results = canonicalResults();
+      results[0].resourceIds = ['cus_allowed', ,];
+      return [results, { ownedResourceIds: ['cus_allowed'] }];
+    },
+    () => {
+      const results = canonicalResults();
+      results[0].resourceIds = ['cus_allowed'];
+      results[0].resourceIds.extra = true;
+      return [results, { ownedResourceIds: ['cus_allowed'] }];
+    },
+    () => {
+      const results = canonicalResults();
+      results[0].resourceIds = ['cus_allowed'];
+      Object.defineProperty(results[0].resourceIds, Symbol('unexpected'), { value: true });
+      return [results, { ownedResourceIds: ['cus_allowed'] }];
+    },
+    () => {
+      const results = canonicalResults();
+      results[0].resourceIds = ['cus_allowed'];
+      return [results, { ownedResourceIds: ['cus_allowed', ,] }];
+    },
+    () => {
+      const results = canonicalResults();
+      results[0].resourceIds = ['cus_allowed'];
+      const ownedResourceIds = ['cus_allowed'];
+      ownedResourceIds.extra = true;
+      return [results, { ownedResourceIds }];
+    },
+    () => {
+      const results = canonicalResults();
+      results[0].resourceIds = ['cus_allowed'];
+      const ownedResourceIds = ['cus_allowed'];
+      Object.defineProperty(ownedResourceIds, Symbol('unexpected'), { value: true });
+      return [results, { ownedResourceIds }];
+    },
+    () => [canonicalResults(), { ownedResourceIds: [], unexpected: true }],
+    () => {
+      const options = { ownedResourceIds: [] };
+      Object.defineProperty(options, Symbol('unexpected'), { value: true });
+      return [canonicalResults(), options];
+    },
+    () => {
+      const results = canonicalResults();
+      Object.defineProperty(results[0].evidence, Symbol('unexpected'), { value: true });
+      return [results];
+    },
+  ];
+
+  for (const makeInput of invalidInputs) {
+    const [results, options] = makeInput();
+    assert.throws(() => validate(results, options), { code: 'billing_result_invalid' });
+  }
+});
+
+test('an application HTTP response cannot provide a canonical scenario pass', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const httpOnly = canonicalResults();
+  httpOnly[0].evidence = ['http'];
+  assert.throws(() => validate(httpOnly), { code: 'billing_result_invalid' });
+
+  const copiedHttpBody = canonicalResults();
+  copiedHttpBody[0] = { id: 'payment.approved', status: 200, evidence: ['http'], resourceIds: [] };
+  assert.throws(() => validate(copiedHttpBody), { code: 'billing_result_invalid' });
+});
+
+test('resource IDs must be supplied by the trusted owner allowlist', () => {
+  const validate = needExport(evidenceContracts, 'validateBilling43Results');
+  const results = canonicalResults();
+  results[0].resourceIds = ['cus_task6'];
+  const ownerResultIds = ['cus_task6'];
+  const accepted = validate(results, { ownedResourceIds: ownerResultIds });
+  assert.equal(accepted[0].resourceIds[0], 'cus_task6');
+  assert.throws(() => validate(results), { code: 'billing_result_invalid' });
+});
 
 test('parses the sealed final producer manifest into a minimal projection', () => {
   const document = finalAcceptanceDocument();

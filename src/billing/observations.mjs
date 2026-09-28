@@ -1,7 +1,15 @@
 import { createHash } from 'node:crypto';
 import { assertCurrentAttempt } from './contracts.mjs';
+import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 
 const TABLES = Object.freeze(['attempts', 'contexts', 'contracts', 'settlements', 'grants', 'revisions', 'usage']);
+const SQL_ASSERTION_IDS = Object.freeze(['checkout_rls', 'catalog_version_audit', 'usage_reservation_replay',
+  'legacy_plan_webhook_compatibility', 'settlement_lock_order', 'stale_completion_renewal_fencing']);
+const SQL_RACE_IDS = Object.freeze(['coupon_capacity', 'checkout_payment_context_idempotency', 'plan_change', 'adjustment']);
+const SQL_BARRIER_IDS = new Set(['billing-sql-barrier-a', 'billing-sql-barrier-b']);
+const SQL_DIGEST = /^[0-9a-f]{64}$/u;
+const SQL_PROJECT_REF = /^[a-z0-9]{20}$/u;
+const SQL_BRANCH = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const ROW_KEYS = Object.freeze({
   attempts: ['id', 'quoteId', 'status'],
   contexts: ['sessionId', 'attemptId', 'status'],
@@ -20,6 +28,21 @@ export class BillingObservationRefusal extends Error {
 function refuse(code) { throw new BillingObservationRefusal(code); }
 function isObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function safeToken(value) { return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(value) && !/(?:secret|cookie|token|session_state)/iu.test(value); }
+function dataRecord(value, keys) {
+  if (!isObject(value)) return false;
+  let ownKeys;
+  try { ownKeys = Reflect.ownKeys(value); } catch { return false; }
+  if (ownKeys.length !== keys.length || ownKeys.some((key) => typeof key !== 'string' || !keys.includes(key))) return false;
+  const result = {};
+  try {
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || descriptor.enumerable !== true) return false;
+      result[key] = descriptor.value;
+    }
+  } catch { return false; }
+  return result;
+}
 function ref(value) { return typeof value === 'string' ? value : value?.id; }
 function dateMs(value) { const result = Date.parse(value); return Number.isFinite(result) ? result : null; }
 function clean(value) { return typeof value === 'string' && /^[a-z_]{1,64}$/u.test(value) ? value : null; }
@@ -31,6 +54,118 @@ function canonical(value) {
   return JSON.stringify(value);
 }
 function digest(value) { return createHash('sha256').update(canonical(value), 'utf8').digest('hex'); }
+
+/** Compose independently configured readonly sources without inventing their remote schemas. */
+export function createIndependentBillingReaders({ expectedEnvironment, expectedWebhookEndpointId,
+  supabase, stripe } = {}) {
+  const supabaseMethods = ['readIdentity', 'readBillingSnapshot', 'listAttemptFixtures',
+    'readSyntheticFixture', 'readWebhookInbox', 'readWebhookReceipts'];
+  const stripeMethods = ['readIdentity', 'retrieve', 'listEvents', 'retrieveWebhookEndpoint'];
+  if (!isValidExpectedEnvironment(expectedEnvironment) ||
+      typeof expectedWebhookEndpointId !== 'string' || !/^we_[A-Za-z0-9]+$/u.test(expectedWebhookEndpointId) ||
+      supabaseMethods.some((method) => typeof supabase?.[method] !== 'function') ||
+      stripeMethods.some((method) => typeof stripe?.[method] !== 'function') ||
+      supabase.identity?.projectRef !== expectedEnvironment.database.projectRef ||
+      supabase.identity?.branchId !== expectedEnvironment.database.branchId ||
+      supabase.identity?.readOnly !== true || stripe.identity?.accountId !== expectedEnvironment.stripe.accountId ||
+      stripe.identity?.webhookEndpointId !== expectedWebhookEndpointId ||
+      stripe.identity?.webhookUrl !== `${expectedEnvironment.deployment.origin}/api/stripe/webhook` ||
+      stripe.identity?.livemode !== false || stripe.identity?.readOnly !== true) {
+    refuse('observation_readers_unavailable');
+  }
+
+  async function assertReady(binding) {
+    if (!isObject(binding) || !safeToken(binding.attemptId) || !safeToken(binding.caseId) ||
+        dateMs(binding.startedAt) === null) refuse('observation_reader_binding_invalid');
+    try {
+      const database = await supabase.readIdentity();
+      const provider = await stripe.readIdentity();
+      if (database?.projectRef !== expectedEnvironment.database.projectRef ||
+          database?.branchId !== expectedEnvironment.database.branchId || database?.readOnly !== true ||
+          provider?.accountId !== expectedEnvironment.stripe.accountId ||
+          provider?.webhookEndpointId !== expectedWebhookEndpointId ||
+          provider?.webhookUrl !== `${expectedEnvironment.deployment.origin}/api/stripe/webhook` ||
+          provider?.livemode !== false || provider?.readOnly !== true) refuse('observation_reader_identity_mismatch');
+      const endpoint = await stripe.retrieveWebhookEndpoint(expectedWebhookEndpointId);
+      if (endpoint?.id !== expectedWebhookEndpointId ||
+          endpoint.url !== `${expectedEnvironment.deployment.origin}/api/stripe/webhook` ||
+          endpoint.livemode !== false || !Number.isSafeInteger(endpoint.created) ||
+          !Array.isArray(endpoint.enabledEvents)) refuse('observation_reader_identity_mismatch');
+    } catch { refuse('observation_reader_identity_mismatch'); }
+    return true;
+  }
+
+  async function readWebhookEvidence(input) {
+    const keys = ['attemptId', 'caseId', 'startedAt', 'cutoffAt', 'eventId', 'objectId'];
+    const startedAt = dateMs(input?.startedAt);
+    const cutoffAt = dateMs(input?.cutoffAt);
+    if (!isObject(input) || Reflect.ownKeys(input).length !== keys.length ||
+        keys.some((key) => !Object.hasOwn(input, key)) || !safeToken(input.attemptId) ||
+        !safeToken(input.caseId) || !safeToken(input.eventId) || !safeToken(input.objectId) ||
+        startedAt === null || cutoffAt === null || startedAt > cutoffAt || cutoffAt > Date.now()) {
+      refuse('observation_reader_binding_invalid');
+    }
+    await assertReady(input);
+    const started = Math.ceil(startedAt / 1000);
+    const cutoff = Math.floor(cutoffAt / 1000);
+    let events;
+    try {
+      events = await stripe.listEvents({ eventId: input.eventId, objectId: input.objectId,
+        attemptId: input.attemptId, caseId: input.caseId, created: { gte: started, lte: cutoff } });
+    } catch { refuse('observation_read_failed'); }
+    if (!Array.isArray(events) || events.length > 100) refuse('observation_evidence_invalid');
+    const eventMatches = events.filter((event) => event?.id === input.eventId &&
+      typeof event.eventType === 'string' && event.accountId === expectedEnvironment.stripe.accountId &&
+      event.livemode === false && event.objectId === input.objectId &&
+      Number.isSafeInteger(event.created) && event.created * 1000 >= startedAt &&
+      event.created * 1000 <= cutoffAt);
+    if (eventMatches.length !== 1) refuse('observation_evidence_invalid');
+    let endpoint;
+    try { endpoint = await stripe.retrieveWebhookEndpoint(expectedWebhookEndpointId); }
+    catch { refuse('observation_read_failed'); }
+    const event = eventMatches[0];
+    if (endpoint?.id !== expectedWebhookEndpointId ||
+        endpoint.url !== `${expectedEnvironment.deployment.origin}/api/stripe/webhook` ||
+        endpoint.livemode !== false || !Number.isSafeInteger(endpoint.created) ||
+        endpoint.created > event.created || !Array.isArray(endpoint.enabledEvents) ||
+        !endpoint.enabledEvents.includes(event.eventType)) refuse('observation_evidence_invalid');
+
+    let inbox;
+    let receipts;
+    try {
+      const query = Object.freeze({ attemptId: input.attemptId, caseId: input.caseId,
+        branchId: expectedEnvironment.database.branchId, eventId: input.eventId, objectId: input.objectId });
+      [inbox, receipts] = await Promise.all([
+        supabase.readWebhookInbox(query), supabase.readWebhookReceipts(query),
+      ]);
+    } catch (error) {
+      if (error?.code === 'supabase_webhook_response_invalid') refuse('observation_evidence_invalid');
+      refuse('observation_read_failed');
+    }
+    const inboxMatches = isObject(inbox) && inbox.attemptId === input.attemptId &&
+      inbox.caseId === input.caseId && inbox.branchId === expectedEnvironment.database.branchId &&
+      inbox.eventId === input.eventId && inbox.objectId === input.objectId && inbox.status === 'processed' &&
+      inbox.accountId === expectedEnvironment.stripe.accountId && inbox.livemode === false;
+    const receivedAt = dateMs(inbox?.receivedAt);
+    const processedAt = dateMs(inbox?.processedAt);
+    const inboxWindowValid = receivedAt !== null && processedAt !== null &&
+      startedAt <= receivedAt && receivedAt <= processedAt && processedAt <= cutoffAt;
+    const receiptCount = Array.isArray(receipts) ? receipts.filter((receipt) => isObject(receipt) &&
+      receipt.attemptId === input.attemptId && receipt.caseId === input.caseId &&
+      receipt.branchId === expectedEnvironment.database.branchId && receipt.eventId === input.eventId &&
+      receipt.objectId === input.objectId && receipt.status === 'processed' &&
+      receipt.accountId === expectedEnvironment.stripe.accountId && receipt.livemode === false &&
+      dateMs(receipt.receivedAt) !== null && dateMs(receipt.receivedAt) >= startedAt &&
+      dateMs(receipt.receivedAt) <= cutoffAt && dateMs(receipt.receivedAt) <= processedAt).length : 0;
+    if (!inboxMatches || !inboxWindowValid || receiptCount < 1) refuse('observation_evidence_invalid');
+    return Object.freeze({ eventId: input.eventId, accountId: expectedEnvironment.stripe.accountId,
+      livemode: false, eventObserved: true, inboxStatus: 'processed', receiptCount,
+      receivedAt: new Date(receivedAt).toISOString(), processedAt: new Date(processedAt).toISOString() });
+  }
+
+  return Object.freeze({ expectedEnvironment, expectedWebhookEndpointId, supabase, stripe,
+    assertReady, readWebhookEvidence });
+}
 
 export function sanitizeDatabaseSnapshot(snapshot) {
   if (!isObject(snapshot) || Object.keys(snapshot).length !== TABLES.length + 1 ||
@@ -61,6 +196,61 @@ export function sanitizeDatabaseSnapshot(snapshot) {
     }).sort((a, b) => canonical(a).localeCompare(canonical(b)));
   }
   return cleanSnapshot;
+}
+
+/** Project an independently read installed-schema receipt into a closed, digest-only form. */
+export function sanitizeInstalledSchemaState(value) {
+  const keys = ['version', 'readerId', 'projectRef', 'parentProjectRef', 'branchId', 'branchName', 'isDefaultBranch',
+    'schemaFingerprintSha256', 'migrationHistorySha256', 'triggerDigestSha256', 'aclDigestSha256',
+    'privilegeDigestSha256'];
+  const state = dataRecord(value, keys);
+  if (!state || state.version !== 1 || !safeToken(state.readerId) ||
+      !SQL_PROJECT_REF.test(state.projectRef) || !SQL_PROJECT_REF.test(state.parentProjectRef) ||
+      !SQL_BRANCH.test(state.branchId) || !SQL_BRANCH.test(state.branchName) ||
+      typeof state.isDefaultBranch !== 'boolean' ||
+      ['schemaFingerprintSha256', 'migrationHistorySha256', 'triggerDigestSha256', 'aclDigestSha256',
+        'privilegeDigestSha256'].some((key) => !SQL_DIGEST.test(state[key] ?? ''))) {
+    refuse('sql_schema_observation_invalid');
+  }
+  return Object.freeze(state);
+}
+
+/** Validate the fixed Task 7 assertion and race receipt shape without retaining raw database rows. */
+export function sanitizeSqlConcurrencyProof(value) {
+  const keys = ['version', 'readerId', 'projectRef', 'parentProjectRef', 'branchId', 'branchName', 'barrierId',
+    'assertionDigests', 'races'];
+  const proof = dataRecord(value, keys);
+  const assertionDigests = proof && dataRecord(proof.assertionDigests, SQL_ASSERTION_IDS);
+  const observedRaces = proof && dataRecord(proof.races, SQL_RACE_IDS);
+  if (!proof || proof.version !== 1 || !safeToken(proof.readerId) ||
+      !SQL_PROJECT_REF.test(proof.projectRef) || !SQL_PROJECT_REF.test(proof.parentProjectRef) ||
+      !SQL_BRANCH.test(proof.branchId) || !SQL_BRANCH.test(proof.branchName) ||
+      !SQL_BARRIER_IDS.has(proof.barrierId) || !assertionDigests ||
+      SQL_ASSERTION_IDS.some((id) => !SQL_DIGEST.test(assertionDigests[id] ?? '')) || !observedRaces) {
+    refuse('sql_concurrency_observation_invalid');
+  }
+
+  const races = {};
+  for (const id of SQL_RACE_IDS) {
+    const race = dataRecord(observedRaces[id], ['committedOwnerCount', 'committedOwnerDigest', 'loserStateDigest']);
+    if (!race ||
+        race.committedOwnerCount !== 1 || !SQL_DIGEST.test(race.committedOwnerDigest ?? '') ||
+        !SQL_DIGEST.test(race.loserStateDigest ?? '')) refuse('sql_concurrency_observation_invalid');
+    races[id] = Object.freeze({ committedOwnerCount: 1,
+      committedOwnerDigest: race.committedOwnerDigest, loserStateDigest: race.loserStateDigest });
+  }
+
+  return Object.freeze({
+    version: 1,
+    readerId: proof.readerId,
+    projectRef: proof.projectRef,
+    parentProjectRef: proof.parentProjectRef,
+    branchId: proof.branchId,
+    branchName: proof.branchName,
+    barrierId: proof.barrierId,
+    assertionDigests: Object.freeze(assertionDigests),
+    races: Object.freeze(races),
+  });
 }
 
 function snapshotFacts(snapshot) {
@@ -122,6 +312,20 @@ function collectEventEvidence(event, inbox, receipts, endpoint, expectedEndpoint
     receivedAt: inboxValid ? new Date(inboxReceivedAt).toISOString() : null,
     processedAt: inboxValid ? new Date(inboxProcessedAt).toISOString() : null,
     endpointWindowVerified: endpointWindow, endpointAttribution: 'configuration-window-only' };
+}
+
+function eventForEvidence(event) {
+  if (!isObject(event) || typeof event.eventType !== 'string' || typeof event.objectId !== 'string') return event;
+  return {
+    id: event.id,
+    type: event.eventType,
+    livemode: event.livemode,
+    created: event.created,
+    pending_webhooks: event.pendingWebhooks,
+    api_version: event.apiVersion,
+    account: event.accountId,
+    data: { object: { id: event.objectId, ...(event.customerId ? { customer: event.customerId } : {}) } },
+  };
 }
 
 async function readObservation(operation) {
@@ -206,7 +410,8 @@ export async function observeFinancialEvidence({ context, caseId, identity, read
   let webhook = { eventId: null, processed: false, inboxStatus: null, receiptCount: 0,
     pendingWebhooks: null, providerCreatedAt: null, receivedAt: null, processedAt: null,
     endpointWindowVerified: false, endpointAttribution: 'configuration-window-only' };
-  for (const event of Array.isArray(rawEvents) ? rawEvents : []) {
+  for (const rawEvent of Array.isArray(rawEvents) ? rawEvents : []) {
+    const event = eventForEvidence(rawEvent);
     if (event?.type !== 'invoice.paid' || event.data?.object?.id !== identity.invoiceId ||
         ref(event.data.object.customer) !== identity.customerId || event.livemode !== false) continue;
     const [inbox, receipts, endpoint] = await readObservation(() => Promise.all([

@@ -1,13 +1,41 @@
 import assert from 'node:assert/strict';
+import { generateKeyPairSync, sign } from 'node:crypto';
+import { verifyDeploymentAttestation } from '../../src/runtime/vercel.mjs';
 
 export const environment = Object.freeze({
   database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst', branchId: 'validation-child-123' }),
-  deployment: Object.freeze({ id: 'dpl_task6preview123', origin: 'https://lawx-task6-preview.vercel.app' }),
+  deployment: Object.freeze({ id: 'dpl_task6preview123', origin: 'https://lawx-abc123def-team.vercel.app' }),
   stripe: Object.freeze({ accountId: 'acct_task6test123' }),
+});
+
+export const candidate = Object.freeze({ candidateSha: 'a'.repeat(40), treeSha: 'b'.repeat(40) });
+const attestationKeys = generateKeyPairSync('ed25519');
+const attestationDocument = {
+  origin: environment.deployment.origin,
+  deploymentId: environment.deployment.id,
+  commit: candidate.candidateSha,
+  treeHash: candidate.treeSha,
+  env: 'billing-validation',
+  projectRef: environment.database.projectRef,
+  timestamp: new Date().toISOString(),
+};
+const signedAttestationDocument = { ...attestationDocument,
+  signature: sign(null, Buffer.from(JSON.stringify(attestationDocument)), attestationKeys.privateKey).toString('base64') };
+export const deploymentAttestation = await verifyDeploymentAttestation({
+  deployment: environment.deployment,
+  candidate,
+  policy: { database: { projectRef: environment.database.projectRef }, attestation: {
+    publicKeyPem: attestationKeys.publicKey.export({ type: 'spki', format: 'pem' }),
+  } },
+  fetchImpl: async () => new Response(JSON.stringify(signedAttestationDocument), {
+    status: 200, headers: { 'Content-Type': 'application/json' },
+  }),
 });
 
 export const preflight = Object.freeze({
   expectedEnvironment: environment,
+  candidate,
+  deploymentAttestation,
   providerVerification: Object.freeze({
     supabase: Object.freeze({ projectRef: environment.database.projectRef,
       parentProjectRef: 'zyxwvutsrqponmlkjihg', branchId: environment.database.branchId,
@@ -19,25 +47,94 @@ export const preflight = Object.freeze({
   }),
 });
 
-export function makeAttemptParts({ attemptId = 'attempt-task6', fence = 'fence-task6',
-  currentFence = fence, resourceIds = [], databaseResourceIds = [] } = {}) {
-  const owner = Object.freeze({ attemptId, fence, environment, resourceIds: [...resourceIds],
-    databaseResourceIds: structuredClone(databaseResourceIds) });
-  const calls = { assertions: [], cleanup: [], mutations: [] };
+export function makeAttemptParts({ attemptId = 'attempt-task6', fence = '11111111-1111-4111-8111-111111111111',
+  currentFence = fence, resourceIds = [], databaseResourceIds = [], failReceipt = false } = {}) {
+  const owner = Object.freeze({ attemptId, fence, candidateSha: 'a'.repeat(40),
+    workflow: Object.freeze({ repository: 'lawxcompany-stack/billing-validation-control',
+      ref: 'refs/heads/main', runId: '100', runAttempt: 1,
+      runnerLabel: `billing-validation-${'a'.repeat(32)}` }),
+    environment, resourceIds: [...resourceIds], databaseResourceIds: structuredClone(databaseResourceIds) });
+  const calls = { assertions: [], cleanup: [], mutations: [], fixtureMutations: [], intentBegins: [],
+    pendingQueries: [], reconciliations: [] };
+  const intents = new Map();
+  const receipts = new Map();
   const attempts = {
     async assertFence(input) {
       calls.assertions.push({ ...input });
       if (input.attemptId !== attemptId || input.fence !== currentFence) {
         throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
       }
-      return { ...owner, state: 'rechecking', cleanupStatus: 'pending' };
+      return { ...owner, state: 'collecting', cleanupStatus: 'pending' };
     },
-    async cleanup(input) {
-      calls.cleanup.push({ ...input });
+    async beginStripeIntent(input) {
       if (input.attemptId !== attemptId || input.fence !== currentFence) {
         throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
       }
-      return { cleanupStatus: 'complete' };
+      const prior = [...intents.values()].find((intent) => intent.attemptId === input.attemptId &&
+        intent.operation === input.operation);
+      if (prior) throw Object.assign(new Error('stripe_intent_unresolved'), { code: 'stripe_intent_unresolved' });
+      calls.intentBegins.push(structuredClone(input));
+      const intent = { intentId: `intent-${attemptId}-${intents.size + 1}`,
+        ...structuredClone(input), accountId: input.environment.stripe.accountId, state: 'in_flight' };
+      intents.set(intent.intentId, intent);
+      return structuredClone(intent);
+    },
+    async getStripeIntent(intentId) {
+      return structuredClone(intents.get(intentId) ?? null);
+    },
+    async listPendingStripeIntents(input) {
+      calls.pendingQueries.push(structuredClone(input));
+      if (input.attemptId !== attemptId || input.fence !== currentFence) {
+        throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
+      }
+      return [...intents.values()].filter((intent) => intent.attemptId === input.attemptId &&
+        !receipts.has(intent.intentId)).map((intent) => structuredClone(intent));
+    },
+    async reconcileStripeIntent(input) {
+      calls.reconciliations.push(structuredClone(input));
+      if (input.attemptId !== attemptId || input.fence !== currentFence) {
+        throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
+      }
+      if (failReceipt) throw Object.assign(new Error('stripe_reconciliation_unavailable'), {
+        code: 'stripe_reconciliation_unavailable',
+      });
+      const intent = intents.get(input.intentId);
+      const observation = input.observation;
+      if (!intent || intent.attemptId !== attemptId || observation.accountId !== intent.accountId ||
+          observation.livemode !== false || observation.operation !== intent.operation ||
+          observation.requestDigest !== intent.requestDigest ||
+          observation.idempotencyKey !== intent.idempotencyKey || !Array.isArray(observation.resourceIds) ||
+          observation.resourceIds.length < 1) {
+        throw Object.assign(new Error('stripe_observation_mismatch'), { code: 'stripe_observation_mismatch' });
+      }
+      if (receipts.has(intent.intentId)) {
+        throw Object.assign(new Error('stripe_intent_already_reconciled'), {
+          code: 'stripe_intent_already_reconciled',
+        });
+      }
+      const receipt = { receiptId: `receipt-${attemptId}-${receipts.size + 1}`,
+        intentId: intent.intentId, attemptId, fence: input.fence,
+        observation: structuredClone(observation) };
+      receipts.set(intent.intentId, receipt);
+      return structuredClone(receipt);
+    },
+    async cleanup(input) {
+      calls.cleanup.push(structuredClone(input));
+      if (input.attemptId !== attemptId || input.fence !== currentFence) {
+        throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
+      }
+      if ([...intents.values()].some((intent) => intent.attemptId === attemptId &&
+          !receipts.has(intent.intentId))) {
+        throw Object.assign(new Error('stripe_intent_unresolved'), { code: 'stripe_intent_unresolved' });
+      }
+      return { cleanupStatus: 'complete', cleanupReceipt: { digest: 'f'.repeat(64) } };
+    },
+    async fixtureMutation(input, mutation) {
+      calls.fixtureMutations.push(structuredClone(input));
+      if (input.attemptId !== attemptId || input.fence !== currentFence) {
+        throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
+      }
+      return mutation(Object.freeze({ attemptId, fence: currentFence }));
     },
   };
   const mutationAdapter = {
@@ -46,8 +143,21 @@ export function makeAttemptParts({ attemptId = 'attempt-task6', fence = 'fence-t
       return { id: 'cs_task6created', client_secret: 'sk_test_private_output',
         browserState: 'private-session-state' };
     },
+    async mutateInTransaction(request, transaction) {
+      if (transaction?.attemptId !== attemptId || transaction?.fence !== currentFence) {
+        throw Object.assign(new Error('fixture_transaction_unverified'), {
+          code: 'fixture_transaction_unverified',
+        });
+      }
+      calls.mutations.push(structuredClone(request));
+    },
   };
-  return { attempts, owner, preflight, mutationAdapter, calls };
+  const readers = { expectedEnvironment: preflight.expectedEnvironment,
+    expectedWebhookEndpointId: preflight.providerVerification.stripe.webhookEndpointId,
+    async assertReady() { return true; } };
+  const readerBinding = Object.freeze({ attemptId, caseId: 'payment.approved',
+    startedAt: '2026-09-23T09:00:00.000Z' });
+  return { attempts, owner, preflight, mutationAdapter, readers, readerBinding, calls, intents, receipts };
 }
 
 export async function importIfMissing(importer) {
@@ -159,7 +269,8 @@ export function makeReaders({ provider = paidProviderState(), baseline = databas
       return structuredClone(replayStates.shift());
     },
   };
-  return { stripe, supabase, calls };
+  return { stripe, supabase, calls, expectedEnvironment: environment,
+    expectedWebhookEndpointId: 'we_task6endpoint', async assertReady() { return true; } };
 }
 
 export function paidDatabaseSnapshot({ observedAt } = {}) {
@@ -170,7 +281,7 @@ export class OpaqueChallengeWitness {
   #opaque = true;
 }
 
-export function challengeCapabilities({ verified = true, expectedFence = 'fence-task6' } = {}) {
+export function challengeCapabilities({ verified = true, expectedFence = '11111111-1111-4111-8111-111111111111' } = {}) {
   const witness = Object.freeze(new OpaqueChallengeWitness());
   const brand = new WeakSet([witness]);
   const calls = [];

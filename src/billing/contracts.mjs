@@ -1,5 +1,7 @@
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { providerIdempotencyKey } from '../attempts/prepare.mjs';
+import { runStripeMutation, stripeRequestDigest } from '../runtime/stripe.mjs';
+import { isVerifiedDeploymentAttestation } from '../runtime/vercel.mjs';
 
 export class BillingControlRefusal extends Error {
   constructor(code) { super(code); this.name = 'BillingControlRefusal'; this.code = code; }
@@ -35,16 +37,47 @@ function exactVerifiedEnvironment(preflight) {
     stripe.webhookUrl === `${expected.deployment.origin}/api/stripe/webhook`;
 }
 
-export function createVerifiedContext({ attempts, owner, preflight, mutationAdapter } = {}) {
+function hasCurrentDeploymentAttestation(preflight, candidateSha) {
+  const candidate = preflight?.candidate;
+  return typeof candidateSha === 'string' && /^[0-9a-f]{40}$/u.test(candidateSha) &&
+    candidate?.candidateSha === candidateSha &&
+    isVerifiedDeploymentAttestation(preflight?.deploymentAttestation, {
+      deployment: preflight?.expectedEnvironment?.deployment,
+      candidate,
+    });
+}
+
+function validReaderBinding(binding, attemptId) {
+  return binding && binding.attemptId === attemptId &&
+    typeof binding.caseId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(binding.caseId) &&
+    typeof binding.startedAt === 'string' && Number.isFinite(Date.parse(binding.startedAt));
+}
+
+export function createVerifiedContext({ attempts, owner, preflight, mutationAdapter, readers, readerBinding } = {}) {
   if (!attempts || typeof attempts.assertFence !== 'function' ||
       typeof owner?.attemptId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(owner.attemptId) ||
       typeof owner.fence !== 'string' || owner.fence.length < 2 ||
       !exactVerifiedEnvironment(preflight) ||
+      !hasCurrentDeploymentAttestation(preflight, owner.candidateSha) ||
       canonical(owner.environment) !== canonical(preflight.expectedEnvironment) ||
+      canonical(readers?.expectedEnvironment) !== canonical(preflight.expectedEnvironment) ||
+      readers?.expectedWebhookEndpointId !== preflight.providerVerification.stripe.webhookEndpointId ||
+      typeof readers?.assertReady !== 'function' || !validReaderBinding(readerBinding, owner.attemptId) ||
       (mutationAdapter !== undefined && typeof mutationAdapter?.mutate !== 'function')) {
     refuse('billing_environment_unverified');
   }
-  return Object.freeze({ attempts, owner, preflight, mutationAdapter });
+  return Object.freeze({ attempts, owner, preflight, mutationAdapter, readers,
+    readerBinding: Object.freeze({ ...readerBinding }) });
+}
+
+export async function assertReadersReady(context, { readers = context?.readers, binding = context?.readerBinding,
+  code = 'billing_readers_unavailable' } = {}) {
+  if (!context?.preflight || !validReaderBinding(binding, context.owner?.attemptId) ||
+      canonical(readers?.expectedEnvironment) !== canonical(context.preflight.expectedEnvironment) ||
+      readers?.expectedWebhookEndpointId !== context.preflight.providerVerification?.stripe?.webhookEndpointId ||
+      typeof readers?.assertReady !== 'function') refuse(code);
+  try { await readers.assertReady(Object.freeze({ ...binding })); }
+  catch { refuse(code); }
 }
 
 export async function assertCurrentAttempt(context) {
@@ -60,6 +93,10 @@ export async function assertCurrentAttempt(context) {
   if (canonical(current.environment) !== canonical(preflight.expectedEnvironment)) {
     refuse('billing_environment_unverified');
   }
+  if (current.candidateSha !== owner.candidateSha ||
+      !hasCurrentDeploymentAttestation(preflight, owner.candidateSha)) {
+    refuse('billing_environment_unverified');
+  }
   return current;
 }
 
@@ -70,16 +107,55 @@ export async function mutateProvider(context, { provider = 'stripe', action, ope
       typeof operation !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u.test(operation) ||
       !input || typeof input !== 'object' || Array.isArray(input)) refuse('billing_mutation_invalid');
 
-  const { owner, preflight } = context;
+  const { owner, attempts } = context;
+  if (provider === 'supabase' && (typeof attempts?.fixtureMutation !== 'function' ||
+      typeof context.mutationAdapter?.mutateInTransaction !== 'function')) {
+    refuse('supabase_transaction_adapter_unavailable');
+  }
+  await assertReadersReady(context);
   const idempotencyKey = providerIdempotencyKey(owner.attemptId, provider, operation);
-  await assertCurrentAttempt(context);
+  const current = await assertCurrentAttempt(context);
+  if (provider === 'stripe' && typeof attempts.beginStripeIntent !== 'function') {
+    refuse('stripe_intent_store_unavailable');
+  }
+  const requestDigest = provider === 'stripe' ? stripeRequestDigest({ action, operation, input }) : undefined;
+  const request = { attemptId: owner.attemptId, fence: owner.fence,
+    candidateSha: current.candidateSha, workflow: current.workflow,
+    environment: current.environment, provider, action, operation, idempotencyKey,
+    ...(requestDigest ? { requestDigest } : {}), input: structuredClone(input) };
 
   try {
-    await context.mutationAdapter.mutate({ attemptId: owner.attemptId, fence: owner.fence,
-      environment: preflight.expectedEnvironment, provider, action, operation, idempotencyKey,
-      input: structuredClone(input) });
-  } catch {
+    if (provider === 'stripe') {
+      if (!hasCurrentDeploymentAttestation(context.preflight, owner.candidateSha)) {
+        refuse('billing_environment_unverified');
+      }
+      const stripeOwner = { attemptId: owner.attemptId, fence: owner.fence,
+        candidateSha: current.candidateSha, workflow: current.workflow,
+        environment: current.environment,
+        webhookEndpointId: context.preflight.providerVerification.stripe.webhookEndpointId };
+      const result = await runStripeMutation({ attempts, owner: stripeOwner, action, operation,
+        input, idempotencyKey, adapter: context.mutationAdapter, readers: context.readers,
+        readerBinding: context.readerBinding, deploymentAttestation: context.preflight.deploymentAttestation,
+        candidate: context.preflight.candidate });
+      return Object.freeze({ operation, idempotencyKey, dispatched: true,
+        intentId: result.intentId, requestDigest: result.requestDigest, state: result.state });
+    }
+    await attempts.fixtureMutation({ attemptId: owner.attemptId, fence: owner.fence },
+      (tx) => {
+        if (!hasCurrentDeploymentAttestation(context.preflight, owner.candidateSha)) {
+          refuse('billing_environment_unverified');
+        }
+        return context.mutationAdapter.mutateInTransaction(request, tx);
+      });
+  } catch (error) {
+    if (['lease_fence_lost', 'lease_expired'].includes(error?.code) ||
+        (provider === 'stripe' && ['stripe_mutation_ambiguous', 'stripe_intent_unresolved',
+          'stripe_intent_already_reconciled'].includes(error?.code))) {
+      throw error;
+    }
     refuse('provider_mutation_failed');
   }
   return Object.freeze({ operation, idempotencyKey, dispatched: true });
 }
+
+export { stripeRequestDigest };
