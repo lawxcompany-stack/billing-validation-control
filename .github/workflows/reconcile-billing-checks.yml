@@ -1,0 +1,54 @@
+name: Reconcile billing checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Reconcile a previously authorized collect attempt
+        required: true
+        type: choice
+        options: [recheck]
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout protected control default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Set up Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Fail closed unless running from the protected default ref
+        env:
+          CONTROL_REF: ${{ github.ref }}
+          CONTROL_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CONTROL_REPOSITORY: ${{ github.repository }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { assertProtectedDefaultRef } from './src/contracts/dispatch.mjs';
+
+          try {
+            assertProtectedDefaultRef({
+              ref: process.env.CONTROL_REF,
+              defaultBranch: process.env.CONTROL_DEFAULT_BRANCH,
+              repository: process.env.CONTROL_REPOSITORY,
+            });
+          } catch (error) {
+            const code = typeof error?.code === 'string' ? error.code : 'protected_ref_required';
+            console.error(`Reconciliation refused (${code}).`);
+            process.exitCode = 1;
+          }
+          NODE
+      - name: Fail closed until Task 9 supplies the reconciler
+        run: |
+          echo 'Check reconciliation is not enabled by Task 1.' >&2
+          exit 1

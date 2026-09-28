@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "repository": "lawxcompany-stack/Plataforma-LawX",
+  "base_branch": "preview",
+  "workflows": [
+    {
+      "id": 290018021,
+      "path": ".github/workflows/ci.yml",
+      "event": "pull_request",
+      "suite": "ci",
+      "artifact_required": true,
+      "artifact_name_template": "acceptance-final-{run_id}-{attempt}",
+      "artifact_json_path": "billing-acceptance.json",
+      "expected_categories": [
+        "quality",
+        "regression",
+        "build",
+        "remote-sql",
+        "remote-concurrency",
+        "financial-e2e"
+      ]
+    }
+  ]
+}
