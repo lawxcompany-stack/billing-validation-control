@@ -47,10 +47,53 @@ async function collect(input) {
   return evidence.collectCandidateChecks(input);
 }
 
+test('candidate prerequisite receipt refuses a caller-selected repository ID before I/O', async () => {
+  const f = fixture();
+  await assert.rejects(collect({ api: f.api, candidate: { ...candidate, repositoryId: 42 } }),
+    { code: 'candidate_checks_input_invalid' });
+  assert.equal(f.calls.length, 0);
+});
+
+test('candidate prerequisite reader snapshots identity before asynchronous API reads', async () => {
+  const mutable = { ...candidate };
+  const f = fixture({ onGet() { mutable.candidateSha = '9'.repeat(40); mutable.repositoryId = 42; } });
+  const result = await collect({ api: f.api, candidate: mutable });
+  assert.equal(result.repositoryId, 1234079266);
+  assert.equal(result.candidateSha, '1'.repeat(40));
+});
+
+test('candidate prerequisite boundary rejects getters and proxies without running traps', async () => {
+  let touched = 0;
+  const getter = { ...candidate };
+  Object.defineProperty(getter, 'candidateSha', { get() { touched++; return candidate.candidateSha; } });
+  for (const value of [getter, new Proxy(candidate, { get() { touched++; throw Error('secret'); } })]) {
+    const f = fixture();
+    await assert.rejects(collect({ api: f.api, candidate: value }), { code: 'candidate_checks_input_invalid' });
+    assert.equal(f.calls.length, 0);
+  }
+  const f = fixture();
+  const input = { api: f.api, get candidate() { touched++; return candidate; } };
+  await assert.rejects(collect(input), { code: 'candidate_checks_input_invalid' });
+  assert.equal(touched, 0);
+});
+
+test('candidate SHA fields reject objects without invoking string coercion', async () => {
+  let touched = 0;
+  for (const field of ['candidateSha', 'baseSha', 'treeSha']) {
+    const f = fixture();
+    const value = { toString() { touched++; return candidate[field]; } };
+    await assert.rejects(collect({ api: f.api, candidate: { ...candidate, [field]: value } }),
+      { code: 'candidate_checks_input_invalid' });
+    assert.equal(f.calls.length, 0);
+  }
+  assert.equal(touched, 0);
+});
+
 test('successful candidate prerequisites do not wait for downstream billing acceptance or artifacts', async () => {
   const f = fixture({ jobList: [...jobs(), { ...jobs()[0], id: 299, name: 'Billing acceptance', conclusion: 'failure' }] });
   const result = await collect({ api: f.api, candidate });
   assert.equal(result.scope, 'candidate-prerequisites');
+  assert.equal(result.repositoryId, 1234079266);
   assert.equal(result.runId, '100');
   assert.equal(result.attempt, 1);
   assert.equal(result.candidateSha, candidate.candidateSha);
