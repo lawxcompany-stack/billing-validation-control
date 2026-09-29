@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { test } from 'node:test';
+import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
 import { authorizationFixture } from './fixtures.mjs';
 import { authorizationApiFixture, ROOT, WORKFLOW } from './task2-fixtures.mjs';
 
@@ -9,6 +11,196 @@ const module = await import('../../src/authorization/context.mjs').catch((error)
 });
 function required() { assert.ok(module, 'Task2 context reader is not implemented'); return module; }
 const invalid = { code: 'authorization_context_invalid' };
+
+// Only the internal GET seam maps fixed public selectors to this loopback server.
+// Native fetch owns decoding, stream errors and cancellation, as in production.
+async function localContextApi(t, { encoding = 'gzip', encode = gzipSync, declaredLength,
+  send = (response, wire) => response.end(wire) } = {}) {
+  const api = authorizationApiFixture();
+  const requests = []; const responses = [];
+  const server = createServer((request, response) => {
+    const suffix = request.url === '/' ? '' : request.url;
+    if (!Object.hasOwn(api.payloads, suffix)) { response.writeHead(404); response.end(); return; }
+    const decoded = Buffer.from(JSON.stringify(api.payloads[suffix]));
+    const wire = encode(decoded);
+    requests.push({ suffix, decodedBytes: decoded.length, wireBytes: wire.length });
+    const headers = { 'content-type': 'application/json', connection: 'close',
+      'content-length': declaredLength ?? String(wire.length) };
+    if (encoding !== null) headers['content-encoding'] = encoding;
+    response.writeHead(200, headers);
+    send(response, wire);
+  });
+  t.after(async () => {
+    const closed = new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    server.closeAllConnections();
+    await closed;
+    server.removeAllListeners();
+    assert.equal(server.listening, false);
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); });
+  });
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  return { ...api, requests, responses, async get(url, options) {
+    assert.ok(url.startsWith(ROOT));
+    const suffix = url.slice(ROOT.length);
+    assert.ok(Object.hasOwn(api.payloads, suffix), `unexpected endpoint ${suffix}`);
+    api.calls.push({ url, options });
+    const response = await fetch(`${origin}${suffix || '/'}`, options);
+    responses.push(response);
+    return response;
+  } };
+}
+
+for (const [encoding, encode] of [
+  ['gzip', gzipSync], ['br', brotliCompressSync], ['deflate', deflateSync],
+  [' GZip\t', gzipSync], [' BR ', brotliCompressSync], [' DeFlAtE ', deflateSync],
+  ['identity', (bytes) => bytes], [' IdEnTiTy\t', (bytes) => bytes], [null, (bytes) => bytes],
+]) {
+  test(`local HTTP ${JSON.stringify(encoding)} completes all seven context reads`, { timeout: 5_000 }, async (t) => {
+    const { readAuthorizationContextWithDependencies: read } = required();
+    const api = await localContextApi(t, { encoding, encode });
+    const result = await read({ manifest: authorizationFixture(), get: api.get });
+    assert.deepEqual(result, { controlSha: 'd'.repeat(40), runId: '567890123', runAttempt: '2',
+      workflowId: '901234567', jobs: [
+        { name: 'authorize', jobId: '801234560' }, { name: 'reader', jobId: '801234561' },
+        { name: 'attest-activation', jobId: '801234562' },
+      ] });
+    assert.ok(Object.isFrozen(result));
+    assert.equal(api.requests.length, 7);
+    assert.deepEqual(api.requests.map(({ suffix }) => suffix), ['', api.runPath, api.attemptPath,
+      '/actions/workflows/authorize-local-collector.yml', `${api.attemptPath}/jobs?per_page=100&page=1`,
+      '/branches/main', api.runPath]);
+    if (encoding !== null && encoding.trim().toLowerCase() !== 'identity') {
+      // Compression can coincidentally preserve a small payload's length. The
+      // first response must differ to reproduce the original refusal at GET 1.
+      assert.notEqual(api.requests[0].wireBytes, api.requests[0].decodedBytes);
+    }
+    for (const { url, options } of api.calls) {
+      assert.ok(url.startsWith(ROOT));
+      assert.equal(options.method, 'GET');
+      assert.equal(options.redirect, 'error');
+      assert.equal(options.credentials, 'omit');
+      assert.equal(options.cache, 'no-store');
+      assert.deepEqual(Object.keys(options.headers).sort(), ['Accept', 'User-Agent', 'X-GitHub-Api-Version']);
+      assert.equal(options.signal.aborted, false);
+    }
+  });
+}
+
+for (const decodedBytes of [65_536, 65_537]) {
+  test(`local HTTP gzip enforces the decoded byte limit at ${decodedBytes}`, { timeout: 5_000 }, async (t) => {
+    const { readAuthorizationContextWithDependencies: read } = required();
+    const api = await localContextApi(t);
+    api.payloads[''].padding = '';
+    api.payloads[''].padding = 'x'.repeat(decodedBytes - Buffer.byteLength(JSON.stringify(api.payloads[''])));
+    const pending = read({ manifest: authorizationFixture(), get: api.get });
+    if (decodedBytes === 65_536) {
+      assert.equal((await pending).runId, '567890123');
+      assert.equal(api.requests.length, 7);
+    } else {
+      await assert.rejects(pending, invalid);
+      assert.equal(api.requests.length, 1);
+      assert.equal(api.calls[0].options.signal.aborted, true);
+    }
+    assert.equal(api.requests[0].decodedBytes, decodedBytes);
+    assert.ok(api.requests[0].wireBytes < 1_024);
+  });
+}
+
+test('local HTTP truncated gzip transfer fails through the native stream before the deadline', { timeout: 5_000 }, async (t) => {
+  const { readAuthorizationContextWithDependencies: read } = required();
+  const api = await localContextApi(t, { send(response, wire) {
+    response.write(wire.subarray(0, wire.length - 8));
+    response.socket.end(); // Close the transport before the declared wire length is delivered.
+  } });
+  await assert.rejects(read({ manifest: authorizationFixture(), get: api.get }), invalid);
+  assert.equal(api.requests.length, 1);
+  assert.equal(api.responses.length, 1); // Headers arrived; the real body stream failed.
+  assert.equal(api.responses[0].bodyUsed, true);
+  assert.equal(api.calls[0].options.signal.aborted, true);
+  assert.equal(api.calls[0].options.signal.reason.code, 'authorization_context_invalid');
+});
+
+test('local HTTP gzip checksum errors fail closed through native decompression', { timeout: 5_000 }, async (t) => {
+  const { readAuthorizationContextWithDependencies: read } = required();
+  const api = await localContextApi(t, { encode(bytes) {
+    const wire = gzipSync(bytes);
+    wire[wire.length - 8] ^= 0xff; // Corrupt CRC32 without changing the HTTP content length.
+    return wire;
+  } });
+  await assert.rejects(read({ manifest: authorizationFixture(), get: api.get }), invalid);
+  assert.equal(api.requests.length, 1);
+  assert.equal(api.calls[0].options.signal.aborted, true);
+  assert.equal(api.calls[0].options.signal.reason.code, 'authorization_context_invalid');
+});
+
+for (const declaredLength of ['65537', '01', '-1', 'invalid']) {
+  test(`local HTTP gzip refuses invalid declared length ${declaredLength}`, { timeout: 5_000 }, async (t) => {
+    const { readAuthorizationContextWithDependencies: read } = required();
+    const api = await localContextApi(t, { declaredLength });
+    await assert.rejects(read({ manifest: authorizationFixture(), get: api.get }), invalid);
+    assert.equal(api.requests.length, 1);
+    assert.equal(api.calls[0].options.signal.aborted, true);
+  });
+}
+
+for (const encoding of ['compress', 'zstd', '', 'g zip', 'gzip; q=1', 'identity, identity']) {
+  test(`local HTTP refuses unsupported or malformed encoding ${JSON.stringify(encoding)}`, { timeout: 5_000 }, async (t) => {
+    const { readAuthorizationContextWithDependencies: read } = required();
+    const api = await localContextApi(t, { encoding, encode: (bytes) => bytes });
+    await assert.rejects(read({ manifest: authorizationFixture(), get: api.get }), invalid);
+    assert.equal(api.requests.length, 1);
+    assert.equal(api.calls[0].options.signal.aborted, true);
+  });
+}
+
+test('local HTTP refuses chained gzip and br even when native fetch can decode them', { timeout: 5_000 }, async (t) => {
+  const { readAuthorizationContextWithDependencies: read } = required();
+  const api = await localContextApi(t, { encoding: 'gzip, br', encode: (bytes) => brotliCompressSync(gzipSync(bytes)) });
+  await assert.rejects(read({ manifest: authorizationFixture(), get: api.get }), invalid);
+  assert.equal(api.requests.length, 1);
+  assert.equal(api.calls[0].options.signal.aborted, true);
+});
+
+test('identity and absent encoding retain exact declared length checks at the reader boundary', async () => {
+  const { readAuthorizationContextWithDependencies: read } = required();
+  // Native HTTP validates framing itself. These boundary cases also prove the
+  // reader retains its own check when a transport supplies inconsistent headers.
+  for (const encoding of [null, 'identity', ' IdEnTiTy\t']) {
+    for (const difference of [-1, 1]) {
+      const api = authorizationApiFixture();
+      await assert.rejects(read({ manifest: authorizationFixture(), get: async (url, options) => {
+        const response = await api.get(url, options);
+        if (api.calls.length === 1) {
+          response.headers.set('content-length', String(Buffer.byteLength(JSON.stringify(api.payloads[''])) + difference));
+          if (encoding !== null) response.headers.set('content-encoding', encoding);
+        }
+        return response;
+      } }), invalid);
+      assert.equal(api.calls.length, 1);
+      assert.equal(api.calls[0].options.signal.aborted, true);
+    }
+  }
+});
+
+test('compressed responses retain declared length syntax and size guards at the reader boundary', async () => {
+  const { readAuthorizationContextWithDependencies: read } = required();
+  // Native HTTP may reject malformed framing first. Supply valid decoded
+  // metadata here so a missing reader guard cannot hide behind transport or JSON errors.
+  for (const declaredLength of ['65537', '9007199254740992', '01', '-1', '1.0', 'invalid', '']) {
+    const api = authorizationApiFixture();
+    await assert.rejects(read({ manifest: authorizationFixture(), get: async (url, options) => {
+      const response = await api.get(url, options);
+      response.headers.set('content-encoding', 'gzip');
+      response.headers.set('content-length', declaredLength);
+      return response;
+    } }), invalid);
+    assert.equal(api.calls.length, 1);
+    assert.equal(api.calls[0].options.signal.aborted, true);
+  }
+});
 
 test('completed current/exact attempt, three hosted jobs and protected current main yield a frozen snapshot', async () => {
   const { readAuthorizationContextWithDependencies: read } = required();

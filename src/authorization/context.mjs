@@ -47,6 +47,8 @@ async function readJson(response, signal) {
   const contentType = headers?.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
   if (!['application/json', 'application/vnd.github+json'].includes(contentType)
     || headers.get('link') !== null) refuse(); // All three jobs must fit the single fixed page.
+  const encoding = headers.get('content-encoding')?.trim().toLowerCase() ?? 'identity';
+  if (!['identity', 'gzip', 'br', 'deflate'].includes(encoding)) refuse();
   const declared = headers.get('content-length');
   if (declared !== null && (!/^(?:0|[1-9][0-9]*)$/u.test(declared)
     || !Number.isSafeInteger(Number(declared)) || Number(declared) > MAX_RESPONSE_BYTES)) refuse();
@@ -66,7 +68,8 @@ async function readJson(response, signal) {
       if (size > MAX_RESPONSE_BYTES) refuse();
       chunks.push(Buffer.from(value));
     }
-    if (declared !== null && Number(declared) !== size) refuse();
+    // Native fetch decodes compressed bodies; Content-Length counts wire bytes.
+    if (encoding === 'identity' && declared !== null && Number(declared) !== size) refuse();
     return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, size)));
   } catch { cancel(); refuse(); }
   finally {
