@@ -136,8 +136,6 @@ export function createAuthorizationManifest(value) {
     if (manifest.sourceExecutionId !== null) invalid();
   } else {
     if (manifest.sourceExecutionId === null || manifest.sourceExecutionId === manifest.executionId) invalid();
-    // Historical authority is not integrated in this increment. Never downgrade to collect.
-    throw new AuthorizationRefusal('authorization_operation_unsupported');
   }
   return manifest;
 }
@@ -168,8 +166,7 @@ export function parseAuthorizationManifest(input) {
     // Compare original bytes, not decoded text: TextDecoder may strip a BOM.
     if (!bytes.equals(inputBytes)) throw new AuthorizationRefusal('authorization_noncanonical');
     return manifest;
-  } catch (error) {
-    if (error instanceof AuthorizationRefusal && error.code === 'authorization_operation_unsupported') throw error;
+  } catch {
     throw new AuthorizationRefusal('authorization_noncanonical');
   }
 }

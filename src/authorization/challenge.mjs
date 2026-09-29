@@ -4,7 +4,7 @@ import { types } from 'node:util';
 import { AuthorizationRefusal, createAuthorizationManifest } from './manifest.mjs';
 
 const CHALLENGE_TTL_MS = 1_200_000;
-const COMMITMENT_DOMAIN = 'lawx/billing-validation/authorization/v2\0';
+const COMMITMENT_DOMAIN = 'lawx/billing-validation/local-collector/activation/v2\0';
 const ownedChallenges = new WeakSet();
 const challengeState = new WeakMap();
 
@@ -83,6 +83,8 @@ export function assertAuthorizationChallenge(challenge, input) {
   const state = challengeState.get(challenge);
   state.assertUsable();
   const manifest = createAuthorizationManifest(input);
+  // This factory binds collect only; historical operations need authoritative admission.
+  if (manifest.operation !== 'collect') refuse('authorization_operation_unsupported');
   const { presentation } = state;
   if (manifest.executionId !== presentation.executionId
     || manifest.activationCommitment !== presentation.activationCommitment

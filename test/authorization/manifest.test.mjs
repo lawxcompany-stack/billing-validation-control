@@ -238,17 +238,19 @@ test('dates require real calendar UTC milliseconds and a positive window of at m
     issuedAt: '2028-02-29T12:00:00.000Z', expiresAt: '2028-02-29T12:20:00.000Z' }));
 });
 
-test('collect requires explicit null source; recover and recheck fail explicitly without historical authority', () => {
+test('collect requires null source; recover and recheck roundtrip with a distinct valid source', () => {
   for (const sourceExecutionId of [undefined, '', '2'.repeat(32), '1'.repeat(32), 'Z'.repeat(32)]) {
     assertInvalid({ ...authorizationFixture(), sourceExecutionId });
   }
   for (const operation of ['recover', 'recheck']) {
     const input = { ...authorizationFixture(), operation, sourceExecutionId: '2'.repeat(32) };
-    for (const create of [createAuthorizationManifest, serializeAuthorizationManifest]) {
-      assert.throws(() => create(input), { code: 'authorization_operation_unsupported' });
-    }
-    assert.throws(() => parseAuthorizationManifest(`${JSON.stringify(input)}\n`),
-      { code: 'authorization_operation_unsupported' });
+    const expected = EXPECTED.replace('"operation":"collect"', `"operation":"${operation}"`)
+      .replace('"sourceExecutionId":null', '"sourceExecutionId":"22222222222222222222222222222222"');
+    assert.deepEqual(createAuthorizationManifest(input), input);
+    assert.equal(serializeAuthorizationManifest(input), expected);
+    assert.deepEqual(parseAuthorizationManifest(expected), input);
+    assert.equal(serializeAuthorizationManifest(parseAuthorizationManifest(Buffer.from(expected))), expected);
+    assert.equal(authorizationDigest(expected), createHash('sha256').update(expected).digest('hex'));
     for (const sourceExecutionId of [null, undefined, '1'.repeat(32), 'Z'.repeat(32), '2'.repeat(31)]) {
       assertInvalid({ ...input, sourceExecutionId });
     }

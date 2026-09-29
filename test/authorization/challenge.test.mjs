@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import { syncBuiltinESMExports } from 'node:module';
 import { performance } from 'node:perf_hooks';
 import { test } from 'node:test';
 import { createAuthorizationChallenge, assertAuthorizationChallenge } from '../../src/authorization/challenge.mjs';
+import { createAuthorizationManifest } from '../../src/authorization/manifest.mjs';
 import { authorizationFixture } from './fixtures.mjs';
 
 function options() {
@@ -43,6 +46,22 @@ test('random execution IDs and commitments are unique for independent challenges
   for (const challenge of challenges) challenge.destroy();
 });
 
+test('commitment matches the local-collector activation v2 domain and NUL known hash vector', (t) => {
+  const randomBytes = t.mock.method(crypto, 'randomBytes', (size) => Buffer.alloc(size, 0x2a));
+  syncBuiltinESMExports();
+  let challenge;
+  try {
+    challenge = createAuthorizationChallenge(options());
+    // Independently computed with OpenSSL: UTF-8 domain, one NUL, then 32 bytes of 0x2a.
+    assert.equal(challenge.presentation.activationCommitment,
+      'd4831826745e20ce2eb45dbb4d6fe2ee252895c379f01eb4d578a0bad8abaeb1');
+  } finally {
+    challenge?.destroy();
+    randomBytes.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
 test('copied challenge cannot authorize the same manifest', () => {
   const challenge = createAuthorizationChallenge(options());
   const manifest = boundManifest(challenge);
@@ -80,6 +99,22 @@ test('all four presentation bindings must match the manifest', () => {
   }
   assert.doesNotThrow(() => assertAuthorizationChallenge(challenge, boundManifest(challenge)));
   challenge.destroy();
+});
+
+test('collect challenges refuse schema-valid recover and recheck admission with matching bindings', () => {
+  const challenge = createAuthorizationChallenge(options());
+  try {
+    for (const operation of ['recover', 'recheck']) {
+      const manifest = createAuthorizationManifest({
+        ...boundManifest(challenge), operation, sourceExecutionId: '2'.repeat(32),
+      });
+      assert.throws(() => assertAuthorizationChallenge(challenge, manifest),
+        { code: 'authorization_operation_unsupported' });
+    }
+    assert.doesNotThrow(() => assertAuthorizationChallenge(challenge, boundManifest(challenge)));
+  } finally {
+    challenge.destroy();
+  }
 });
 
 test('challenge binding refuses open or accessor manifests without executing getters', () => {
