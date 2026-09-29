@@ -1,6 +1,6 @@
 # Coletor local isolado com autorização atestada
 
-**Status:** contrato detalhado aprovado pelo usuário em 2026-09-29; primeiro incremento de autorização em implementação local, sem habilitação financeira.
+**Status:** contrato detalhado aprovado pelo usuário em 2026-09-29; primeiro incremento de autorização implementado e revisado localmente, com testes offline, sem habilitação financeira nem handoff real verificado. Demais incrementos permanecem pendentes.
 **Base examinada:** `70822c0dc4dd8e9f34d84284682a8f888b147e99`, PR #3 do repositório de controle, ainda aberta.
 **Escopo:** substituir a ativação/agendamento via Actions runner por execução local confiável, preservando as exigências financeiras já aprovadas.
 

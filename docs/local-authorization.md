@@ -131,8 +131,9 @@ npx --yes --package=node@22 -c 'node --test test/workflows/local-authorization.t
 
 ## After PR3 review
 
-1. Complete scoped Task 3 review, then whole-branch review. Resolve findings before
-   any separately authorized remote integration or dispatch.
+1. Scoped Task 3 and whole-branch reviews are complete, including the final HTTP
+   decoding fix. Independently authorize remote integration after the underlying
+   PR3 review; no push, merge or dispatch was part of this local increment.
 2. Independently review a real collector release and its complete image/config/
    source/tree/policy digests and permitted suites; provision its reviewed policy.
 3. After the remote control commit is final, manually review and provision that
