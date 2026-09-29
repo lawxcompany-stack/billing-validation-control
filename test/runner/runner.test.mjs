@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { runInNewContext } from 'node:vm';
+import YAML from 'yaml';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const dockerfilePath = path.join(root, 'runner/Dockerfile');
@@ -12,6 +14,17 @@ const dockerignorePath = path.join(root, 'runner/Dockerfile.dockerignore');
 const entrypointPath = path.join(root, 'runner/entrypoint.sh');
 const registrationToken = 'placeholder-value-not-a-credential';
 const runnerLabel = `billing-validation-${'a'.repeat(32)}`;
+
+function evaluateRunnerSelector(expression, label) {
+  const body = expression.match(/^\$\{\{\s*(.*?)\s*\}\}$/u);
+  assert.ok(body, 'runs-on must be a workflow expression');
+  // This selector uses JS-compatible boolean operators and these two Actions functions.
+  return runInNewContext(body[1], {
+    needs: { authorize: { outputs: { runner_label: label } } },
+    fromJSON: JSON.parse,
+    format: (template, value) => template.replaceAll('{0}', value),
+  }, { timeout: 1000 });
+}
 
 test('runner image pins matching Playwright and checksums the exact ephemeral runner archive', async () => {
   const dockerfile = await readFile(dockerfilePath, 'utf8');
@@ -129,6 +142,41 @@ test('mocked ephemeral runner success and failure scrub credentials and preserve
     await assert.rejects(access(path.join(runnerHome, '.credentials')));
     await assert.rejects(access(path.join(runnerHome, '.credentials_rsaparams')));
   });
+});
+
+test('collect selector matches config.sh labels only for the same ephemeral attempt', async () => {
+  const workflow = YAML.parse(await readFile(path.join(root, '.github/workflows/validate-billing.yml'), 'utf8'));
+  const expression = workflow.jobs.test['runs-on'];
+  const attempts = [];
+  for (const label of [runnerLabel, `billing-validation-${'b'.repeat(32)}`]) {
+    await withFakeRunner(0, async ({ env, capturePath }) => {
+      const result = spawnSync('bash', [entrypointPath], {
+        env: { ...env, CONTROL_RUNNER_LABEL: label, RUNNER_LABEL: label }, encoding: 'utf8',
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const args = (await readFile(capturePath, 'utf8')).split('\n');
+      assert.ok(args.includes('--no-default-labels'));
+      assert.ok(args.includes('--labels'));
+      const registeredLabels = args[args.indexOf('--labels') + 1].split(',');
+      assert.deepEqual(registeredLabels, [label]);
+      assert.equal(args[args.indexOf('--runnergroup') + 1], 'billing-validation-isolated');
+      const selector = evaluateRunnerSelector(expression, label);
+      const selectedLabels = Array.isArray(selector) ? Array.from(selector) : [selector];
+      assert.deepEqual(selectedLabels.filter((required) => !registeredLabels.includes(required)), [],
+        'runs-on requires labels absent from the actual config.sh registration');
+      assert.deepEqual(selectedLabels, [label]);
+      attempts.push({ registeredLabels, selectedLabels });
+    });
+  }
+  for (const [index, attempt] of attempts.entries()) {
+    assert.equal(attempt.selectedLabels.every((label) => attempts[1 - index].registeredLabels.includes(label)), false,
+      'a collect job must not match another attempt\'s runner');
+  }
+});
+
+test('recheck with no runner label selects the hosted fallback', async () => {
+  const workflow = YAML.parse(await readFile(path.join(root, '.github/workflows/validate-billing.yml'), 'utf8'));
+  assert.equal(evaluateRunnerSelector(workflow.jobs.test['runs-on'], ''), 'ubuntu-latest');
 });
 
 test('runner entrypoint refuses a fixed or malformed label before runner registration', async () => {

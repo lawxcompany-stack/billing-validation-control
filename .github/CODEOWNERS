@@ -1,1 +1,9 @@
-* @lawxcompany-stack/billing-validation-maintainers
+# Verified write/admin collaborators of this personally owned repository.
+# An organization/team reference does not resolve under an owner of type User.
+* @lawxcompany-stack @netopvh
+
+# Local authorization and station-admin trust policies require the same owners.
+/policy/local-collector-release.json @lawxcompany-stack @netopvh
+/policy/local-collector-trust.json @lawxcompany-stack @netopvh
+/src/authorization/ @lawxcompany-stack @netopvh
+/.github/workflows/authorize-local-collector.yml @lawxcompany-stack @netopvh

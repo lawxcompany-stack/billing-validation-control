@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+export { collectCandidateChecks } from './candidate-checks.mjs';
 import { createRequire } from 'node:module';
 import {
   parseEvidenceArchive,

@@ -103,6 +103,11 @@ test('forgeable local GITHUB_* values are not selectors or trusted identity', as
   }
 });
 
+test('run-attempt path accepts the canonical REST workflow path without treating it as an untrusted ref', async () => {
+  const result = await withFetch(async () => githubResponse(validRun({ path: CONTROL_WORKFLOW_PATH })), () => read());
+  assert.equal(result.workflowRef, `${CONTROL_REPOSITORY}/${CONTROL_WORKFLOW_PATH}@refs/heads/main`);
+});
+
 test('malformed run selectors and unreviewed repository IDs refuse before HTTP', async () => {
   for (const [selectors, repositoryId] of [
     [{ runId: '01', runAttempt: RUN_ATTEMPT }, CONTROL_REPOSITORY_ID],
@@ -125,6 +130,7 @@ for (const [field, mutation] of [
   ['immutable repository ID', (run) => ({ ...run, repository: { ...run.repository, id: 87654321 } })],
   ['head repository identity', (run) => ({ ...run, head_repository: { id: 87654321, full_name: 'attacker/repository' } })],
   ['workflow path', (run) => ({ ...run, path: '.github/workflows/other.yml@main' })],
+  ['workflow path ref', (run) => ({ ...run, path: `${CONTROL_WORKFLOW_PATH}@feature` })],
   ['event', (run) => ({ ...run, event: 'pull_request_target' })],
   ['branch', (run) => ({ ...run, head_branch: 'feature' })],
   ['malformed workflow SHA', (run) => ({ ...run, head_sha: 'not-a-full-sha' })],
@@ -166,7 +172,7 @@ test('a well-formed but unreviewed repository ID fails against the API identity 
   assert.equal(requests, 1);
 });
 
-test('production run selector API ignores caller-supplied repository ID and refuses while trust policy is unset', async () => {
+test('production run selector API rejects caller-supplied repository ID instead of overriding the reviewed identity', async () => {
   let requests = 0;
   await withFetch(async () => {
     requests += 1;
@@ -176,5 +182,13 @@ test('production run selector API ignores caller-supplied repository ID and refu
       reviewedControlRepositoryId: CONTROL_REPOSITORY_ID }),
     { code: 'runner_workflow_context_invalid' });
   });
-  assert.equal(requests, 0);
+  assert.equal(requests, 1);
+});
+
+test('production run selector accepts only the immutable repository ID read back from GitHub', async () => {
+  const repository = { full_name: CONTROL_REPOSITORY, id: 1384018279 };
+  const result = await withFetch(async () => githubResponse(validRun({
+    repository, head_repository: repository,
+  })), () => workflowContext.readSelectedRunAttempt(SELECTORS));
+  assert.equal(result.repositoryId, '1384018279');
 });

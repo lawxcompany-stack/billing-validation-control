@@ -66,7 +66,7 @@ function matchesRunAttempt(payload, { runId, runAttempt, reviewedControlReposito
     Number.isSafeInteger(payload.id) && String(payload.id) === runId &&
     Number.isSafeInteger(payload.run_attempt) && String(payload.run_attempt) === runAttempt &&
     repositoryIdMatches(payload.repository) && repositoryIdMatches(payload.head_repository) &&
-    payload.path === workflowPathAtMain &&
+    (payload.path === CONTROL_WORKFLOW_PATH || payload.path === workflowPathAtMain) &&
     payload.event === 'workflow_dispatch' && payload.head_branch === CONTROL_DEFAULT_BRANCH &&
     typeof payload.head_sha === 'string' && /^[a-f0-9]{40}$/u.test(payload.head_sha) &&
     payload.status === 'in_progress';
