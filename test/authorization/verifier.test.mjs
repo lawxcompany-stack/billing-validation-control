@@ -6,6 +6,7 @@ import childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { syncBuiltinESMExports } from 'node:module';
 import { performance } from 'node:perf_hooks';
+import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { assertAuthorizationChallenge } from '../../src/authorization/challenge.mjs';
@@ -41,13 +42,11 @@ test('synthetic boundary success invokes fixed gh verification and consumes only
   assert.deepEqual(args, ['attestation', 'verify', args[2],
     '--repo', CONTROL, '--signer-workflow', `${CONTROL}/${WORKFLOW}`,
     '--signer-digest', 'd'.repeat(40),
-    '--cert-identity', `https://github.com/${CONTROL}/${WORKFLOW}@refs/heads/main`,
-    '--cert-oidc-issuer', 'https://token.actions.githubusercontent.com',
-    '--source-repo', CONTROL, '--source-ref', 'refs/heads/main', '--source-digest', 'd'.repeat(40),
+    '--source-ref', 'refs/heads/main', '--source-digest', 'd'.repeat(40),
     '--deny-self-hosted-runners', '--predicate-type', 'https://slsa.dev/provenance/v1', '--format', 'json']);
   assert.ok(options.timeoutMs <= 30_000);
   assert.ok(options.maxOutputBytes <= 512 * 1024);
-  assert.equal(options.env.GH_CONFIG_DIR, path.join(path.dirname(args[2]), 'gh'));
+  assert.equal(Object.hasOwn(options.env, 'GH_CONFIG_DIR'), false);
   assert.equal(options.env.GH_HOST, 'github.com');
   assert.equal(options.env.GH_PROMPT_DISABLED, '1');
   assert.equal(f.contextCalls.length, 2);
@@ -67,8 +66,11 @@ test('zero process exit with a wrong subject cannot consume the challenge', asyn
   await assert.rejects(fs.stat(path.dirname(f.calls[0].args[2])), { code: 'ENOENT' });
 });
 
-test('real process boundary invokes only gh without a shell or ambient credentials', async () => {
+test('real process boundary retains the station profile without a shell or inherited token environment', async () => {
   const f = fixture(); let spawns = 0;
+  const forbidden = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_CONFIG_DIR'];
+  const previous = forbidden.map((key) => process.env[key]);
+  for (const key of forbidden) process.env[key] = 'synthetic-must-not-inherit';
   f.input.boundary = createSystemProcessBoundary({ dockerContext: ISOLATED_DOCKER_CONTEXT,
     spawnProcess(command, args, options) {
       spawns++;
@@ -76,12 +78,14 @@ test('real process boundary invokes only gh without a shell or ambient credentia
       assert.equal(options.shell, false);
       assert.deepEqual(options.stdio, ['ignore', 'pipe', 'ignore']);
       assert.equal(options.env.GH_HOST, 'github.com');
-      assert.deepEqual(Object.keys(options.env).filter((key) => !['PATH', 'HOME', 'GH_CONFIG_DIR', 'GH_HOST',
+      assert.equal(options.env.PATH, process.env.PATH ?? '/usr/bin:/bin');
+      assert.equal(options.env.HOME, process.env.HOME);
+      for (const key of forbidden) assert.equal(Object.hasOwn(options.env, key), false, `${key} must not be passed`);
+      assert.deepEqual(Object.keys(options.env).filter((key) => !['PATH', 'HOME', 'GH_HOST',
         'GH_PROMPT_DISABLED', 'GH_NO_UPDATE_NOTIFIER', 'GH_NO_EXTENSION_UPDATE_NOTIFIER'].includes(key)), []);
       const child = new EventEmitter(); child.stdout = new EventEmitter();
       queueMicrotask(async () => {
         try {
-          assert.deepEqual(await fs.readdir(options.env.GH_CONFIG_DIR), []);
           const bytes = await fs.readFile(args[2]);
           const out = verifiedOutput(f.manifest, createHash('sha256').update(bytes).digest('hex'));
           child.stdout.emit('data', Buffer.from(JSON.stringify(out)));
@@ -91,8 +95,74 @@ test('real process boundary invokes only gh without a shell or ambient credentia
       return child;
     },
   });
-  assert.equal((await f.verify()).scope, 'authorization-only');
-  assert.equal(spawns, 1);
+  try {
+    assert.equal((await f.verify()).scope, 'authorization-only');
+    assert.equal(spawns, 1);
+  } finally {
+    forbidden.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; });
+  }
+});
+
+test('installed gh accepts the production argv through local missing-artifact validation', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'bvc-gh-grammar-'));
+  try {
+    // Test-only empty config: the grammar probe must never consult station secrets.
+    const env = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: directory,
+      GH_CONFIG_DIR: path.join(directory, 'gh'), XDG_CONFIG_HOME: path.join(directory, 'config'),
+      XDG_DATA_HOME: path.join(directory, 'data'), XDG_STATE_HOME: path.join(directory, 'state'),
+      XDG_CACHE_HOME: path.join(directory, 'cache'),
+      GH_HOST: 'github.com', GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1', GH_NO_EXTENSION_UPDATE_NOTIFIER: '1' };
+    const spawnOptions = { env, cwd: directory, shell: false, encoding: 'utf8', timeout: 5_000, maxBuffer: 65_536 };
+    const version = childProcess.spawnSync('gh', ['--version'], spawnOptions);
+    if (version.error?.code === 'ENOENT') {
+      t.skip('gh is not installed; actual CLI grammar compatibility is unverified');
+      return;
+    }
+    assert.equal(version.error, undefined);
+    assert.equal(version.status, 0);
+    t.diagnostic(version.stdout.split('\n')[0]);
+    const missingArtifact = path.join(directory, 'missing-authorization.json');
+    const missingBundle = path.join(directory, 'missing-bundle.jsonl');
+    const emptyRoot = path.join(directory, 'empty-trusted-root.jsonl');
+    await fs.writeFile(emptyRoot, '', { flag: 'wx', mode: 0o600 });
+    // v2.96.0 verify.go initializes Sigstore before loading the artifact. Its
+    // verification/sigstore.go custom-root branch reads only this local file.
+    // An empty file avoids TUF initialization; --bundle bypasses auth. Both
+    // flags are confined to this probe, never to production verification.
+    const probe = (args) => {
+      const result = childProcess.spawnSync('gh', [...args, '--bundle', missingBundle,
+        '--custom-trusted-root', emptyRoot], spawnOptions);
+      assert.equal(result.error, undefined);
+      assert.equal(result.signal, null);
+      assert.notEqual(result.status, 0);
+      return result;
+    };
+    const base = ['attestation', 'verify', missingArtifact, '--repo', CONTROL];
+    const unknown = probe([...base, '--source-repo', CONTROL]);
+    assert.match(unknown.stderr, /unknown flag: --source-repo/u);
+    assert.doesNotMatch(unknown.stderr, /Loading digest|no such file/u);
+    const conflict = probe([...base, '--signer-workflow', `${CONTROL}/${WORKFLOW}`,
+      '--cert-identity', `https://github.com/${CONTROL}/${WORKFLOW}@refs/heads/main`]);
+    assert.match(conflict.stderr, /none of the others can be|at most one|mutually exclusive/u);
+    assert.doesNotMatch(conflict.stderr, /Loading digest|no such file/u);
+
+    // Capture the verifier's real argument vector; do not reconstruct it here.
+    const f = fixture();
+    await f.verify();
+    const [{ args }] = f.calls;
+    await assert.rejects(fs.stat(args[2]), { code: 'ENOENT' }); // verifier cleanup made it absent
+    assert.equal(args.includes('--bundle'), false);
+    assert.equal(args.includes('--custom-trusted-root'), false);
+    const actual = probe(args);
+    assert.equal(actual.status, 1);
+    assert.match(actual.stderr, /failed to open local artifact|Loading digest/u);
+    assert.match(actual.stderr, /no such file or directory/u);
+    assert.ok(actual.stderr.includes(args[2]));
+    assert.doesNotMatch(actual.stderr, /unknown flag|none of the others can be|at most one|mutually exclusive|gh auth login/u);
+    t.diagnostic('unsupported/conflicting flags stop before artifact loading; production argv reaches the absent local artifact');
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
 });
 
 for (const field of ['issuer', 'subjectAlternativeName', 'buildSignerURI', 'buildSignerDigest',

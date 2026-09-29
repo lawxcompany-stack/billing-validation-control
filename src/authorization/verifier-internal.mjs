@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { types } from 'node:util';
@@ -177,18 +177,16 @@ export async function verifyLocalAuthorizationWithDependencies(input) {
         const file = path.join(directory, SUBJECT);
         await writeFile(file, manifestBytes, { flag: 'wx', mode: 0o600 });
         fresh();
-        const ghConfig = path.join(directory, 'gh');
-        await mkdir(ghConfig, { mode: 0o700 });
-        fresh();
         const args = ['attestation', 'verify', file,
           '--repo', CONTROL, '--signer-workflow', `${CONTROL}/${WORKFLOW}`,
-          '--signer-digest', manifest.control.sha, '--cert-identity', `https://github.com/${CONTROL}/${WORKFLOW}@${REF}`,
-          '--cert-oidc-issuer', ISSUER, '--source-repo', CONTROL, '--source-ref', REF,
+          '--signer-digest', manifest.control.sha, '--source-ref', REF,
           '--source-digest', manifest.control.sha, '--deny-self-hosted-runners',
           '--predicate-type', PREDICATE, '--format', 'json'];
         const result = await withAuthorizationDeadline(deadlineSignal, 30_000, (processSignal) => run('gh', args, {
           signal: processSignal, timeoutMs: 30_000, maxOutputBytes: MAX_OUTPUT_BYTES,
-          env: { GH_CONFIG_DIR: ghConfig, GH_HOST: 'github.com', GH_PROMPT_DISABLED: '1',
+          // The trusted station's gh login is a precondition. The existing
+          // boundary retains PATH/HOME and strips token environment variables.
+          env: { GH_HOST: 'github.com', GH_PROMPT_DISABLED: '1',
             GH_NO_UPDATE_NOTIFIER: '1', GH_NO_EXTENSION_UPDATE_NOTIFIER: '1' },
         }));
         const now = fresh();
