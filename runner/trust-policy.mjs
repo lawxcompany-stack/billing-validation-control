@@ -1,6 +1,8 @@
-// Task 9 must replace null only after administrator readback. Keeping this unset
-// makes production activation fail closed instead of trusting a caller/env value.
-const REVIEWED_CONTROL_REPOSITORY_ID = null;
+// Administrator-authenticated GET /repos/lawxcompany-stack/billing-validation-control,
+// read back 2026-09-29. This identity does not authorize runner activation:
+// the environment, App, runner admission and collection prerequisites still apply.
+// Never source this value from caller input, a dispatch field or local environment.
+const REVIEWED_CONTROL_REPOSITORY_ID = '1384018279';
 
 export function getReviewedControlRepositoryId() {
   if (typeof REVIEWED_CONTROL_REPOSITORY_ID !== 'string' ||

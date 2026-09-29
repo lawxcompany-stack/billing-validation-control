@@ -165,23 +165,59 @@ jobs:
 
 
   reader:
-    if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && needs.authorize.result == 'success' }}
     needs: authorize
     runs-on: ubuntu-latest
     environment: billing-validation-reader
     timeout-minutes: 10
     permissions:
       contents: read
+    outputs:
+      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
+      candidate_tree_sha: ${{ steps.candidate.outputs.candidate_tree_sha }}
+      candidate_base_sha: ${{ steps.candidate.outputs.candidate_base_sha }}
+      candidate_pull_number: ${{ steps.candidate.outputs.candidate_pull_number }}
+      ci_run_id: ${{ steps.candidate.outputs.ci_run_id }}
+      ci_run_attempt: ${{ steps.candidate.outputs.ci_run_attempt }}
     steps:
-      - name: Fail closed until Task 2 supplies the read-only candidate resolver
-        run: |
-          echo 'Candidate API access is not enabled by Task 1.' >&2
-          exit 1
+      - name: Checkout exact triggering workflow SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Create candidate metadata reader token
+        id: reader_token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ vars.BILLING_READER_APP_ID }}
+          private-key: ${{ secrets.BILLING_READER_APP_PRIVATE_KEY }}
+          owner: lawxcompany-stack
+          repositories: Plataforma-LawX
+          permission-actions: read
+          permission-contents: read
+          permission-pull-requests: read
+          skip-token-revoke: false
+      - name: Read exact candidate and prerequisite CI jobs
+        id: candidate
+        env:
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          CONTROL_REF: ${{ github.ref }}
+          CONTROL_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CONTROL_REF_PROTECTED: ${{ github.ref_protected }}
+          CONTROL_EVENT_NAME: ${{ github.event_name }}
+          CANDIDATE_SHA: ${{ needs.authorize.outputs.candidate_sha }}
+          CANDIDATE_READ_TOKEN: ${{ steps.reader_token.outputs.token }}
+        run: node scripts/read-candidate.mjs
 
   test:
     if: ${{ always() && github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && needs.reader.result == 'success' && ((needs.authorize.outputs.operation == 'collect' && needs.attest-activation.result == 'success') || (needs.authorize.outputs.operation == 'recheck' && needs.attest-activation.result == 'skipped')) }}
     needs: [authorize, reader, attest-activation]
-    runs-on: ${{ needs.authorize.outputs.runner_label != '' && fromJSON(format('["self-hosted","linux","{0}"]', needs.authorize.outputs.runner_label)) || 'ubuntu-latest' }}
+    runs-on: ${{ needs.authorize.outputs.runner_label != '' && fromJSON(format('["{0}"]', needs.authorize.outputs.runner_label)) || 'ubuntu-latest' }}
     environment: billing-validation-tests
     timeout-minutes: 45
     permissions:

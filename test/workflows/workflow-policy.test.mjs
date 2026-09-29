@@ -191,7 +191,8 @@ test('the collect test job uses the validated per-attempt label and recheck rema
   assert.equal(typeof runsOn, 'string');
   assert.match(runsOn, /needs\.authorize\.outputs\.runner_label/);
   assert.match(runsOn, /fromJSON\(/);
-  assert.match(runsOn, /self-hosted/);
+  assert.doesNotMatch(runsOn, /self-hosted|linux/,
+    'default labels are unavailable on the no-default-labels ephemeral runner');
   assert.match(runsOn, /ubuntu-latest/);
   assert.ok(!runsOn.includes('billing-validation-runner'), 'A fixed reusable runner label is forbidden');
   assert.ok(!runsOn.includes('candidate_ref'), 'Candidate refs must not choose the runner');
@@ -211,7 +212,7 @@ test('PR validation is GitHub-hosted and no privileged workflow runs on pull_req
 
   for (const [jobId, job] of Object.entries(workflow.jobs)) {
     if (job.if?.includes("github.event_name == 'pull_request'")) continue;
-    if (typeof job['runs-on'] === 'string' && job['runs-on'].includes('self-hosted')) {
+    if (!isHostedRunner(job['runs-on'])) {
       assert.match(job.if, /github\.event_name\s*==\s*'workflow_dispatch'/,
         `${jobId} may target self-hosted only for trusted workflow_dispatch runs`);
       assert.match(job.if, /needs\.authorize\.result\s*==\s*'success'/,
