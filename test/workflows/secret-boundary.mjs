@@ -6,9 +6,20 @@ import YAML from 'yaml';
 const workflowPaths = [
   '.github/workflows/validate-billing.yml',
   '.github/workflows/reconcile-billing-checks.yml',
+  '.github/workflows/authorize-local-collector.yml',
 ];
 
 function assertReaderBoundary(job) {
+  assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'environment', 'timeout-minutes', 'permissions', 'outputs', 'steps'].sort());
+  assert.equal(job['runs-on'], 'ubuntu-latest');
+  assert.deepEqual(job.outputs, {
+    candidate_sha: '${{ steps.candidate.outputs.candidate_sha }}',
+    candidate_tree_sha: '${{ steps.candidate.outputs.candidate_tree_sha }}',
+    candidate_base_sha: '${{ steps.candidate.outputs.candidate_base_sha }}',
+    candidate_pull_number: '${{ steps.candidate.outputs.candidate_pull_number }}',
+    ci_run_id: '${{ steps.candidate.outputs.ci_run_id }}',
+    ci_run_attempt: '${{ steps.candidate.outputs.ci_run_attempt }}',
+  });
   assert.equal(job.environment, 'billing-validation-reader');
   assert.equal(job.needs, 'authorize');
   assert.equal(job['continue-on-error'], undefined);
@@ -24,6 +35,7 @@ function assertReaderBoundary(job) {
   assert.equal(checkout.with.ref, '${{ github.sha }}');
   assert.equal(checkout.with['persist-credentials'], false);
   assert.equal(checkout.with.repository, undefined);
+  assert.deepEqual(checkout.with, { ref: '${{ github.sha }}', 'persist-credentials': false });
   assert.equal(setup.uses, 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020');
   assert.deepEqual(setup.with, { 'node-version': '22', 'package-manager-cache': false });
   assert.equal(token.id, 'reader_token');
@@ -52,7 +64,80 @@ function assertReaderBoundary(job) {
     'the reader token may only be consumed by the fixed reader step');
 }
 
+// Closed structural contract independent of the YAML being checked. Exact keys,
+// commands and expressions also cover bracket/toJSON credential exfiltration and
+// job/step defaults, containers, paths, shell or conditional execution bypasses.
+function assertLocalAuthorizationBoundary(workflow) {
+  const guard = "github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected";
+  const expression = text => '${{ ' + text + ' }}';
+  const setup = () => [
+    { name: 'Checkout exact triggering workflow SHA',
+      uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      with: { ref: '${{ github.sha }}', 'persist-credentials': false } },
+    { name: 'Set up Node.js 22', uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      with: { 'node-version': '22', 'package-manager-cache': false } },
+  ];
+  const context = {
+    CONTROL_REPOSITORY: '${{ github.repository }}', CONTROL_REPOSITORY_ID: '${{ github.repository_id }}',
+    CONTROL_REF: '${{ github.ref }}', CONTROL_DEFAULT_BRANCH: '${{ github.event.repository.default_branch }}',
+    CONTROL_REF_PROTECTED: '${{ github.ref_protected }}', CONTROL_EVENT_NAME: '${{ github.event_name }}',
+    CONTROL_WORKFLOW_REF: '${{ github.workflow_ref }}', CONTROL_WORKFLOW_SHA: '${{ github.workflow_sha }}',
+    CONTROL_SHA: '${{ github.sha }}', CONTROL_RUN_ID: '${{ github.run_id }}', CONTROL_RUN_ATTEMPT: '${{ github.run_attempt }}',
+  };
+  const stringInput = description => ({ description, required: true, type: 'string' });
+  assert.deepEqual(workflow, {
+    name: 'Authorize local collector',
+    on: { workflow_dispatch: { inputs: {
+      candidate_sha: stringInput('Full lowercase candidate commit SHA'),
+      execution_id: stringInput('Local challenge execution ID'),
+      activation_commitment: stringInput('Local challenge activation commitment'),
+      suite: { description: 'Authorization suite', required: true, type: 'choice', options: ['billing-43', 'billing-3ds-15'] },
+    } } },
+    permissions: { contents: 'read' },
+    jobs: {
+      authorize: {
+        if: expression(guard), 'runs-on': 'ubuntu-latest', 'timeout-minutes': 5, permissions: { contents: 'read' },
+        outputs: { dispatch: '${{ steps.authorize.outputs.dispatch }}' },
+        steps: [...setup(), { name: 'Authorize dispatch and require a reviewed release', id: 'authorize',
+          env: { ...context, DISPATCH_INPUTS: '${{ toJSON(inputs) }}' }, run: 'node scripts/authorize-local-collector.mjs' }],
+      },
+      reader: {
+        if: expression(guard + " && needs.authorize.result == 'success'"), needs: 'authorize', 'runs-on': 'ubuntu-latest',
+        environment: 'billing-validation-reader', 'timeout-minutes': 10, permissions: { contents: 'read' },
+        outputs: { receipt: '${{ steps.candidate.outputs.receipt }}' },
+        steps: [...setup(), {
+          name: 'Create candidate metadata reader token', id: 'reader_token',
+          uses: 'actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349',
+          with: { 'app-id': '${{ vars.BILLING_READER_APP_ID }}', 'private-key': '${{ secrets.BILLING_READER_APP_PRIVATE_KEY }}',
+            owner: 'lawxcompany-stack', repositories: 'Plataforma-LawX', 'permission-actions': 'read',
+            'permission-contents': 'read', 'permission-pull-requests': 'read', 'skip-token-revoke': false },
+        }, { name: 'Read exact candidate and prerequisite CI jobs', id: 'candidate',
+          env: { ...context, DISPATCH_INPUTS: '${{ needs.authorize.outputs.dispatch }}',
+            CANDIDATE_READ_TOKEN: '${{ steps.reader_token.outputs.token }}' }, run: 'node scripts/read-local-authorization-candidate.mjs' }],
+      },
+      'attest-activation': {
+        if: expression(guard + " && needs.authorize.result == 'success' && needs.reader.result == 'success'"),
+        needs: ['authorize', 'reader'], 'runs-on': 'ubuntu-latest', environment: 'billing-validation-attestation',
+        'timeout-minutes': 10, permissions: { contents: 'read', 'id-token': 'write', attestations: 'write' },
+        steps: [...setup(), { name: 'Compose canonical local authorization subject',
+          env: { ...context, DISPATCH_INPUTS: '${{ needs.authorize.outputs.dispatch }}',
+            CANDIDATE_RECEIPT: '${{ needs.reader.outputs.receipt }}', RUNNER_TEMP: '${{ runner.temp }}' },
+          run: 'node scripts/write-local-authorization.mjs',
+        }, { name: 'Attest only the canonical local authorization subject',
+          uses: 'actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d',
+          with: { 'subject-path': '${{ runner.temp }}/local-collector-authorization.json' },
+        }, { name: 'Upload only the canonical local authorization subject',
+          uses: 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+          with: { name: 'local-collector-authorization', path: '${{ runner.temp }}/local-collector-authorization.json',
+            'if-no-files-found': 'error', 'retention-days': 1, overwrite: false, 'include-hidden-files': false },
+        }],
+      },
+    },
+  });
+}
+
 export function assertWorkflowSecretBoundary(workflow, path) {
+  if (path === workflowPaths[2]) return assertLocalAuthorizationBoundary(workflow);
   assert.deepEqual(workflow.permissions, { contents: 'read' }, `${path} must keep token permissions read-only`);
 
   for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {

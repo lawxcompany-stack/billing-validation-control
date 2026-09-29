@@ -1,7 +1,10 @@
 // These are prerequisites for trusted collection, not billing/release evidence.
 // Waiting for the application workflow's final financial artifact here would
 // create a cycle when that workflow is itself waiting for trusted collection.
+import { types } from 'node:util';
+
 const REPOSITORY = 'lawxcompany-stack/Plataforma-LawX';
+const REPOSITORY_ID = 1234079266;
 const WORKFLOW_ID = 290018021;
 const WORKFLOW_PATH = '.github/workflows/ci.yml';
 const SHA = /^[a-f0-9]{40}$/u;
@@ -114,10 +117,28 @@ async function readJobs(api, attempt, candidate) {
   refuse('job_list_too_large');
 }
 
-export async function collectCandidateChecks({ api, candidate } = {}) {
-  if (!api || typeof api.get !== 'function' || candidate?.repository !== REPOSITORY ||
-      !id(candidate.repositoryId) || !id(candidate.pullNumber) || !SHA.test(candidate.candidateSha ?? '') ||
-      !SHA.test(candidate.baseSha ?? '') || !SHA.test(candidate.treeSha ?? '')) refuse('input_invalid');
+function snapshotFields(value, keys) {
+  if (!value || typeof value !== 'object' || types.isProxy(value) || Array.isArray(value)
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) refuse('input_invalid');
+  const result = {};
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) refuse('input_invalid');
+    result[key] = descriptor.value;
+  }
+  return Object.freeze(result);
+}
+
+export async function collectCandidateChecks(input = {}) {
+  const options = snapshotFields(input, ['api', 'candidate']);
+  const candidate = snapshotFields(options.candidate,
+    ['repository', 'repositoryId', 'pullNumber', 'candidateSha', 'baseSha', 'treeSha']);
+  const client = snapshotFields(options.api, ['get']);
+  if (typeof client.get !== 'function') refuse('input_invalid');
+  const api = Object.freeze({ get: client.get.bind(options.api) });
+  if (candidate.repository !== REPOSITORY || candidate.repositoryId !== REPOSITORY_ID || !id(candidate.pullNumber) ||
+      ![candidate.candidateSha, candidate.baseSha, candidate.treeSha].every(value =>
+        typeof value === 'string' && SHA.test(value))) refuse('input_invalid');
 
   const attempt = await latestAttempt(api, candidate);
   const jobs = await readJobs(api, attempt, candidate);
@@ -141,6 +162,7 @@ export async function collectCandidateChecks({ api, candidate } = {}) {
       current.startedAt !== attempt.startedAt) refuse('changed_during_read');
 
   return Object.freeze({ scope: 'candidate-prerequisites', repository: REPOSITORY,
+    repositoryId: REPOSITORY_ID,
     candidateSha: candidate.candidateSha, treeSha: candidate.treeSha, baseSha: candidate.baseSha,
     pullNumber: candidate.pullNumber, workflowId: WORKFLOW_ID, workflowPath: WORKFLOW_PATH,
     runId: String(attempt.id), attempt: attempt.run_attempt, jobs: Object.freeze(receipts) });

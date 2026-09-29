@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import YAML from 'yaml';
+import { assertWorkflowSecretBoundary } from './secret-boundary.mjs';
 
 const paths = [
   '.github/workflows/validate-billing.yml',
   '.github/workflows/reconcile-billing-checks.yml',
+  '.github/workflows/authorize-local-collector.yml',
 ];
 
 for (const path of paths) {
@@ -14,6 +16,7 @@ for (const path of paths) {
   assert.ok(workflow.jobs && Object.keys(workflow.jobs).length > 0, `${path} must declare jobs`);
   assert.deepEqual(workflow.permissions, { contents: 'read' }, `${path} must default to contents: read`);
   assert.ok(!Object.hasOwn(workflow.on, 'pull_request_target'), `${path} must not use pull_request_target`);
+  assertWorkflowSecretBoundary(workflow, path);
 
   for (const [jobId, job] of Object.entries(workflow.jobs)) {
     assert.ok(Number.isInteger(job['timeout-minutes']) && job['timeout-minutes'] > 0,
