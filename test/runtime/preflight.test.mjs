@@ -2,8 +2,14 @@ import assert from 'node:assert/strict';
 import { createHash, createPublicKey } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { preflightRuntime, validateEnvironmentPolicy } from '../../src/runtime/preflight.mjs';
+import { preflightRuntime as runtime, validateEnvironmentPolicy } from '../../src/runtime/preflight.mjs';
 import { candidate, deployment, fetchFixture, policy as configuredPolicy, signedAttestation } from './fixture.mjs';
+import { projectDetails, trustedConfiguration } from './standalone-fixture.mjs';
+
+function preflightRuntime(options) {
+  return runtime({ trustedConfiguration, supabaseToken: 'synthetic-read-token',
+    stripeKey: 'sk_test_synthetic123', ...options });
+}
 
 function apiFixture({ listed = {}, detail = {} } = {}) {
   const calls = [];
@@ -46,13 +52,8 @@ function verifiedRuntimeFetch(overrides = {}) {
       calls.push({ url, options });
       let body;
       if (url === `${deployment.origin}/api/internal/deployment-identity`) body = signedAttestation();
-      else if (url.endsWith(`/branches/${configuredPolicy.database.branchName}`)) body = {
-        id: configuredPolicy.database.branchId, name: configuredPolicy.database.branchName,
-        project_ref: configuredPolicy.database.projectRef,
-        parent_project_ref: configuredPolicy.database.parentProjectRef,
-        is_default: false, status: 'ACTIVE_HEALTHY', preview_project_status: 'ACTIVE_HEALTHY',
-        ...overrides.branch,
-      };
+      else if (url === `https://api.supabase.com/v1/projects/${configuredPolicy.database.projectRef}`)
+        body = { ...projectDetails, ...overrides.project };
       else if (url.endsWith('/database/migrations')) body = [
         { version: '202609230002', name: 'billing' }, { version: '202609230001', name: 'init' },
       ];
@@ -78,12 +79,14 @@ test('default policy is closed-schema and records the reviewed non-secret identi
   assert.equal(validateEnvironmentPolicy(policy), true);
   assert.equal(policy.vercel.projectId, 'prj_NEAKAPvyPzh76wfoHqYF6mRSfBs0');
   assert.equal(policy.vercel.teamId, 'team_Legw262JzvhZUhIZtv5pFE4T');
-  assert.equal(policy.database.projectRef, 'zjvqjdntasprusoqfsgw');
-  assert.equal(policy.database.parentProjectRef, null);
+  assert.equal(policy.database.kind, 'standalone');
+  assert.equal(policy.database.approved, false);
+  assert.equal(policy.database.projectRef, null);
+  assert.equal(policy.database.productionProjectRef, null);
   assert.equal(policy.database.schemaFingerprintSha256, null);
   assert.equal(policy.database.migrationHistorySha256, null);
-  assert.equal(policy.database.branchId, 'e2f26c0b-8a79-4cd5-ad80-faaf91fb51a2');
-  assert.equal(policy.database.branchName, 'lawx-billing-validation-20260912');
+  assert.deepEqual(policy.database.branchProjectRefs, ['zjvqjdntasprusoqfsgw']);
+  for (const field of ['parentProjectRef', 'branchId', 'branchName']) assert.equal(Object.hasOwn(policy.database, field), false);
   assert.equal(policy.stripe.accountId, 'acct_1TWh8jF7lfHrHdNa');
   assert.equal(policy.stripe.webhookEndpointId, null);
   const publicKeyDer = createPublicKey(policy.attestation.publicKeyPem).export({ type: 'spki', format: 'der' });
@@ -125,12 +128,13 @@ test('fails before metadata or runtime requests when any authoritative identity 
   await assert.rejects(preflightRuntime({
     api,
     candidate,
-    policy: { ...configuredPolicy, database: { ...configuredPolicy.database, branchId: null } },
+    policy: { ...configuredPolicy, database: { ...configuredPolicy.database, projectRef: null, connection: null } },
     fetchImpl: async () => { fetchCalls += 1; throw new Error('must not fetch'); },
   }), { code: 'environment_policy_unconfigured' });
   assert.deepEqual(api.calls, []);
   assert.equal(fetchCalls, 0);
-  for (const field of ['parentProjectRef', 'schemaFingerprintSha256', 'migrationHistorySha256']) {
+  for (const field of ['productionProjectRef', 'organizationId', 'region', 'databaseVersion',
+    'postgresEngine', 'releaseChannel', 'connection', 'schemaFingerprintSha256', 'migrationHistorySha256']) {
     await assert.rejects(preflightRuntime({
       api, candidate,
       policy: { ...configuredPolicy, database: { ...configuredPolicy.database, [field]: null } },
@@ -146,12 +150,14 @@ test('fails before metadata or runtime requests when any authoritative identity 
   assert.equal(fetchCalls, 0);
 });
 
-test('returns the exact Task 2/4 environment tuple after immutable deployment and runtime verification', async () => {
+test('returns project-only standalone identity after immutable deployment and runtime verification', async () => {
   const api = apiFixture();
   const fetch = verifiedRuntimeFetch();
   const result = await preflightRuntime({
     api,
-    candidate,
+    candidate: { ...candidate, projectRef: 'zjvqjdntasprusoqfsgw',
+      SUPABASE_VALIDATION_PROJECT_REF: 'zjvqjdntasprusoqfsgw', databaseUrl: 'https://candidate.invalid/',
+      supabaseUrl: 'https://candidate.invalid/', environmentApproved: false },
     policy: configuredPolicy,
     fetchImpl: fetch.fetchImpl,
     supabaseToken: 'synthetic-read-token',
@@ -161,25 +167,17 @@ test('returns the exact Task 2/4 environment tuple after immutable deployment an
   assert.deepEqual(result.expectedEnvironment, {
     database: {
       projectRef: 'abcdefghijklmnopqrst',
-      branchId: 'synthetic-billing-validation',
     },
     deployment: { id: 'dpl_candidate123', origin: 'https://lawx-abc123def-team.vercel.app' },
     stripe: { accountId: 'acct_testlawx123' },
   });
   assert.deepEqual(Object.keys(result.expectedEnvironment), ['database', 'deployment', 'stripe']);
-  assert.deepEqual(Object.keys(result.expectedEnvironment.database), ['projectRef', 'branchId']);
+  assert.deepEqual(Object.keys(result.expectedEnvironment.database), ['projectRef']);
   assert.deepEqual(Object.keys(result.expectedEnvironment.deployment), ['id', 'origin']);
   assert.deepEqual(Object.keys(result.expectedEnvironment.stripe), ['accountId']);
   assert.equal(Object.hasOwn(result, 'secret'), false);
   assert.deepEqual(result.providerVerification, {
-    supabase: {
-      projectRef: configuredPolicy.database.projectRef,
-      parentProjectRef: configuredPolicy.database.parentProjectRef,
-      branchId: configuredPolicy.database.branchId,
-      branchName: configuredPolicy.database.branchName,
-      schemaFingerprintSha256: configuredPolicy.database.schemaFingerprintSha256,
-      migrationHistorySha256: configuredPolicy.database.migrationHistorySha256,
-    },
+    supabase: configuredPolicy.database,
     stripe: {
       accountId: configuredPolicy.stripe.accountId,
       webhookEndpointId: configuredPolicy.stripe.webhookEndpointId,
@@ -191,6 +189,7 @@ test('returns the exact Task 2/4 environment tuple after immutable deployment an
   assert.equal(JSON.stringify(result).includes('sk_test_synthetic123'), false);
   assert.equal(api.calls.length, 2);
   assert.equal(fetch.calls.length, 6);
+  assert.equal(fetch.calls.some(({ url }) => url.includes('candidate.invalid') || url.includes('zjvqjdntasprusoqfsgw')), false);
 });
 
 test('refuses a Production deployment before exposing runtime identity', async () => {
@@ -216,7 +215,7 @@ test('refuses candidate tree or runtime project mismatches', async () => {
 });
 
 test('provider mismatch after valid attestation never reaches fixture or session methods', async () => {
-  for (const override of [{ branch: { status: 'INACTIVE' } }, { webhook: { livemode: true } }]) {
+  for (const override of [{ project: { status: 'INACTIVE' } }, { webhook: { livemode: true } }]) {
     const api = apiFixture();
     let mutations = 0;
     api.createFixture = async () => { mutations += 1; };
@@ -225,7 +224,7 @@ test('provider mismatch after valid attestation never reaches fixture or session
     await assert.rejects(preflightRuntime({
       api, candidate, policy: configuredPolicy, fetchImpl: fetch.fetchImpl,
       supabaseToken: 'synthetic-read-token', stripeKey: 'sk_test_synthetic123',
-    }), { code: override.branch ? 'supabase_branch_mismatch' : 'stripe_webhook_mismatch' });
+    }), { code: override.project ? 'supabase_project_mismatch' : 'stripe_webhook_mismatch' });
     assert.equal(fetch.calls[0].url, `${deployment.origin}/api/internal/deployment-identity`);
     assert.equal(mutations, 0);
   }

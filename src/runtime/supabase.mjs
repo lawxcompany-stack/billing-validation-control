@@ -1,13 +1,12 @@
 import { createHash } from 'node:crypto';
-import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { BILLING_43_IDS } from '../contracts/billing-43.mjs';
 import { sanitizeDatabaseSnapshot, sanitizeInstalledSchemaState, sanitizeSqlConcurrencyProof } from '../billing/observations.mjs';
 import { isActiveFixtureMutationTransaction } from '../attempts/store.mjs';
+import { isValidBillingEnvironment, isValidStandaloneDatabasePolicy } from '../billing/contracts.mjs';
 
 const API = 'https://api.supabase.com';
 const REF = /^[a-z0-9]{20}$/u;
 const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
-const DIGEST = /^[0-9a-f]{64}$/u;
 const VERSION = /^[0-9]{1,32}$/u;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const PRODUCTION_BRANCH_PART = /(?:^|[-_.])(?:main|master|prod|production|primary|default)(?:$|[-_.])/u;
@@ -69,24 +68,42 @@ async function getJson(path, token, fetchImpl, limit) {
   }
 }
 
-export async function verifySupabaseEnvironment({ policy, token, fetchImpl = globalThis.fetch } = {}) {
+// This seam is called only by trusted control code after Environment approval.
+// It deliberately does not load process.env, dotenv files, or candidate inputs.
+export function assertSupabaseRuntimeConfiguration({ policy, token, trustedConfiguration,
+  fetchImpl = globalThis.fetch } = {}) {
   const db = policy?.database;
-  if (!object(db) || !REF.test(db.projectRef) || !REF.test(db.parentProjectRef) ||
-      db.projectRef === db.parentProjectRef || !BRANCH.test(db.branchId) || !BRANCH.test(db.branchName) ||
-      PRODUCTION_BRANCH_PART.test(db.branchId.toLowerCase()) || PRODUCTION_BRANCH_PART.test(db.branchName.toLowerCase()) ||
-      !DIGEST.test(db.schemaFingerprintSha256) || !DIGEST.test(db.migrationHistorySha256)) {
-    refuse('supabase_policy_invalid');
+  if (!isValidStandaloneDatabasePolicy(db, { configured: true })) refuse('supabase_policy_invalid');
+  if (!exactRecord(trustedConfiguration, ['environmentApproved', 'SUPABASE_VALIDATION_PROJECT_REF', 'databaseUrl']) ||
+      trustedConfiguration.environmentApproved !== true ||
+      trustedConfiguration.SUPABASE_VALIDATION_PROJECT_REF !== db.projectRef ||
+      typeof trustedConfiguration.databaseUrl !== 'string') refuse('supabase_configuration_invalid');
+  let url;
+  try { url = new URL(trustedConfiguration.databaseUrl); } catch { refuse('supabase_configuration_invalid'); }
+  const c = db.connection;
+  if (!['postgresql:', 'postgres:'].includes(url.protocol) || url.hostname !== c.host ||
+      (url.port || '5432') !== String(c.port) || url.pathname !== `/${c.database}` ||
+      url.username !== c.role || !url.password || url.search || url.hash ||
+      /[\r\n\0]/u.test(trustedConfiguration.databaseUrl)) {
+    refuse('supabase_configuration_invalid');
   }
   if (typeof token !== 'string' || token.length === 0 || /[\r\n]/u.test(token) || typeof fetchImpl !== 'function') {
     refuse('supabase_credentials_invalid');
   }
+  return Object.freeze({ ...db, branchProjectRefs: Object.freeze([...db.branchProjectRefs]),
+    connection: Object.freeze({ ...c }) });
+}
 
-  const branch = await getJson(`/v1/projects/${db.parentProjectRef}/branches/${db.branchName}`, token, fetchImpl, 256_000);
-  if (!object(branch) || branch.id !== db.branchId || branch.name !== db.branchName ||
-      branch.project_ref !== db.projectRef || branch.parent_project_ref !== db.parentProjectRef ||
-      branch.is_default !== false || branch.status !== 'ACTIVE_HEALTHY' ||
-      (branch.preview_project_status !== undefined && branch.preview_project_status !== null &&
-       branch.preview_project_status !== 'ACTIVE_HEALTHY')) refuse('supabase_branch_mismatch');
+export async function verifySupabaseEnvironment({ policy, token, trustedConfiguration,
+  fetchImpl = globalThis.fetch } = {}) {
+  const db = assertSupabaseRuntimeConfiguration({ policy, token, trustedConfiguration, fetchImpl });
+  const project = await getJson(`/v1/projects/${db.projectRef}`, token, fetchImpl, 256_000);
+  if (!object(project) || project.ref !== db.projectRef || project.organization_id !== db.organizationId ||
+      project.region !== db.region || project.status !== 'ACTIVE_HEALTHY' || !object(project.database) ||
+      project.database.version !== db.databaseVersion || project.database.postgres_engine !== db.postgresEngine ||
+      project.database.release_channel !== db.releaseChannel ||
+      Object.hasOwn(project, 'parent_project_ref') || Object.hasOwn(project, 'branch_id') ||
+      Object.hasOwn(project, 'branch_name') || project.is_branch === true) refuse('supabase_project_mismatch');
 
   const migrations = await getJson(`/v1/projects/${db.projectRef}/database/migrations`, token, fetchImpl, 512_000);
   if (!Array.isArray(migrations) || migrations.length > 10_000) refuse('supabase_migrations_invalid');
@@ -107,14 +124,7 @@ export async function verifySupabaseEnvironment({ policy, token, fetchImpl = glo
     refuse('supabase_types_invalid');
   }
   if (sha256(Buffer.from(generated.types, 'utf8')) !== db.schemaFingerprintSha256) refuse('supabase_types_mismatch');
-  return Object.freeze({
-    projectRef: db.projectRef,
-    parentProjectRef: db.parentProjectRef,
-    branchId: db.branchId,
-    branchName: db.branchName,
-    schemaFingerprintSha256: db.schemaFingerprintSha256,
-    migrationHistorySha256: db.migrationHistorySha256,
-  });
+  return db;
 }
 
 const FIXTURE_CAPABILITIES = Object.freeze({
@@ -142,9 +152,9 @@ function exactRecord(value, keys) {
 }
 
 function fixtureIdentity(value, expectedEnvironment) {
-  return exactRecord(value, ['projectRef', 'branchId', 'appendOnly']) &&
-    value.projectRef === expectedEnvironment.database.projectRef &&
-    value.branchId === expectedEnvironment.database.branchId && value.appendOnly === true;
+  return exactRecord(value, [...Object.keys(expectedEnvironment.database), 'appendOnly']) &&
+    Object.keys(expectedEnvironment.database).every((key) => value[key] === expectedEnvironment.database[key]) &&
+    value.appendOnly === true;
 }
 
 function safeFixtureRow(value) {
@@ -162,6 +172,7 @@ function validateReaderBinding(input, expectedEnvironment) {
   if (!object(input) || !SAFE_CONTROL_ID.test(input.attemptId ?? '') ||
       !SAFE_CONTROL_ID.test(input.caseId ?? '') || input.environment !== undefined &&
       JSON.stringify(input.environment) !== JSON.stringify(expectedEnvironment) ||
+      input.projectRef !== undefined && input.projectRef !== expectedEnvironment.database.projectRef ||
       input.branchId !== undefined && input.branchId !== expectedEnvironment.database.branchId) {
     refuse('supabase_reader_input_invalid');
   }
@@ -243,7 +254,7 @@ function sanitizeWebhookReceipts(value) {
 export function createSupabaseBillingReader({ expectedEnvironment, source } = {}) {
   const required = ['readIdentity', 'readBillingSnapshot', 'listAttemptFixtures',
     'readSyntheticFixture', 'readWebhookInbox', 'readWebhookReceipts'];
-  if (!isValidExpectedEnvironment(expectedEnvironment) || !object(source) ||
+  if (!isValidBillingEnvironment(expectedEnvironment) || !object(source) ||
       required.some((method) => typeof source[method] !== 'function')) {
     refuse('supabase_reader_unavailable');
   }
@@ -252,15 +263,13 @@ export function createSupabaseBillingReader({ expectedEnvironment, source } = {}
     ? readerIdDescriptor.value : null;
   const trustedReaderId = typeof candidateReaderId === 'string' && SQL_READER_ID.test(candidateReaderId)
     ? candidateReaderId : null;
-  const identity = Object.freeze({ projectRef: expectedEnvironment.database.projectRef,
-    branchId: expectedEnvironment.database.branchId, readOnly: true });
+  const identity = Object.freeze({ ...expectedEnvironment.database, readOnly: true });
 
   async function readIdentity() {
     let actual;
     try { actual = await source.readIdentity(); } catch { refuse('supabase_reader_unavailable'); }
-    if (!exactRecord(actual, ['projectRef', 'branchId', 'readOnly']) ||
-        actual.projectRef !== identity.projectRef || actual.branchId !== identity.branchId ||
-        actual.readOnly !== true) refuse('supabase_reader_identity_mismatch');
+    if (!exactRecord(actual, Object.keys(identity)) ||
+        Object.keys(identity).some((key) => actual[key] !== identity[key])) refuse('supabase_reader_identity_mismatch');
     return identity;
   }
 
@@ -375,7 +384,7 @@ export function createSupabaseBillingReader({ expectedEnvironment, source } = {}
  * transactional fencing/reservation and insert-only capabilities at runtime.
  */
 export function createSupabaseFixturePublisher({ expectedEnvironment, adapter, attempts, owner } = {}) {
-  if (!isValidExpectedEnvironment(expectedEnvironment)) refuse('supabase_fixture_adapter_unavailable');
+  if (!isValidBillingEnvironment(expectedEnvironment)) refuse('supabase_fixture_adapter_unavailable');
 
   async function assertReadyBinding(binding = {}, verifyFence = true) {
     if (!object(adapter) || typeof adapter.readIdentity !== 'function' ||

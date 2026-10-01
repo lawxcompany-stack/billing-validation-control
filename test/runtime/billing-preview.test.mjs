@@ -91,7 +91,7 @@ function fakeChromium({ urlOverride, method = 'GET', redirected = false, content
 }
 
 const previewOwner = { attemptId: 'attempt-preview', fence: 'fence-preview',
-  candidateSha: candidate.candidateSha, environment: { deployment } };
+  candidateSha: candidate.candidateSha, environment: { deployment, database: { projectRef: policy.database.projectRef } } };
 const previewAttempts = { async assertFence({ attemptId, fence }) {
   if (attemptId !== previewOwner.attemptId || fence !== previewOwner.fence) {
     throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
@@ -103,6 +103,18 @@ function previewInput(chromium, overrides = {}) {
   return { deployment, candidate, deploymentAttestation, attempts: previewAttempts,
     owner: previewOwner, chromium, ...overrides };
 }
+
+test('Preview refuses missing, shared, and attestation-divergent database refs before launching', async () => {
+  for (const database of [undefined, { projectRef: 'zjvqjdntasprusoqfsgw' },
+    { projectRef: 'zyxwvutsrqponmlkjihg' }]) {
+    const fake = fakeChromium();
+    const owner = { ...previewOwner, environment: { deployment, database } };
+    await assert.rejects(previewModule.createBillingPreviewBrowser(previewInput(fake.chromium,
+      { owner, attempts: { async assertFence() { return owner; } } })),
+    { code: 'preview_deployment_unverified' });
+    assert.equal(fake.calls.launch, 0);
+  }
+});
 
 test('Preview transport opens only a pinned immutable HTTPS deployment in a disposable browser context', async () => {
   const create = needExport(previewModule, 'createBillingPreviewBrowser');
@@ -225,7 +237,7 @@ test('Preview creation requires the verifier capability to match the admitted at
   const create = needExport(previewModule, 'createBillingPreviewBrowser');
   const fake = fakeChromium();
   const owner = { attemptId: 'attempt-preview', fence: 'fence-preview',
-    candidateSha: candidate.candidateSha, environment: { deployment } };
+    candidateSha: candidate.candidateSha, environment: { deployment, database: { projectRef: policy.database.projectRef } } };
   const attempts = { async assertFence({ attemptId, fence }) {
     assert.equal(attemptId, owner.attemptId);
     assert.equal(fence, owner.fence);

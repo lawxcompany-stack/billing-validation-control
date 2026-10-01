@@ -2,6 +2,68 @@ import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { providerIdempotencyKey } from '../attempts/prepare.mjs';
 import { runStripeMutation, stripeRequestDigest } from '../runtime/stripe.mjs';
 import { isVerifiedDeploymentAttestation } from '../runtime/vercel.mjs';
+import { immutableVercelOrigin } from '../github/deployments.mjs';
+
+const REF = /^[a-z0-9]{20}$/u;
+const DIGEST = /^[0-9a-f]{64}$/u;
+const SHARED_BRANCH_REF = 'zjvqjdntasprusoqfsgw';
+const DATABASE_KEYS = ['kind', 'approved', 'projectRef', 'productionProjectRef', 'branchProjectRefs',
+  'organizationId', 'region', 'databaseVersion', 'postgresEngine', 'releaseChannel', 'connection',
+  'schemaFingerprintSha256', 'migrationHistorySha256'];
+
+function exactDataRecord(value, keys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const ownKeys = Reflect.ownKeys(value);
+  return ownKeys.length === keys.length && ownKeys.every((key) => keys.includes(key)) && keys.every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && Object.hasOwn(descriptor, 'value') && descriptor.enumerable;
+  });
+}
+
+export function isValidStandaloneProjectRef(value) {
+  return typeof value === 'string' && REF.test(value) && value !== SHARED_BRANCH_REF;
+}
+
+/** Trusted policy pins; nulls describe an unconfigured target, never an approved identity. */
+export function isValidStandaloneDatabasePolicy(db, { configured = false } = {}) {
+  if (!exactDataRecord(db, DATABASE_KEYS) || db.kind !== 'standalone' || typeof db.approved !== 'boolean' ||
+      !Array.isArray(db.branchProjectRefs) || db.branchProjectRefs.some((ref) => typeof ref !== 'string' || !REF.test(ref)) ||
+      new Set(db.branchProjectRefs).size !== db.branchProjectRefs.length) return false;
+  const nullable = (value, pattern) => value === null || typeof value === 'string' && pattern.test(value);
+  if (!nullable(db.projectRef, REF) || !nullable(db.productionProjectRef, REF) ||
+      db.projectRef !== null && (!isValidStandaloneProjectRef(db.projectRef) ||
+        db.projectRef === db.productionProjectRef || db.branchProjectRefs.includes(db.projectRef)) ||
+      !nullable(db.organizationId, /^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$/u) ||
+      !nullable(db.region, /^[a-z0-9][a-z0-9-]{2,63}$/u) ||
+      !nullable(db.databaseVersion, /^[0-9][A-Za-z0-9._-]{0,63}$/u) ||
+      !nullable(db.postgresEngine, /^[a-z][a-z0-9_-]{1,63}$/u) ||
+      !nullable(db.releaseChannel, /^[a-z][a-z0-9_-]{1,63}$/u) ||
+      !nullable(db.schemaFingerprintSha256, DIGEST) || !nullable(db.migrationHistorySha256, DIGEST)) return false;
+  if (db.connection !== null) {
+    const c = db.connection;
+    if (!exactDataRecord(c, ['mode', 'host', 'port', 'database', 'role']) ||
+        c.mode !== 'direct' || !isValidStandaloneProjectRef(db.projectRef) ||
+        c.host !== `db.${db.projectRef}.supabase.co` || c.port !== 5432 || c.database !== 'postgres' ||
+        typeof c.role !== 'string' || !/^[a-z][a-z0-9_]{2,62}$/u.test(c.role) || c.role.startsWith('pg_') ||
+        ['postgres', 'service_role', 'supabase_admin', 'supabase_auth_admin', 'authenticator', 'anon', 'authenticated']
+          .includes(c.role)) return false;
+  }
+  return !configured || db.approved === true && DATABASE_KEYS.every((key) => db[key] !== null);
+}
+
+/** New environments carry only project identity. Legacy attempt envelopes remain readable. */
+export function isValidBillingEnvironment(environment) {
+  if (!isValidStandaloneProjectRef(environment?.database?.projectRef)) return false;
+  if (isValidExpectedEnvironment(environment)) return true;
+  return exactDataRecord(environment, ['database', 'deployment', 'stripe']) &&
+    exactDataRecord(environment.database, ['projectRef']) &&
+    exactDataRecord(environment.deployment, ['id', 'origin']) &&
+    typeof environment.deployment.id === 'string' && /^dpl_[A-Za-z0-9]+$/u.test(environment.deployment.id) &&
+    typeof environment.deployment.origin === 'string' &&
+    immutableVercelOrigin(environment.deployment.origin) === environment.deployment.origin &&
+    exactDataRecord(environment.stripe, ['accountId']) && typeof environment.stripe.accountId === 'string' &&
+    /^acct_[A-Za-z0-9_]+$/u.test(environment.stripe.accountId);
+}
 
 export class BillingControlRefusal extends Error {
   constructor(code) { super(code); this.name = 'BillingControlRefusal'; this.code = code; }
@@ -27,11 +89,8 @@ function exactVerifiedEnvironment(preflight) {
   const verified = preflight?.providerVerification;
   const db = verified?.supabase;
   const stripe = verified?.stripe;
-  return isValidExpectedEnvironment(expected) &&
-    db?.projectRef === expected.database.projectRef && db?.branchId === expected.database.branchId &&
-    /^[a-z0-9]{20}$/u.test(db?.parentProjectRef ?? '') && db.parentProjectRef !== db.projectRef &&
-    /^[0-9a-f]{64}$/u.test(db?.schemaFingerprintSha256 ?? '') &&
-    /^[0-9a-f]{64}$/u.test(db?.migrationHistorySha256 ?? '') &&
+  return isValidBillingEnvironment(expected) && isValidStandaloneDatabasePolicy(db, { configured: true }) &&
+    db.projectRef === expected.database.projectRef &&
     stripe?.accountId === expected.stripe.accountId && stripe.livemode === false &&
     /^we_[A-Za-z0-9]+$/u.test(stripe?.webhookEndpointId ?? '') &&
     stripe.webhookUrl === `${expected.deployment.origin}/api/stripe/webhook`;
@@ -41,6 +100,7 @@ function hasCurrentDeploymentAttestation(preflight, candidateSha) {
   const candidate = preflight?.candidate;
   return typeof candidateSha === 'string' && /^[0-9a-f]{40}$/u.test(candidateSha) &&
     candidate?.candidateSha === candidateSha &&
+    preflight.deploymentAttestation?.projectRef === preflight.expectedEnvironment?.database?.projectRef &&
     isVerifiedDeploymentAttestation(preflight?.deploymentAttestation, {
       deployment: preflight?.expectedEnvironment?.deployment,
       candidate,

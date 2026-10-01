@@ -1,28 +1,23 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
-import { createSupabaseBillingReader, verifySupabaseEnvironment } from '../../src/runtime/supabase.mjs';
+import { createSupabaseBillingReader, verifySupabaseEnvironment as verify } from '../../src/runtime/supabase.mjs';
 import * as supabaseModule from '../../src/runtime/supabase.mjs';
 import { environment as billingEnvironment } from '../billing/support.mjs';
 import { policy } from './fixture.mjs';
+import { projectDetails, trustedConfiguration } from './standalone-fixture.mjs';
+
+function verifySupabaseEnvironment(options) { return verify({ trustedConfiguration, ...options }); }
 
 const token = 'synthetic-read-token';
-const branch = {
-  id: policy.database.branchId,
-  name: policy.database.branchName,
-  project_ref: policy.database.projectRef,
-  parent_project_ref: policy.database.parentProjectRef,
-  is_default: false,
-  status: 'ACTIVE_HEALTHY',
-  preview_project_status: 'ACTIVE_HEALTHY',
-};
+const project = projectDetails;
 const migrations = [
   { version: '202609230002', name: 'billing' },
   { version: '202609230001', name: 'init' },
 ];
 const types = { types: 'export type Database = { public: true }\n' };
 
-function fixture(replies = [branch, migrations, types]) {
+function fixture(replies = [project, migrations, types]) {
   const calls = [];
   return {
     calls,
@@ -36,19 +31,12 @@ function fixture(replies = [branch, migrations, types]) {
   };
 }
 
-test('verifies the exact healthy child branch and independent migration/types digests using only pinned read routes', async () => {
+test('verifies the exact healthy standalone project and independent migration/types digests using pinned read routes', async () => {
   const network = fixture();
   const result = await verifySupabaseEnvironment({ policy, token, fetchImpl: network.fetchImpl });
-  assert.deepEqual(result, {
-    projectRef: policy.database.projectRef,
-    parentProjectRef: policy.database.parentProjectRef,
-    branchId: policy.database.branchId,
-    branchName: policy.database.branchName,
-    schemaFingerprintSha256: policy.database.schemaFingerprintSha256,
-    migrationHistorySha256: policy.database.migrationHistorySha256,
-  });
+  assert.deepEqual(result, policy.database);
   assert.deepEqual(network.calls.map(({ url }) => url), [
-    `https://api.supabase.com/v1/projects/${policy.database.parentProjectRef}/branches/${policy.database.branchName}`,
+    `https://api.supabase.com/v1/projects/${policy.database.projectRef}`,
     `https://api.supabase.com/v1/projects/${policy.database.projectRef}/database/migrations`,
     `https://api.supabase.com/v1/projects/${policy.database.projectRef}/types/typescript?included_schemas=public`,
   ]);
@@ -71,7 +59,7 @@ test('rejects a production-labelled branch pin before any provider request', asy
 
 test('exposes only the safe reader and append-only fixture factory; refuses equal refs without fetching', async () => {
   assert.deepEqual(Object.keys(supabaseModule).sort(), ['SupabaseRefusal', 'createSupabaseBillingReader',
-    'createSupabaseFixturePublisher', 'verifySupabaseEnvironment']);
+    'assertSupabaseRuntimeConfiguration', 'createSupabaseFixturePublisher', 'verifySupabaseEnvironment'].sort());
   assert.equal(Object.hasOwn(supabaseModule, 'mutateBillingData'), false);
   const network = fixture();
   await assert.rejects(verifySupabaseEnvironment({
@@ -81,16 +69,15 @@ test('exposes only the safe reader and append-only fixture factory; refuses equa
   assert.equal(network.calls.length, 0);
 });
 
-test('refuses every branch identity, default, and health mismatch before reading child project', async () => {
+test('refuses project, organization, region, branch and health mismatches before reading schema', async () => {
   const cases = [
-    { id: 'wrong-branch' }, { name: 'wrong-name' }, { project_ref: policy.database.parentProjectRef },
-    { parent_project_ref: policy.database.projectRef }, { is_default: true }, { status: 'INACTIVE' },
-    { preview_project_status: 'INACTIVE' },
+    { ref: policy.database.productionProjectRef }, { organization_id: 'another-org' }, { region: 'another-region' },
+    { parent_project_ref: policy.database.projectRef }, { is_branch: true }, { status: 'INACTIVE' },
   ];
   for (const change of cases) {
-    const network = fixture([{ ...branch, ...change }, migrations, types]);
+    const network = fixture([{ ...project, ...change }, migrations, types]);
     await assert.rejects(verifySupabaseEnvironment({ policy, token, fetchImpl: network.fetchImpl }), {
-      code: 'supabase_branch_mismatch',
+      code: 'supabase_project_mismatch',
     });
     assert.equal(network.calls.length, 1);
   }
@@ -105,7 +92,7 @@ test('refuses malformed, duplicate, and drifted migration history before generat
     { value: [{ version: '202609230003', name: 'drift' }], code: 'supabase_migrations_mismatch' },
   ];
   for (const { value, code } of cases) {
-    const network = fixture([branch, value, types]);
+    const network = fixture([project, value, types]);
     await assert.rejects(verifySupabaseEnvironment({ policy, token, fetchImpl: network.fetchImpl }), { code });
     assert.equal(network.calls.length, 2);
   }
@@ -117,7 +104,7 @@ test('rejects numeric migration versions and names even when their coerced value
     { version: '202609230001', name: 123 },
   ]) {
     const digest = createHash('sha256').update(JSON.stringify([entry])).digest('hex');
-    const network = fixture([branch, [entry], types]);
+    const network = fixture([project, [entry], types]);
     await assert.rejects(verifySupabaseEnvironment({
       policy: { ...policy, database: { ...policy.database, migrationHistorySha256: digest } },
       token, fetchImpl: network.fetchImpl,
@@ -134,7 +121,7 @@ test('refuses absent, empty, ambiguous, and drifted generated types without retu
     { value: { types: 'export type Database = { public: false }\n' }, code: 'supabase_types_mismatch' },
   ];
   for (const { value, code } of cases) {
-    const network = fixture([branch, migrations, value]);
+    const network = fixture([project, migrations, value]);
     await assert.rejects(verifySupabaseEnvironment({ policy, token, fetchImpl: network.fetchImpl }), { code });
     assert.equal(network.calls.length, 3);
   }
@@ -185,7 +172,7 @@ test('rejects oversized migration and generated-types bodies at their own respon
     const calls = [];
     const fetchImpl = async (url) => {
       calls.push(url);
-      let value = branch;
+      let value = project;
       if (url.endsWith('/database/migrations')) value = target === 'migrations' ? 'x'.repeat(512_000) : migrations;
       if (url.includes('/types/typescript?')) value = 'x'.repeat(4_000_000);
       return new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } });

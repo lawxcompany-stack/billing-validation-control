@@ -1,4 +1,5 @@
 import { generateKeyPairSync, sign } from 'node:crypto';
+import { databasePolicy } from './standalone-fixture.mjs';
 
 const keyPair = generateKeyPairSync('ed25519');
 export const publicKeyPem = keyPair.publicKey.export({ type: 'spki', format: 'pem' });
@@ -14,17 +15,10 @@ export const deployment = Object.freeze({
 });
 
 export const policy = Object.freeze({
-  schema_version: 2,
+  schema_version: 3,
   environment: 'billing-validation',
   vercel: Object.freeze({ projectId: 'prj_lawxvalidation', teamId: 'team_lawxvalidation' }),
-  database: Object.freeze({
-    projectRef: 'abcdefghijklmnopqrst',
-    parentProjectRef: 'zyxwvutsrqponmlkjihg',
-    branchId: 'synthetic-billing-validation',
-    branchName: 'synthetic-validation-branch',
-    schemaFingerprintSha256: '5fc39c1e3b29e8f9862db2a63503bce26fe470ed383119f52b4979a47fdecb95',
-    migrationHistorySha256: 'dc2fea6d8a3cf12df137e8870d263aa3ae3b5ae4f674459ff7b8033b30671f93',
-  }),
+  database: databasePolicy,
   stripe: Object.freeze({ accountId: 'acct_testlawx123', webhookEndpointId: 'we_testlawx123', livemode: false }),
   attestation: Object.freeze({ publicKeyPem }),
 });
