@@ -59,6 +59,39 @@ for (const [scope, reference, mutate] of [
   });
 }
 
+for (const [source, scope, reference, mutate] of [
+  ['vars', 'workflow', "${{ vars['DATABASE_URL'] }}", (value, env) => { value.env = env; }],
+  ['vars', 'job', "${{ vars['SUPABASE_VALIDATION_DATABASE_URL'] }}", (value, env) => { value.jobs.test.env = env; }],
+  ['vars', 'step', "${{ vars['DATABASE_URL'] }}", (value, env) => { value.jobs.test.steps[1].env = env; }],
+  ['secrets', 'workflow', "${{ secrets['DATABASE_URL'] }}", (value, env) => { value.env = env; }],
+  ['secrets', 'job', "${{ secrets['DATABASE_URL'] }}", (value, env) => { value.jobs.test.env = env; }],
+  ['secrets', 'step', "${{ secrets['DATABASE_URL'] }}", (value, env) => { value.jobs.test.steps[1].env = env; }],
+]) {
+  test(`workflow boundary rejects indirect bracket ${source} database config reference at ${scope} env`, () => {
+    const value = workflow();
+    mutate(value, { APP_CONFIG: reference });
+    assert.throws(() => assertWorkflowSecretBoundary(value, path));
+  });
+}
+
+test('workflow boundary rejects a computed vars selector in step env', () => {
+  const value = workflow();
+  value.jobs.test.steps[1].env = { APP_CONFIG: "${{ vars[format('DATABASE_URL')] }}" };
+  assert.throws(() => assertWorkflowSecretBoundary(value, path));
+});
+
+test('workflow boundary does not confuse an outputs property named vars with a provider context', () => {
+  const value = workflow();
+  value.jobs.test.env = { APP_CONFIG: '${{ needs.authorize.outputs.vars }}' };
+  assert.doesNotThrow(() => assertWorkflowSecretBoundary(value, path));
+});
+
+test('workflow boundary ignores expression-like examples in non-evaluated input descriptions', () => {
+  const value = workflow();
+  value.on.workflow_dispatch.inputs.candidate_sha.description = 'Example only: ${{ vars.DATABASE_URL }}';
+  assert.doesNotThrow(() => assertWorkflowSecretBoundary(value, path));
+});
+
 for (const [name, mutate] of [
   ['a local credential file', (value) => { value.jobs.test.steps[1].run = 'node --env-file=.env.local runner/collect.mjs'; }],
   ['a workflow-level env provider credential name', (value) => {

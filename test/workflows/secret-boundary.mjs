@@ -274,7 +274,101 @@ function workflowConfigurationStrings(workflow) {
   return strings;
 }
 
+const allowedProviderContextReferences = new Set([
+  ['.github/workflows/authorize-local-collector.yml', 'jobs.reader.steps[2].with.app-id', 'vars', 'BILLING_READER_APP_ID'],
+  ['.github/workflows/authorize-local-collector.yml', 'jobs.reader.steps[2].with.private-key', 'secrets', 'BILLING_READER_APP_PRIVATE_KEY'],
+  ['.github/workflows/validate-billing.yml', 'jobs.reader.steps[2].with.app-id', 'vars', 'BILLING_READER_APP_ID'],
+  ['.github/workflows/validate-billing.yml', 'jobs.reader.steps[2].with.private-key', 'secrets', 'BILLING_READER_APP_PRIVATE_KEY'],
+  ['.github/workflows/validate-billing.yml', 'jobs.attest-result.steps[3].env.VERCEL_READ_ONLY_TOKEN', 'secrets', 'BILLING_VALIDATION_VERCEL_READ_ONLY_TOKEN'],
+].map((tuple) => JSON.stringify(tuple)));
+
+function workflowExpressionBlocks(value, sourcePath) {
+  const expressions = [];
+  let searchFrom = 0;
+  while (true) {
+    const start = value.indexOf('${{', searchFrom);
+    if (start === -1) break;
+    let quote;
+    let end = -1;
+    for (let index = start + 3; index < value.length - 1; index += 1) {
+      const character = value[index];
+      if (quote) {
+        if (character === quote) {
+          if (value[index + 1] === quote) index += 1;
+          else quote = undefined;
+        }
+      } else if (character === "'" || character === '"') quote = character;
+      else if (character === '}' && value[index + 1] === '}') {
+        end = index;
+        break;
+      }
+    }
+    assert.ok(end !== -1, `${sourcePath} contains an unterminated workflow expression`);
+    expressions.push(value.slice(start + 3, end).trim());
+    searchFrom = end + 2;
+  }
+  return expressions;
+}
+
+function providerContextReferences(expression) {
+  let quote;
+  for (let index = 0; index < expression.length;) {
+    const character = expression[index];
+    if (quote) {
+      if (character === quote) {
+        if (expression[index + 1] === quote) index += 2;
+        else {
+          quote = undefined;
+          index += 1;
+        }
+      } else index += 1;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      index += 1;
+      continue;
+    }
+    if (!/[A-Za-z_]/u.test(character)) {
+      index += 1;
+      continue;
+    }
+
+    let identifierEnd = index + 1;
+    while (/[A-Za-z0-9_]/u.test(expression[identifierEnd] ?? '')) identifierEnd += 1;
+    const source = expression.slice(index, identifierEnd).toLowerCase();
+    let previous = index - 1;
+    while (previous >= 0 && /\s/u.test(expression[previous])) previous -= 1;
+    if ((source === 'vars' || source === 'secrets') && expression[previous] !== '.') return true;
+    index = identifierEnd;
+  }
+  return false;
+}
+
+function assertAllowedProviderContextReferences(workflow, workflowPath) {
+  function visit(value, path = '') {
+    if (typeof value === 'string') {
+      if (path === 'name' || /^on\.[^.]+\.inputs\.[^.]+\.description$/u.test(path)) return;
+      for (const expression of workflowExpressionBlocks(value, `${workflowPath}:${path}`)) {
+        if (!providerContextReferences(expression)) continue;
+        const reference = /^(vars|secrets)\.([A-Za-z_][A-Za-z0-9_]*)$/u.exec(expression);
+        const tuple = JSON.stringify([workflowPath, path, reference?.[1], reference?.[2]]);
+        assert.ok(allowedProviderContextReferences.has(tuple),
+          `${workflowPath}:${path} must use an explicitly allowlisted vars/secrets reference`);
+      }
+    } else if (Array.isArray(value)) {
+      value.forEach((child, index) => visit(child, `${path}[${index}]`));
+    } else if (value !== null && typeof value === 'object') {
+      for (const [key, child] of Object.entries(value)) {
+        visit(child, path ? `${path}.${key}` : key);
+      }
+    }
+  }
+  visit(workflow);
+}
+
 function assertNoProviderRuntimeEnvironment(workflow, path) {
+  assertAllowedProviderContextReferences(workflow, path);
   const blocked = /^(?:DATABASE_URL|POSTGRES(?:_|$)|SUPABASE(?:_|$)|STRIPE(?:_|$)|VERCEL_(?:ACCESS_TOKEN|API_TOKEN|TOKEN)(?:_|$))/iu;
   const providerReferences = /\$\{\{\s*(?:vars|secrets)\.([A-Za-z_][A-Za-z0-9_]*)/giu;
   const environments = [['workflow', workflow.env]];
