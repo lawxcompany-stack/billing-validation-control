@@ -48,7 +48,7 @@ export const preflight = Object.freeze({
 export function makeAttemptParts({ attemptId = 'attempt-task6', fence = '11111111-1111-4111-8111-111111111111',
   currentFence = fence, resourceIds = [], databaseResourceIds = [], failReceipt = false } = {}) {
   const owner = Object.freeze({ attemptId, fence, candidateSha: 'a'.repeat(40),
-    workflow: Object.freeze({ repository: 'lawxcompany-stack/billing-validation-control',
+    workflow: Object.freeze({ repository: 'lawx-ai/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: `billing-validation-${'a'.repeat(32)}` }),
     environment, resourceIds: [...resourceIds], databaseResourceIds: structuredClone(databaseResourceIds) });

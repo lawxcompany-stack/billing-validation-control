@@ -23,7 +23,7 @@ function enableLocalStripeIntents(h) {
 function pinLocalStripeIdentity(h) {
   const priorAssertFence = h.attempts.assertFence;
   const identity = { candidateSha: h.owner.candidateSha, workflow: {
-    repository: 'lawxcompany-stack/billing-validation-control', ref: 'refs/heads/main',
+    repository: 'lawx-ai/billing-validation-control', ref: 'refs/heads/main',
     runId: '987654321', runAttempt: 3, runnerLabel: `billing-validation-${'e'.repeat(32)}` } };
   h.attempts.assertFence = async (request) => ({ ...await priorAssertFence(request), ...identity });
 }
@@ -178,7 +178,7 @@ test('Stripe mutation intent binds the immutable SHA, workflow run identity and 
   const h = makeAttemptParts();
   const identity = {
     candidateSha: h.owner.candidateSha,
-    workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+    workflow: { repository: 'lawx-ai/billing-validation-control',
       ref: 'refs/heads/main', runId: '987654321', runAttempt: 3,
       runnerLabel: `billing-validation-${'e'.repeat(32)}` },
   };

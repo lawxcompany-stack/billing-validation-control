@@ -6,6 +6,8 @@ billing acceptance. `collect` is the only admitted/emitted operation. The schema
 understands `recover` and `recheck`, but admission, emission and verification refuse
 historical operations until authoritative historical state is integrated.
 
+The approved post-transfer control identity is `lawx-ai/billing-validation-control`, with immutable repository ID `1384018279`, default branch `main`, and public visibility. The last recorded pre-transfer owner was `lawxcompany-stack`; the owner's transfer and all post-transfer readbacks remain pending until independently observed. This PR does not transfer the repository. Follow [control-repository-transfer.md](control-repository-transfer.md), keep `collect`/`recheck` frozen, and leave runner/financial execution blocked until the identity, protection, five environments, App/collaborator, GHCR and exact runner-group readbacks are complete. Task 0 dedicated-workstation proof and Task 9 setup remain prerequisites; hosted PR policy checks continue on `ubuntu-latest`. Nothing here proves settings or production readiness.
+
 ## Current blockers
 
 Both checked-in policies intentionally remain empty:
@@ -25,7 +27,7 @@ pins. Do not dispatch this workflow to work around these blockers.
 ## Hosted boundary
 
 The fixed path is `.github/workflows/authorize-local-collector.yml` in
-`lawxcompany-stack/billing-validation-control` (repository ID `1384018279`). Its
+`lawx-ai/billing-validation-control` (repository ID `1384018279`). Its
 only trigger is `workflow_dispatch` on protected `refs/heads/main`, with default
 branch `main`. The four closed dispatch fields are `candidate_sha`, `execution_id`,
 `activation_commitment` and `suite` (`billing-43` or `billing-3ds-15`). No release,

@@ -85,7 +85,7 @@ function fixtureMutationClient({ mode = 'valid', currentFixtureRows = 0 } = {}) 
   const fixtureClaimEvents = [];
   let fixtureRowsUsed = currentFixtureRows;
   const fence = '11111111-1111-4111-8111-111111111111';
-  const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
+  const workflow = { repository: 'lawx-ai/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1,
     runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
   const attemptRow = { attempt_id: 'attempt-fixture', branch_id: database.projectRef,
@@ -445,7 +445,7 @@ test('store remains pinned to a detached environment snapshot after source objec
 
   await store.prepare({ attemptId: 'attempt-stable-snapshot',
     key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-snapshot' },
-    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawx-ai/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
     environment: stableEnvironment, ttlSeconds: 60, retentionPolicy, projection });
@@ -463,7 +463,7 @@ test('every store transaction verifies its exact runtime session before any stor
   const store = createPostgresAttemptStore({ client, preflight, target });
   await store.prepare({ attemptId: 'attempt-a',
     key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
-    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawx-ai/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
     environment: preflight.expectedEnvironment, ttlSeconds: 60, retentionPolicy, projection });
@@ -613,7 +613,7 @@ test('zero-row conflicting attempt insert cannot create an orphan fixture lease'
   const store = createPostgresAttemptStore({ client, preflight, target });
   await assert.rejects(store.prepare({ attemptId: 'attempt-a',
     key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-b' },
-    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawx-ai/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
     environment: preflight.expectedEnvironment, ttlSeconds: 60, retentionPolicy, projection }),
@@ -625,7 +625,7 @@ test('PostgreSQL adapter accepts an injected transactional client and parameteri
   const client = recordingClient();
   const store = createPostgresAttemptStore({ client, preflight, target });
   await store.prepare({ attemptId: 'attempt-a', key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
-    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawx-ai/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1, runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
     environment: preflight.expectedEnvironment, ttlSeconds: 60, retentionPolicy, projection });
   const attemptLock = client.calls.findIndex(({ sql, values }) =>
@@ -655,7 +655,7 @@ test('PostgreSQL admission locks both global provider resources before capacity 
   const store = createPostgresAttemptStore({ client, preflight, target });
   await store.prepare({ attemptId: 'attempt-a', key: { projectRef: database.projectRef,
     suite: 'billing', fixtureKey: 'invoice-a' }, candidateSha: 'a'.repeat(40),
-  workflow: { repository: 'lawxcompany-stack/billing-validation-control', ref: 'refs/heads/main',
+  workflow: { repository: 'lawx-ai/billing-validation-control', ref: 'refs/heads/main',
     runId: '100', runAttempt: 1, runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
   environment: preflight.expectedEnvironment, ttlSeconds: 60, retentionPolicy, projection });
 
@@ -691,7 +691,7 @@ test('fixture SQL executes behind an owner fence in the same transaction', async
       calls.push({ sql, values });
       if (sql.includes('FROM billing_validation_control.attempts')) return { rows: [{
         attempt_id: 'attempt-a', branch_id: database.projectRef, suite: 'billing', fixture_key: 'invoice-a',
-        candidate_sha: 'a'.repeat(40), workflow_repository: 'lawxcompany-stack/billing-validation-control',
+        candidate_sha: 'a'.repeat(40), workflow_repository: 'lawx-ai/billing-validation-control',
         workflow_ref: 'refs/heads/main', workflow_run_id: '100', workflow_run_attempt: 1,
         runner_label: 'billing-validation-' + 'a'.repeat(32), database_project_ref: database.projectRef,
         deployment_id: 'dpl_candidate123', deployment_origin: 'https://candidate.vercel.app',
@@ -701,20 +701,20 @@ test('fixture SQL executes behind an owner fence in the same transaction', async
       if (sql.includes('FROM billing_validation_control.standalone_resource_locks')) return { rows: [
         { resource_type: 'supabase_project', resource_id: `${database.projectRef}`,
           owner_attempt_id: 'attempt-a', fence, candidate_sha: 'a'.repeat(40),
-          workflow_repository: 'lawxcompany-stack/billing-validation-control',
+          workflow_repository: 'lawx-ai/billing-validation-control',
           workflow_ref: 'refs/heads/main', workflow_run_id: '100', workflow_run_attempt: 1,
           runner_label: 'billing-validation-' + 'a'.repeat(32),
           environment_identity: preflight.expectedEnvironment, expires_at_epoch: 1060 },
         { resource_type: 'stripe_account', resource_id: 'acct_synthetic123',
           owner_attempt_id: 'attempt-a', fence, candidate_sha: 'a'.repeat(40),
-          workflow_repository: 'lawxcompany-stack/billing-validation-control',
+          workflow_repository: 'lawx-ai/billing-validation-control',
           workflow_ref: 'refs/heads/main', workflow_run_id: '100', workflow_run_attempt: 1,
           runner_label: 'billing-validation-' + 'a'.repeat(32),
           environment_identity: preflight.expectedEnvironment, expires_at_epoch: 1060 },
       ] };
       if (sql.includes('FROM billing_validation_control.standalone_fixture_leases')) return { rows: [{
         attempt_id: 'attempt-a', fence, expires_at_epoch: 1060, owner_candidate_sha: 'a'.repeat(40),
-        owner_repository: 'lawxcompany-stack/billing-validation-control', owner_ref: 'refs/heads/main',
+        owner_repository: 'lawx-ai/billing-validation-control', owner_ref: 'refs/heads/main',
         owner_run_id: '100', owner_run_attempt: 1,
       }] };
       if (sql.includes('clock_timestamp')) return { rows: [{ now: 1000 }] };
@@ -857,7 +857,7 @@ test('PostgreSQL persists Stripe intents, blocks replay, and appends one indepen
   const calls = [];
   const transactions = [];
   const fence = '11111111-1111-4111-8111-111111111111';
-  const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
+  const workflow = { repository: 'lawx-ai/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1,
     runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
   const attemptRow = { attempt_id: 'attempt-stripe', branch_id: database.projectRef,
@@ -972,7 +972,7 @@ test('PostgreSQL persists Stripe intents, blocks replay, and appends one indepen
 test('PostgreSQL pending intent query is authorized by the current attempt fence and excludes receipted intents', async () => {
   const calls = [];
   const fence = '11111111-1111-4111-8111-111111111111';
-  const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
+  const workflow = { repository: 'lawx-ai/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1,
     runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
   const attemptRow = { attempt_id: 'attempt-pending', branch_id: database.projectRef,
@@ -1042,7 +1042,7 @@ test('PostgreSQL pending intent query is authorized by the current attempt fence
 test('PostgreSQL cleanup receipt persists before release and rolls receipt, state, lease, and locks back together', async () => {
   const attemptId = 'attempt-cleanup-pg';
   const fence = '11111111-1111-4111-8111-111111111111';
-  const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
+  const workflow = { repository: 'lawx-ai/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1,
     runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
   const verifiedProjection = cleanupProjection;
@@ -1188,7 +1188,7 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
   const transactions = [];
   const attemptId = 'attempt-recovery-pg';
   const oldFence = '11111111-1111-4111-8111-111111111111';
-  const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
+  const workflow = { repository: 'lawx-ai/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1,
     runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
   const attempt = { attempt_id: attemptId, branch_id: database.projectRef, suite: 'billing',
@@ -1510,7 +1510,7 @@ test('PostgreSQL recovery-only authority survives handoff and renewal after a te
   const calls = [];
   const attemptId = 'attempt-recovery-terminal-pg';
   const oldFence = '22222222-2222-4222-8222-222222222222';
-  const workflow = { repository: 'lawxcompany-stack/billing-validation-control', ref: 'refs/heads/main',
+  const workflow = { repository: 'lawx-ai/billing-validation-control', ref: 'refs/heads/main',
     runId: '100', runAttempt: 1, runnerLabel: 'billing-validation-' + 'b'.repeat(32) };
   const attempt = { attempt_id: attemptId, branch_id: database.projectRef, suite: 'billing',
     fixture_key: 'invoice-terminal-recovery', candidate_sha: 'a'.repeat(40),
@@ -1642,7 +1642,7 @@ test('pinned adapter refuses a different stable environment tuple before SQL', a
   const store = createPostgresAttemptStore({ client, preflight, target });
   await assert.rejects(store.prepare({ attemptId: 'attempt-a',
     key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
-    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawx-ai/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
     environment: { ...preflight.expectedEnvironment, database: { projectRef: 'zzzzzzzzzzzzzzzzzzzz' } },
@@ -1672,7 +1672,7 @@ test('PostgreSQL admission locks and aggregates receipts plus unsettled reservat
   const store = createPostgresAttemptStore({ client, preflight, target });
   const result = await store.prepare({ attemptId: 'attempt-a',
     key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
-    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawx-ai/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
     environment: preflight.expectedEnvironment, ttlSeconds: 60,
@@ -1711,7 +1711,7 @@ test('PostgreSQL admission refuses projected overflow before persisting an attem
   const store = createPostgresAttemptStore({ client, preflight, target });
   await assert.rejects(store.prepare({ attemptId: 'attempt-a',
     key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
-    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawx-ai/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
     environment: preflight.expectedEnvironment, ttlSeconds: 60,
@@ -1738,7 +1738,7 @@ test('PostgreSQL admission refuses decimal-formatted integer usage instead of co
   const store = createPostgresAttemptStore({ client, preflight, target });
   await assert.rejects(store.prepare({ attemptId: 'attempt-a',
     key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
-    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+    candidateSha: 'a'.repeat(40), workflow: { repository: 'lawx-ai/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
     environment: preflight.expectedEnvironment, ttlSeconds: 60,

@@ -3,6 +3,8 @@
 This is a partial integration fix, not financial acceptance or production readiness.
 No Supabase, Vercel or Stripe connection/mutation was used to produce this report.
 
+The approved post-transfer control identity is `lawx-ai/billing-validation-control`, immutable repository ID `1384018279`, default branch `main`, with public visibility. The 2026-09-29 pre-transfer observations below recorded owner `lawxcompany-stack`; they do not establish current ownership or organization settings. The owner's transfer and all post-transfer readbacks remain pending until independently observed. This PR does not transfer the repository. Follow [control-repository-transfer.md](control-repository-transfer.md); `collect`/`recheck` remain frozen and runner/financial execution remains blocked pending these gates and Task 0/9.
+
 ## Observed failure and dependency chain
 
 Application PR #139 still points to `1073c5286a5bf4966e204252a545ff09aa549136`.
@@ -49,8 +51,8 @@ financial acceptance.
 | Gate | Evidence / required action | Completion criterion |
 | --- | --- | --- |
 | Review this control patch | Merge only after its `policy` check and independent review | Reviewed implementation on protected `main` |
-| Runner admission | GitHub reports owner type `User`. Current registration assumes organization group `billing-validation-isolated` but uses a repository URL | Reviewed, externally enforced admission compatible with actual ownership; never simply remove `--runnergroup` |
-| Protected environments | Created/read back the four names below, branch `main` only, no reviewers or secrets added | Complete for these settings; reverify before dispatch |
+| Runner admission | Owner-operated transfer to `lawx-ai` and exact `billing-validation-isolated` readback are pending | Same ID, canonical organization slug, public `main`; exactly this repository and `lawx-ai/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main`; Task 0 dedicated-workstation proof and Task 9 setup; never remove `--runnergroup` |
+| Protected environments | Four names had branch-only readback on 2026-09-29, without reviewers; all five post-transfer readbacks are pending | Independently verify reviewer/non-self-review and protected deployment policies for attestation, reader, tests, publisher and control environments, and secret names only, before dispatch |
 | Private candidate reader | Reader App credentials are not configured in control | Install a read-only App on only the app repository; set reader environment variable/key and verify scopes |
 | Candidate review | `policy/source-pins.json` has no reviewed blobs; PR #139 changes protected paths | Review the exact candidate and record its approved blob hashes; no automatic approval |
 | Environment identity | Parent project, schema/migration digests and TEST webhook ID remain unset in policy | Independent readback of only the authorized validation child and TEST endpoint; current health and immutable Preview signature verified |
@@ -58,14 +60,19 @@ financial acceptance.
 | Application integration | Remote PR #139 still runs its previous CI revision | Publish the reviewed application integration only when trusted evidence can be consumed; rerun the exact candidate |
 | Release acceptance | Offline tests and skipped provider jobs are not end-to-end proof | Required SQL/concurrency, financial, supervised 3DS and acceptance checks succeed with matching SHA/run/attempt and safe cleanup |
 
-The infrastructure issue is account type, not evidence that a paid plan is the
-only solution. GitHub's [runner group documentation](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access)
+The approved admission path requires the control repository transfer to `lawx-ai`
+and independent readback of the exact organization runner group restrictions.
+GitHub's [runner group documentation](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access)
 describes organization-level runner access and warns about runners on public
-repositories. A migration to an organization or a different admission mechanism
-is an architectural/administrative decision, not a reason to weaken the guard.
+repositories. Public visibility remains required; enable public-repository group
+access only with the exact trusted-workflow restriction independently observed.
+Normal PR policy checks remain on `ubuntu-latest`; PRs and forks cannot use this
+runner. Missing restrictions keep activation blocked without a shared/default
+runner fallback.
 
 Environment readback on 2026-09-29 (each has one custom **branch**, not tag, rule
-named `main`; no required reviewers):
+named `main`; no required reviewers). This is dated pre-transfer evidence; it does
+not satisfy the pending five-environment post-transfer gate:
 
 | Environment | Environment ID | Branch policy ID |
 | --- | --- | --- |
