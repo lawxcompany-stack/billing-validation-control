@@ -10,7 +10,7 @@ import { main } from '../../scripts/read-candidate.mjs';
 const repository = 'lawxcompany-stack/Plataforma-LawX';
 const sha = '1'.repeat(40);
 const tree = '2'.repeat(40);
-const context = { repository: 'lawxcompany-stack/billing-validation-control', ref: 'refs/heads/main',
+const context = { repository: 'lawx-ai/billing-validation-control', repositoryId: '1384018279', ref: 'refs/heads/main',
   defaultBranch: 'main', refProtected: true, eventName: 'workflow_dispatch' };
 
 function fixture({ files = [], moveHead = false, brokenQuality = false } = {}) {
@@ -55,7 +55,10 @@ test('protected control reader composes current PR identity with only candidate 
   assert.ok(f.calls.every((path) => path.startsWith(`/repos/${repository}/`)));
 });
 
-for (const change of [{ ref: 'refs/heads/feature' }, { refProtected: false }, { eventName: 'pull_request' }]) {
+for (const change of [{ ref: 'refs/heads/feature' }, { refProtected: false }, { eventName: 'pull_request' },
+  { repository: 'lawxcompany-stack/billing-validation-control' },
+  { repository: 'attacker/billing-validation-control' },
+  { repositoryId: '1384018278' }, { repositoryId: '01384018279' }, { repositoryId: undefined }]) {
   test(`untrusted control context stops before credentials can be used: ${Object.keys(change)[0]}`, async () => {
     const f = fixture();
     await assert.rejects(readCandidatePrerequisites({ api: f.api, candidateSha: sha, context: { ...context, ...change } }));
@@ -99,7 +102,8 @@ test('reader CLI logs only a minimal prerequisite summary, never paths, reposito
     return Response.json(await f.api.get(url.pathname + url.search));
   });
   t.mock.method(console, 'log', (line) => lines.push(line));
-  const result = await main({ CONTROL_REPOSITORY: context.repository, CONTROL_REF: context.ref,
+  const result = await main({ CONTROL_REPOSITORY: context.repository, CONTROL_REPOSITORY_ID: context.repositoryId,
+    CONTROL_REF: context.ref,
     CONTROL_DEFAULT_BRANCH: context.defaultBranch, CONTROL_REF_PROTECTED: 'true',
     CONTROL_EVENT_NAME: 'workflow_dispatch', CANDIDATE_SHA: sha, CANDIDATE_READ_TOKEN: 'token-sentinel' });
   assert.equal(result, 0);
@@ -125,7 +129,8 @@ test('candidate workflow output contains only prerequisite identifiers when upst
   });
   const logs = [];
   t.mock.method(console, 'log', (line) => logs.push(line));
-  assert.equal(await main({ CONTROL_REPOSITORY: context.repository, CONTROL_REF: context.ref,
+  assert.equal(await main({ CONTROL_REPOSITORY: context.repository, CONTROL_REPOSITORY_ID: context.repositoryId,
+    CONTROL_REF: context.ref,
     CONTROL_DEFAULT_BRANCH: context.defaultBranch, CONTROL_REF_PROTECTED: 'true',
     CONTROL_EVENT_NAME: context.eventName, CANDIDATE_SHA: sha,
     CANDIDATE_READ_TOKEN: 'synthetic-reader-token-sentinel', GITHUB_OUTPUT: output }), 0);
@@ -135,4 +140,30 @@ test('candidate workflow output contains only prerequisite identifiers when upst
   ].join('\n'));
   assert.equal(logs.length, 1);
   assert.doesNotMatch(logs[0], /synthetic-privileged-key-sentinel|synthetic-reader-token-sentinel/u);
+});
+
+test('reader CLI refuses missing or mismatched control ID before API reads and output writes', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'bvc-control-identity-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const output = join(directory, 'github-output');
+  await writeFile(output, 'unchanged\n');
+  const f = fixture();
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    return Response.json(await f.api.get(url.pathname + url.search));
+  });
+  const errors = [];
+  const logs = [];
+  t.mock.method(console, 'error', (line) => errors.push(line));
+  t.mock.method(console, 'log', (line) => logs.push(line));
+  for (const repositoryId of [undefined, '1384018278', '01384018279']) {
+    assert.equal(await main({ CONTROL_REPOSITORY: context.repository, CONTROL_REPOSITORY_ID: repositoryId,
+      CONTROL_REF: context.ref, CONTROL_DEFAULT_BRANCH: context.defaultBranch,
+      CONTROL_REF_PROTECTED: 'true', CONTROL_EVENT_NAME: context.eventName,
+      CANDIDATE_SHA: sha, CANDIDATE_READ_TOKEN: 'token-sentinel', GITHUB_OUTPUT: output }), 1);
+  }
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(logs, []);
+  assert.deepEqual(errors, Array(3).fill('candidate_reader_refused (control_repository_not_allowed)'));
+  assert.equal(await readFile(output, 'utf8'), 'unchanged\n');
 });

@@ -1,4 +1,5 @@
-const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
+import { matchesControlRepository } from './control-identity.mjs';
+
 const CANDIDATE_REPOSITORY = 'lawxcompany-stack/Plataforma-LawX';
 const CONTROL_DEFAULT_BRANCH = 'main';
 const OPERATIONS = new Set(['collect', 'recheck']);
@@ -28,8 +29,8 @@ export function assertProtectedDefaultRef(context = {}) {
   if (context === null || typeof context !== 'object' || Array.isArray(context)) {
     refuse('malformed_control_context');
   }
-  const { ref, defaultBranch, repository, refProtected } = context;
-  if (repository !== CONTROL_REPOSITORY) refuse('control_repository_not_allowed');
+  const { ref, defaultBranch, repository, repositoryId, refProtected } = context;
+  if (!matchesControlRepository(repository, repositoryId)) refuse('control_repository_not_allowed');
   if (defaultBranch !== CONTROL_DEFAULT_BRANCH) {
     refuse('default_branch_unavailable');
   }

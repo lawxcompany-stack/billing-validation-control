@@ -15,7 +15,8 @@ const parseDispatch = (...args) => {
 const context = Object.freeze({
   ref: 'refs/heads/main',
   defaultBranch: 'main',
-  repository: 'lawxcompany-stack/billing-validation-control',
+  repository: 'lawx-ai/billing-validation-control',
+  repositoryId: '1384018279',
   refProtected: true,
 });
 
@@ -38,6 +39,22 @@ const recheckInput = Object.freeze({
   source_run_attempt: '2',
   runner_label: '',
   supervisor_activation: '',
+});
+
+test('requires the canonical control repository and pinned ID before returning a dispatch identity', () => {
+  assert.throws(
+    () => dispatchContract.assertProtectedDefaultRef({ ...context, repositoryId: '1384018278' }),
+    { code: 'control_repository_not_allowed' },
+  );
+  for (const change of [
+    { repository: 'lawxcompany-stack/billing-validation-control' },
+    { repository: 'attacker/billing-validation-control' },
+    { repositoryId: undefined }, { repositoryId: '01384018279' }, { repositoryId: true },
+  ]) {
+    assert.throws(() => parseDispatch(collectInput, { ...context, ...change }),
+      { code: 'control_repository_not_allowed' });
+  }
+  assert.equal(parseDispatch(collectInput, { ...context, repositoryId: 1384018279 }).operation, 'collect');
 });
 
 test('accepts a trusted collect identity with a per-attempt runner label', () => {

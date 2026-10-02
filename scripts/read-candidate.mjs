@@ -8,7 +8,8 @@ import { CandidateReadRefusal, createCandidateReadClient } from '../src/github/r
 
 export async function main(env = process.env) {
   try {
-    const context = { repository: env.CONTROL_REPOSITORY, ref: env.CONTROL_REF,
+    const context = { repository: env.CONTROL_REPOSITORY, repositoryId: env.CONTROL_REPOSITORY_ID,
+      ref: env.CONTROL_REF,
       defaultBranch: env.CONTROL_DEFAULT_BRANCH, refProtected: env.CONTROL_REF_PROTECTED === 'true',
       eventName: env.CONTROL_EVENT_NAME };
     const api = createCandidateReadClient({ token: env.CANDIDATE_READ_TOKEN });
