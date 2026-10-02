@@ -348,7 +348,6 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
     // This is a synthetic role, separate from the cluster bootstrap administrator.
     const operatorPassword = randomBytes(32).toString('base64url');
     let operatorRoleMayBeDemoted = false;
-    let postgresRoleRestored = false;
     let operatorClient;
     try {
       operatorRoleMayBeDemoted = true;
@@ -371,17 +370,10 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
         'temporary bootstrap owner membership must not persist after commit');
     } finally {
       if (operatorClient) {
-        try { await operatorClient.query('ROLLBACK'); } catch { /* the migration may already have committed */ }
         await operatorClient.end();
       }
       if (operatorRoleMayBeDemoted) {
         await clusterAdmin.query('ALTER ROLE postgres WITH LOGIN SUPERUSER CREATEROLE CREATEDB');
-      }
-      postgresRoleRestored = true;
-      if (postgresRoleRestored) {
-        await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-        await client.query(`DROP ROLE IF EXISTS billing_validation_owner, billing_validation_runtime,
-          billing_validation_verifier`);
       }
     }
 
@@ -389,8 +381,6 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
       FROM pg_catalog.pg_roles WHERE rolname = 'postgres'`);
     assert.deepEqual(restoredOperator.rows, [{ rolcanlogin: true, rolsuper: true,
       rolcreaterole: true, rolcreatedb: true }], 'the disposable superuser must be restored before later probes');
-
-    await client.query(bootstrapSql);
 
     const roleState = await client.query(`SELECT rolname, rolcanlogin, rolsuper, rolcreaterole,
         rolcreatedb, rolreplication, rolbypassrls
