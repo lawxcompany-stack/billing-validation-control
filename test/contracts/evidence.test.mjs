@@ -338,7 +338,7 @@ test('resource IDs must be supplied by the trusted owner allowlist', () => {
 
 test('parses the sealed final producer manifest into a minimal projection', () => {
   const document = finalAcceptanceDocument();
-  assert.equal(document.manifestDigest, '8da953c72340020fb8a2aa5592f4ad58063dd7939606a0a1381940aabac5c873');
+  assert.equal(document.manifestDigest, 'c1bffed134fd8e10d860802eba88181395685e8612253e74fb10c3292d57dbc5');
   const archive = archiveFor([jsonEntry(document)]);
   const parsed = parseEvidenceArchive(archive, {
     digest: digest(archive),
@@ -416,11 +416,9 @@ test('rejects resealed manifests with producer environment identities outside ap
     (document) => { document.database.projectRef = 'Abcdefghijklmnopqrst'; },
     (document) => { document.database.projectRef = 'abcdefghijklmnopqrs'; },
     (document) => { document.database.projectRef = 'abcdefghijklmnopqr!t'; },
-    (document) => { document.database.branchId = 'ab'; },
-    (document) => { document.database.branchId = '_billing-validation'; },
-    (document) => { document.database.branchId = 'billing/validation'; },
-    (document) => { document.database.branchId = 'billing-validation\n'; },
-    (document) => { document.database.branchId = 'a'.repeat(129); },
+    (document) => { document.database.branchId = 'synthetic-branch'; },
+    (document) => { document.database.parentProjectRef = 'zyxwvutsrqponmlkjihg'; },
+    (document) => { document.database.bootstrap.branchId = 'synthetic-branch'; },
     (document) => { document.deployment.id = 'deploy_candidate123'; },
     (document) => { document.deployment.id = 'dpl_candidate-123'; },
     (document) => { document.deployment.id = 'dpl_candidate123\n'; },
@@ -480,7 +478,6 @@ test('binds manifest environment identities to trusted expected values without e
       document.database.projectRef = 'zyxwvutsrqponmlkjihg';
       document.database.bootstrap.projectRef = 'zyxwvutsrqponmlkjihg';
     }, 'zyxwvutsrqponmlkjihg'],
-    [(document) => { document.database.branchId = 'other-validation-branch'; }, 'other-validation-branch'],
     [(document) => { document.deployment.id = 'dpl_othercandidate123'; }, 'dpl_othercandidate123'],
     [(document) => {
       document.deployment.origin = 'https://other-billing-candidate.vercel.app';
@@ -517,7 +514,11 @@ test('rejects missing or malformed expected environment identities', () => {
     null,
     {},
     { ...expectedEnvironment, extra: 'not-allowed' },
-    { ...expectedEnvironment, database: { projectRef: 'bad', branchId: 'billing-validation-2026' } },
+    { ...expectedEnvironment, database: { projectRef: 'bad' } },
+    { ...expectedEnvironment, database: { projectRef: expectedEnvironment.database.projectRef,
+      branchId: 'synthetic-branch' } },
+    { ...expectedEnvironment, database: { projectRef: expectedEnvironment.database.projectRef,
+      parentProjectRef: 'zyxwvutsrqponmlkjihg' } },
     { ...expectedEnvironment, deployment: { id: 'dpl_candidate123', origin: 'http://billing-candidate.vercel.app' } },
     { ...expectedEnvironment, stripe: { accountId: 'acct_test-lawx' } },
   ];

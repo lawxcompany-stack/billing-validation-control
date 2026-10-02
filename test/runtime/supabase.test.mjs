@@ -188,11 +188,14 @@ test('rejects oversized migration and generated-types bodies at their own respon
   }
 });
 
-test('legacy branch-bound SQL readers are refused before opening a reader session', () => {
+test('branch-shaped identity evidence is refused before any billing reads', async () => {
   let reads = 0;
   const source = {
     trustedReaderId: 'sql-reader-a',
-    async readIdentity() { reads += 1; return {}; },
+    async readIdentity() {
+      reads += 1;
+      return { projectRef: billingEnvironment.database.projectRef, branchId: 'synthetic-branch', readOnly: true };
+    },
     async readBillingSnapshot() { reads += 1; return {}; },
     async listAttemptFixtures() { reads += 1; return []; },
     async readSyntheticFixture() { reads += 1; return null; },
@@ -202,7 +205,7 @@ test('legacy branch-bound SQL readers are refused before opening a reader sessio
     async readConcurrencyProof() { reads += 1; return {}; },
     async query() { reads += 1; throw new Error('generic query must not be used'); },
   };
-  assert.throws(() => createSupabaseBillingReader({ expectedEnvironment: billingEnvironment, source }),
-    { code: 'supabase_reader_unavailable' });
-  assert.equal(reads, 0);
+  const reader = createSupabaseBillingReader({ expectedEnvironment: billingEnvironment, source });
+  await assert.rejects(reader.readIdentity(), { code: 'supabase_reader_identity_mismatch' });
+  assert.equal(reads, 1);
 });

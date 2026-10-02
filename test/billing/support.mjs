@@ -4,7 +4,7 @@ import { verifyDeploymentAttestation } from '../../src/runtime/vercel.mjs';
 import { databasePolicy } from '../runtime/standalone-fixture.mjs';
 
 export const environment = Object.freeze({
-  database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst', branchId: 'validation-child-123' }),
+  database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst' }),
   deployment: Object.freeze({ id: 'dpl_task6preview123', origin: 'https://lawx-abc123def-team.vercel.app' }),
   stripe: Object.freeze({ accountId: 'acct_task6test123' }),
 });

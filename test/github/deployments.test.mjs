@@ -8,7 +8,7 @@ const policy = {
   schema_version: 1,
   environment: 'billing-validation',
   vercel: { projectId: 'prj_lawxvalidation', teamId: 'team_lawxvalidation' },
-  database: { projectRef: 'abcdefghijklmnopqrst', branchId: 'billing-validation-branch' },
+  database: { projectRef: 'abcdefghijklmnopqrst' },
   stripe: { accountId: 'acct_testlawx123', webhookEndpointId: 'we_testlawx123', livemode: false },
   attestation: { publicKeyPem: 'test public key' },
 };

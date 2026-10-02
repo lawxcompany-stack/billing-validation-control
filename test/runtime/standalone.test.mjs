@@ -158,13 +158,19 @@ test('organization inventory paginates to completion and rejects duplicate refs 
 
 test('new billing execution, reader, and publisher contracts reject historical branch envelopes', () => {
   const h = makeAttemptParts();
-  assert.equal(isValidBillingEnvironment(h.owner.environment), false);
-  assert.throws(() => createVerifiedContext(h), { code: 'billing_environment_unverified' });
-  assert.throws(() => createSupabaseBillingReader({ expectedEnvironment: h.owner.environment, source: {
+  const historicalEnvironment = { ...h.owner.environment,
+    database: { ...h.owner.environment.database, branchId: 'synthetic-branch' } };
+  const historical = { ...h,
+    owner: { ...h.owner, environment: historicalEnvironment },
+    preflight: { ...h.preflight, expectedEnvironment: historicalEnvironment },
+    readers: { ...h.readers, expectedEnvironment: historicalEnvironment } };
+  assert.equal(isValidBillingEnvironment(historicalEnvironment), false);
+  assert.throws(() => createVerifiedContext(historical), { code: 'billing_environment_unverified' });
+  assert.throws(() => createSupabaseBillingReader({ expectedEnvironment: historicalEnvironment, source: {
     async readIdentity() {}, async readBillingSnapshot() {}, async listAttemptFixtures() {},
     async readSyntheticFixture() {}, async readWebhookInbox() {}, async readWebhookReceipts() {},
   } }), { code: 'supabase_reader_unavailable' });
-  assert.throws(() => createSupabaseFixturePublisher({ expectedEnvironment: h.owner.environment }),
+  assert.throws(() => createSupabaseFixturePublisher({ expectedEnvironment: historicalEnvironment }),
     { code: 'supabase_fixture_adapter_unavailable' });
 });
 

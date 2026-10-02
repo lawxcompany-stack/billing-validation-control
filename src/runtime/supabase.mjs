@@ -6,10 +6,8 @@ import { isValidBillingEnvironment, isValidStandaloneDatabasePolicy } from '../b
 
 const API = 'https://api.supabase.com';
 const REF = /^[a-z0-9]{20}$/u;
-const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const VERSION = /^[0-9]{1,32}$/u;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
-const PRODUCTION_BRANCH_PART = /(?:^|[-_.])(?:main|master|prod|production|primary|default)(?:$|[-_.])/u;
 const REQUEST_TIMEOUT_MS = 10_000;
 const SQL_READER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u;
 const SQL_BARRIER_IDS = new Set(['billing-sql-barrier-a', 'billing-sql-barrier-b']);
@@ -225,14 +223,15 @@ function validateReaderBinding(input, expectedEnvironment) {
       !SAFE_CONTROL_ID.test(input.caseId ?? '') || input.environment !== undefined &&
       JSON.stringify(input.environment) !== JSON.stringify(expectedEnvironment) ||
       input.projectRef !== undefined && input.projectRef !== expectedEnvironment.database.projectRef ||
-      input.branchId !== undefined && input.branchId !== expectedEnvironment.database.branchId) {
+      Object.hasOwn(input, 'branchId') || Object.hasOwn(input, 'parentProjectRef') ||
+      Object.hasOwn(input, 'branchName')) {
     refuse('supabase_reader_input_invalid');
   }
 }
 
 function validateWebhookReaderBinding(input, expectedEnvironment) {
   validateReaderBinding(input, expectedEnvironment);
-  if (input.branchId !== expectedEnvironment.database.branchId ||
+  if (input.projectRef !== expectedEnvironment.database.projectRef ||
       !/^evt_[A-Za-z0-9_]{1,120}$/u.test(input.eventId ?? '') ||
       !/^(?:cus|in|pi|sub|price|prod|evt|ch|re|pm|seti|cs)_[A-Za-z0-9_]{1,120}$/u.test(input.objectId ?? '')) {
     refuse('supabase_reader_input_invalid');
@@ -240,18 +239,14 @@ function validateWebhookReaderBinding(input, expectedEnvironment) {
 }
 
 function validateSqlReaderBinding(input, expectedEnvironment, withBarrier = false) {
-  const keys = ['projectRef', 'parentProjectRef', 'branchId', 'branchName', ...(withBarrier ? ['barrierId'] : [])];
+  const keys = ['projectRef', ...(withBarrier ? ['barrierId'] : [])];
   if (!exactRecord(input, keys) || input.projectRef !== expectedEnvironment.database.projectRef ||
-      input.branchId !== expectedEnvironment.database.branchId || !REF.test(input.parentProjectRef) ||
-      input.parentProjectRef === input.projectRef || !BRANCH.test(input.branchId) ||
-      !BRANCH.test(input.branchName) || PRODUCTION_BRANCH_PART.test(input.branchId.toLowerCase()) ||
-      PRODUCTION_BRANCH_PART.test(input.branchName.toLowerCase()) ||
+      !REF.test(input.projectRef) ||
       withBarrier && !SQL_BARRIER_IDS.has(input.barrierId)) refuse('supabase_sql_reader_input_invalid');
-  return Object.freeze({ projectRef: input.projectRef, parentProjectRef: input.parentProjectRef,
-    branchId: input.branchId, branchName: input.branchName, ...(withBarrier ? { barrierId: input.barrierId } : {}) });
+  return Object.freeze({ projectRef: input.projectRef, ...(withBarrier ? { barrierId: input.barrierId } : {}) });
 }
 
-const WEBHOOK_FIELDS = Object.freeze(['id', 'attemptId', 'caseId', 'branchId', 'eventId', 'eventType',
+const WEBHOOK_FIELDS = Object.freeze(['id', 'attemptId', 'caseId', 'projectRef', 'eventId', 'eventType',
   'objectId', 'accountId', 'livemode', 'status', 'attempts', 'apiVersion', 'receivedAt', 'processedAt']);
 
 function selectedSafeFields(value, allowed, required = []) {
@@ -401,8 +396,7 @@ export function createSupabaseBillingReader({ expectedEnvironment, source } = {}
       try { state = sanitizeInstalledSchemaState(raw); }
       catch { refuse('supabase_sql_response_invalid'); }
       if (state.readerId !== trustedReaderId || state.projectRef !== target.projectRef ||
-          state.parentProjectRef !== target.parentProjectRef || state.branchId !== target.branchId ||
-          state.branchName !== target.branchName) refuse('supabase_sql_response_invalid');
+          state.isStandaloneProject !== true) refuse('supabase_sql_response_invalid');
       return state;
     },
     async readConcurrencyProof(input) {
@@ -421,8 +415,7 @@ export function createSupabaseBillingReader({ expectedEnvironment, source } = {}
       try { proof = sanitizeSqlConcurrencyProof(raw); }
       catch { refuse('supabase_sql_response_invalid'); }
       if (proof.readerId !== trustedReaderId || proof.projectRef !== target.projectRef ||
-          proof.parentProjectRef !== target.parentProjectRef || proof.branchId !== target.branchId ||
-          proof.branchName !== target.branchName || proof.barrierId !== target.barrierId) {
+          proof.isStandaloneProject !== true || proof.barrierId !== target.barrierId) {
         refuse('supabase_sql_response_invalid');
       }
       return proof;

@@ -5,17 +5,17 @@ import { createPostgresAttemptStore, installAttemptSchema } from '../../src/atte
 import { providerIdempotencyKey } from '../../src/attempts/prepare.mjs';
 import { runStripeMutation } from '../../src/runtime/stripe.mjs';
 
-const database = { projectRef: 'abcdefghijklmnopqrst', parentProjectRef: 'zyxwvutsrqponmlkjihg',
-  branchId: 'child-validation-1', branchName: 'billing-validation-1' };
+const database = { projectRef: 'abcdefghijklmnopqrst' };
 const preflight = { expectedEnvironment: {
-  database: { projectRef: database.projectRef, branchId: database.branchId },
+  database: { projectRef: database.projectRef },
   deployment: { id: 'dpl_candidate123', origin: 'https://candidate.vercel.app' },
   stripe: { accountId: 'acct_synthetic123' },
-}, providerVerification: { supabase: { ...database, schemaFingerprintSha256: 'a'.repeat(64),
+}, providerVerification: { supabase: { ...database, isStandaloneProject: true, databaseVersion: '17.6.1.054',
+  schemaFingerprintSha256: 'a'.repeat(64),
   migrationHistorySha256: 'b'.repeat(64) }, stripe: { accountId: 'acct_synthetic123',
   webhookEndpointId: 'we_synthetic123', webhookUrl: 'https://candidate.vercel.app/api/stripe/webhook',
   livemode: false } } };
-const target = { ...database, isDefault: false, status: 'ACTIVE_HEALTHY', isolated: true };
+const target = { ...preflight.providerVerification.supabase, status: 'ACTIVE_HEALTHY' };
 const retentionPolicy = { version: 1, quotas: {
   attempts: 50, databaseRows: 500, authUsers: 50, stripeObjects: 500,
 } };
@@ -29,6 +29,7 @@ const cleanupProjection = { cleanupClaim: 'owned_reversible_provider_fixtures_on
 function recordingClient() {
   const calls = [];
   const transactions = [];
+  let fenceSequence = 0;
   const client = { calls, async transaction(fn) {
     const transactionCalls = [];
     transactions.push(transactionCalls);
@@ -37,6 +38,7 @@ function recordingClient() {
       calls.push(call);
       transactionCalls.push(call);
       if (/clock_timestamp/.test(sql) && /SELECT/.test(sql)) return { rows: [{ now: 1000 }] };
+      if (/nextval\(/u.test(sql)) return { rows: [{ sequence_value: String(++fenceSequence) }] };
       return { rows: [], rowCount: 1 };
     } });
   } };
@@ -52,7 +54,7 @@ function fixtureMutationClient({ mode = 'valid' } = {}) {
   const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1,
     runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
-  const attemptRow = { attempt_id: 'attempt-fixture', branch_id: database.branchId,
+  const attemptRow = { attempt_id: 'attempt-fixture', branch_id: database.projectRef,
     suite: 'billing', fixture_key: 'fixture-a', candidate_sha: 'a'.repeat(40),
     workflow_repository: workflow.repository, workflow_ref: workflow.ref, workflow_run_id: workflow.runId,
     workflow_run_attempt: workflow.runAttempt, runner_label: workflow.runnerLabel,
@@ -62,7 +64,7 @@ function fixtureMutationClient({ mode = 'valid' } = {}) {
     state: 'collecting', cleanup_status: 'pending', artifact_id: null, resource_ids: [],
     created_at_epoch: 900, updated_at_epoch: 900 };
   const resources = [
-    { resource_type: 'supabase_branch', resource_id: `${database.projectRef}:${database.branchId}` },
+    { resource_type: 'supabase_project', resource_id: database.projectRef },
     { resource_type: 'stripe_account', resource_id: preflight.expectedEnvironment.stripe.accountId },
   ].map((resource) => ({ ...resource, owner_attempt_id: 'attempt-fixture', fence,
     candidate_sha: 'a'.repeat(40), workflow_repository: workflow.repository,
@@ -71,8 +73,8 @@ function fixtureMutationClient({ mode = 'valid' } = {}) {
     expires_at_epoch: 1060 }));
   const reservation = { reservation_id: 'reservation-fixture',
     attempt_id: mode === 'other-attempt' ? 'attempt-other' : 'attempt-fixture',
-    project_ref: database.projectRef,
-    branch_id: mode === 'other-scope' ? 'other-validation-branch' : database.branchId,
+    project_ref: mode === 'other-scope' ? 'zyxwvutsrqponmlkjihg' : database.projectRef,
+    branch_id: mode === 'other-scope' ? 'zyxwvutsrqponmlkjihg' : database.projectRef,
     stripe_account_id: preflight.expectedEnvironment.stripe.accountId, policy_version: 1,
     quota_limits: retentionPolicy.quotas,
     projection: { ...projection, databaseRows: mode === 'insufficient' ? 0 : 1 },
@@ -81,8 +83,8 @@ function fixtureMutationClient({ mode = 'valid' } = {}) {
     return fn({ async query(sql, values) {
       calls.push({ sql, values });
       if (sql.includes('FROM billing_validation_control.attempts')) return { rows: [attemptRow] };
-      if (sql.includes('FROM billing_validation_control.resource_locks')) return { rows: resources };
-      if (sql.includes('FROM billing_validation_control.fixture_leases')) return { rows: [{
+      if (sql.includes('FROM billing_validation_control.standalone_resource_locks')) return { rows: resources };
+      if (sql.includes('FROM billing_validation_control.standalone_fixture_leases')) return { rows: [{
         attempt_id: 'attempt-fixture', fence,
         expires_at_epoch: mode === 'expired' ? 999 : 1060,
         owner_candidate_sha: 'a'.repeat(40), owner_repository: workflow.repository,
@@ -95,7 +97,8 @@ function fixtureMutationClient({ mode = 'valid' } = {}) {
       if (sql.includes('FROM billing_validation_control.retention_receipts')) {
         return { rows: mode === 'settled' ? [{ receipt_id: 'receipt-fixture',
           reservation_id: 'reservation-fixture', attempt_id: 'attempt-fixture',
-          project_ref: database.projectRef, branch_id: database.branchId,
+          project_ref: database.projectRef, branch_id: database.projectRef,
+          owner_fence: fence,
           stripe_account_id: preflight.expectedEnvironment.stripe.accountId,
           outcome: 'completed', retained_usage: { ...projection, databaseRows: 0 },
           created_at_epoch: 950 }] : [] };
@@ -139,34 +142,55 @@ function withGetter(source, key, getter) {
   return copy;
 }
 
-test('wrong, default, parent, or unhealthy schema target refuses before issuing DDL', async () => {
+test('schema installer refuses bootstrap without explicit migration approval before opening SQL', async () => {
+  const client = recordingClient();
+  await assert.rejects(installAttemptSchema({ client, preflight, target }), {
+    code: 'migration_approval_required',
+  });
+  assert.equal(client.calls.length, 0);
+  assert.equal(client.transactions.length, 0);
+});
+
+test('non-standalone, mismatched, or unhealthy readback refuses before any SQL', () => {
   const variants = [
-    { ...target, branchId: 'other-branch' },
-    { ...target, projectRef: target.parentProjectRef },
-    { ...target, branchName: 'main' },
-    { ...target, isDefault: true },
-    { ...target, isolated: false },
+    { ...target, branchId: 'synthetic-branch' },
+    { ...target, projectRef: 'zyxwvutsrqponmlkjihg' },
+    { ...target, isStandaloneProject: false },
+    { ...target, databaseVersion: '16.9' },
     { ...target, status: 'MIGRATIONS_FAILED' },
+    { ...target, schemaFingerprintSha256: 'f'.repeat(64) },
   ];
   for (const bad of variants) {
     const client = recordingClient();
-    await assert.rejects(installAttemptSchema({ client, preflight, target: bad }), { code: 'schema_target_unverified' });
+    assert.throws(() => createPostgresAttemptStore({ client, preflight, target: bad }),
+      { code: 'schema_target_unverified' });
     assert.equal(client.calls.length, 0);
   }
 });
 
-test('schema installer refuses absent identity pins before issuing DDL', async () => {
+test('PostgreSQL store retains the protected-production project denylist before SQL', () => {
+  const blockedProjectRef = 'zjvqjdntasprusoqfsgw';
+  const expectedEnvironment = { ...preflight.expectedEnvironment,
+    database: { projectRef: blockedProjectRef } };
+  const configuredPreflight = { ...preflight, expectedEnvironment,
+    providerVerification: { ...preflight.providerVerification,
+      supabase: { ...preflight.providerVerification.supabase, projectRef: blockedProjectRef } } };
+  const configuredTarget = { ...target, projectRef: blockedProjectRef };
+  const client = recordingClient();
+  assert.throws(() => createPostgresAttemptStore({ client, preflight: configuredPreflight,
+    target: configuredTarget }), { code: 'schema_target_unverified' });
+  assert.equal(client.calls.length, 0);
+});
+
+test('store refuses absent or branch-shaped project identities before SQL', () => {
   const cases = [
     { preflight: { expectedEnvironment: { database: {} },
-      providerVerification: { supabase: { parentProjectRef: database.parentProjectRef } } },
-      target: { parentProjectRef: database.parentProjectRef, isDefault: false,
-        isolated: true, status: 'ACTIVE_HEALTHY' } },
+      providerVerification: { supabase: { projectRef: database.projectRef } } }, target },
     { preflight: { ...preflight, expectedEnvironment: {
-      ...preflight.expectedEnvironment, database: { branchId: database.branchId },
+      ...preflight.expectedEnvironment, database: { projectRef: database.projectRef, branchId: 'legacy' },
     } }, target },
-    { preflight, target: { ...target, branchName: undefined } },
     { preflight: { ...preflight, providerVerification: { supabase: {
-      ...preflight.providerVerification.supabase, branchId: undefined,
+      ...preflight.providerVerification.supabase, isStandaloneProject: false,
     } } }, target },
     { preflight: { ...preflight, providerVerification: {
       supabase: preflight.providerVerification.supabase,
@@ -179,21 +203,21 @@ test('schema installer refuses absent identity pins before issuing DDL', async (
   ];
   for (const invalid of cases) {
     const client = recordingClient();
-    await assert.rejects(installAttemptSchema({ client, ...invalid }),
-      { code: 'schema_target_unverified' });
+    assert.throws(() => createPostgresAttemptStore({ client, ...invalid }), { code: 'schema_target_unverified' });
     assert.equal(client.calls.length, 0);
   }
 });
 
-test('schema installer refuses null or coerced child identity fields before DDL', async () => {
+test('store refuses malformed standalone project and digest fields before SQL', () => {
   const malformed = [
-    { field: 'branchName', value: null },
-    { field: 'branchName', value: 123 },
-    { field: 'parentProjectRef', value: new String(database.parentProjectRef) },
+    { field: 'projectRef', value: null },
+    { field: 'projectRef', value: new String(database.projectRef) },
+    { field: 'schemaFingerprintSha256', value: 'not-a-digest' },
+    { field: 'migrationHistorySha256', value: null },
   ];
   for (const { field, value } of malformed) {
     const client = recordingClient();
-    await assert.rejects(installAttemptSchema({ client,
+    assert.throws(() => createPostgresAttemptStore({ client,
       preflight: { ...preflight, providerVerification: {
         ...preflight.providerVerification,
         supabase: { ...preflight.providerVerification.supabase, [field]: value },
@@ -206,7 +230,7 @@ test('schema installer refuses null or coerced child identity fields before DDL'
 
 test('changing expected-environment getter is refused without reading it or opening a transaction', async () => {
   const otherEnvironment = {
-    database: { projectRef: 'mnopqrstabcdefghijkl', branchId: 'child-validation-2' },
+    database: { projectRef: 'mnopqrstabcdefghijkl' },
     deployment: { id: 'dpl_candidate456', origin: 'https://other-candidate.vercel.app' },
     stripe: { accountId: 'acct_other123' },
   };
@@ -218,8 +242,6 @@ test('changing expected-environment getter is refused without reading it or open
   const client = recordingClient();
 
   assert.throws(() => createPostgresAttemptStore({ client, preflight: unstablePreflight, target }),
-    { code: 'schema_target_unverified' });
-  await assert.rejects(installAttemptSchema({ client, preflight: unstablePreflight, target }),
     { code: 'schema_target_unverified' });
   assert.equal(reads, 0);
   assert.equal(client.transactions.length, 0);
@@ -234,8 +256,8 @@ test('preflight verification and target accessors are rejected without invoking 
     }),
     (counter) => ({
       preflight: { ...preflight, expectedEnvironment: { ...preflight.expectedEnvironment,
-        database: withGetter(preflight.expectedEnvironment.database, 'branchId', () => {
-          counter.count++; return database.branchId;
+        database: withGetter(preflight.expectedEnvironment.database, 'projectRef', () => {
+          counter.count++; return database.projectRef;
         }) } }, target,
     }),
     (counter) => ({
@@ -269,12 +291,13 @@ test('preflight verification and target accessors are rejected without invoking 
         }) } }, target,
     }),
     (counter) => ({
-      preflight, target: withGetter(target, 'branchId', () => {
-        counter.count++; return database.branchId;
+      preflight, target: withGetter(target, 'projectRef', () => {
+        counter.count++; return database.projectRef;
       }),
     }),
   ];
-  for (const field of ['projectRef', 'parentProjectRef', 'branchId', 'branchName', 'isDefault', 'status', 'isolated']) {
+  for (const field of ['projectRef', 'isStandaloneProject', 'databaseVersion', 'status',
+    'schemaFingerprintSha256', 'migrationHistorySha256']) {
     cases.push((counter) => ({
       preflight, target: withGetter(target, field, () => {
         counter.count++; return target[field];
@@ -301,17 +324,15 @@ test('store remains pinned to a detached environment snapshot after source objec
   const store = createPostgresAttemptStore({ client, preflight: sourcePreflight, target: sourceTarget });
 
   sourcePreflight.expectedEnvironment.database.projectRef = 'mnopqrstabcdefghijkl';
-  sourcePreflight.expectedEnvironment.database.branchId = 'other-validation-2';
   sourcePreflight.expectedEnvironment.deployment.id = 'dpl_other456';
   sourcePreflight.expectedEnvironment.deployment.origin = 'https://other-candidate.vercel.app';
   sourcePreflight.expectedEnvironment.stripe.accountId = 'acct_other123';
   sourcePreflight.providerVerification.supabase.projectRef = 'mnopqrstabcdefghijkl';
-  sourcePreflight.providerVerification.supabase.branchId = 'other-validation-2';
   sourcePreflight.providerVerification.stripe.accountId = 'acct_other123';
-  sourceTarget.branchId = 'other-validation-2';
+  sourceTarget.projectRef = 'other-validation-2';
 
   await store.prepare({ attemptId: 'attempt-stable-snapshot',
-    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-snapshot' },
+    key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-snapshot' },
     candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
@@ -325,22 +346,11 @@ test('store remains pinned to a detached environment snapshot after source objec
   assert.equal(insert.values[13], stableEnvironment.stripe.accountId);
 });
 
-test('verified installer issues only the dedicated control schema DDL', async () => {
-  const client = recordingClient();
-  await installAttemptSchema({ client, preflight, target });
-  assert.equal(client.transactions.length, 1);
-  assert.equal(client.transactions[0][0].sql, 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
-  assert.equal(client.transactions[0].length, 2);
-  assert.match(client.transactions[0][1].sql, /CREATE SCHEMA IF NOT EXISTS billing_validation_control/);
-  assert.equal([...client.transactions[0][1].sql.matchAll(/CREATE TABLE IF NOT EXISTS ([\w.]+)/g)]
-    .every((match) => match[1].startsWith('billing_validation_control.')), true);
-});
-
 test('every PostgreSQL store transaction starts at READ COMMITTED before its first read or lock', async () => {
   const client = recordingClient();
   const store = createPostgresAttemptStore({ client, preflight, target });
   await store.prepare({ attemptId: 'attempt-a',
-    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-a' },
+    key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
     candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
@@ -353,16 +363,21 @@ test('every PostgreSQL store transaction starts at READ COMMITTED before its fir
   }
 });
 
-test('schema gives fixture leases the exact shared key and fences owner rows', () => {
-  const sql = readFileSync(new URL('../../src/attempts/schema.sql', import.meta.url), 'utf8');
-  assert.match(sql, /PRIMARY KEY \(branch_id, suite, fixture_key\)/);
-  assert.match(sql, /FOREIGN KEY \(attempt_id, branch_id, suite, fixture_key\)\s+REFERENCES billing_validation_control\.attempts\(attempt_id, branch_id, suite, fixture_key\)/);
-  assert.match(sql, /fence uuid NOT NULL/);
-  assert.match(sql, /owner_run_id text NOT NULL/);
-  assert.match(sql, /owner_run_attempt integer NOT NULL/);
-  assert.match(sql, /owner_candidate_sha char\(40\) NOT NULL/);
-  assert.match(sql, /REVOKE ALL ON SCHEMA billing_validation_control FROM PUBLIC/);
-  assert.doesNotMatch(sql, /candidate_sha, suite, fixture_key\)/);
+test('forward migration adds monotonic project-scoped fencing and immutable lease receipts', () => {
+  const sql = readFileSync(new URL('../../src/attempts/migrations/202610010001-standalone-lease-fencing.sql', import.meta.url), 'utf8');
+  assert.match(sql, /CREATE SEQUENCE billing_validation_control\.fixture_lease_fence_seq/);
+  assert.match(sql, /CREATE TABLE billing_validation_control\.fixture_lease_history/);
+  assert.match(sql, /project_ref char\(20\) NOT NULL/);
+  assert.match(sql, /owner_fence uuid NOT NULL/);
+  assert.match(sql, /workflow_run_id text NOT NULL/);
+  assert.match(sql, /workflow_run_attempt integer NOT NULL/);
+  assert.match(sql, /BEFORE UPDATE OR DELETE ON billing_validation_control\.fixture_lease_history/);
+  assert.match(sql, /BEFORE TRUNCATE ON billing_validation_control\.fixture_lease_history/);
+  assert.match(sql, /REVOKE ALL ON TABLE[\s\S]*billing_validation_control\.fixture_lease_history FROM PUBLIC, anon, authenticated/);
+  assert.match(sql, /REVOKE ALL ON SEQUENCE billing_validation_control\.fixture_lease_fence_seq FROM PUBLIC, anon, authenticated/);
+  assert.match(sql, /ALTER TABLE billing_validation_control\.retention_receipts[\s\S]*ADD COLUMN owner_fence uuid/);
+  assert.match(sql, /fixture_lease_history[\s\S]*attempt_id = NEW\.attempt_id[\s\S]*owner_fence = NEW\.owner_fence/);
+  assert.doesNotMatch(sql, /^\s*(?:DROP|DELETE|TRUNCATE)\b/imu);
 });
 
 test('schema stores append-only retention reservations and terminal receipts with update/delete denial', () => {
@@ -411,11 +426,13 @@ test('schema persists closed, attempt-bound append-only cleanup receipts', () =>
 
 test('schema persists global resource ownership and append-only Stripe intents and receipts', () => {
   const sql = readFileSync(new URL('../../src/attempts/schema.sql', import.meta.url), 'utf8');
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS billing_validation_control\.resource_locks/);
+  const migration = readFileSync(new URL('../../src/attempts/migrations/202610010001-standalone-lease-fencing.sql', import.meta.url), 'utf8');
+  assert.match(migration, /CREATE TABLE billing_validation_control\.standalone_resource_locks/);
   assert.match(sql, /PRIMARY KEY \(resource_type, resource_id\)/);
+  assert.match(migration, /PRIMARY KEY \(resource_type, resource_id\)/);
   for (const field of ['owner_attempt_id', 'fence', 'candidate_sha', 'workflow_run_id',
     'workflow_run_attempt', 'environment_identity', 'expires_at']) {
-    assert.match(sql, new RegExp(`\\b${field}\\b`));
+    assert.match(migration, new RegExp(`\\b${field}\\b`));
   }
   assert.match(sql, /CREATE TABLE IF NOT EXISTS billing_validation_control\.stripe_intents/);
   assert.match(sql, /UNIQUE \(attempt_id, operation\)/);
@@ -449,25 +466,26 @@ test('zero-row conflicting attempt insert cannot create an orphan fixture lease'
     return fn({ async query(sql, values) {
       calls.push({ sql, values });
       if (sql.includes('clock_timestamp')) return { rows: [{ now: 1000 }] };
+      if (/nextval\(/u.test(sql)) return { rows: [{ sequence_value: '1' }] };
       if (sql.includes('INSERT INTO billing_validation_control.attempts')) return { rows: [], rowCount: 0 };
       return { rows: [], rowCount: 1 };
     } });
   } };
   const store = createPostgresAttemptStore({ client, preflight, target });
   await assert.rejects(store.prepare({ attemptId: 'attempt-a',
-    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-b' },
+    key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-b' },
     candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
     environment: preflight.expectedEnvironment, ttlSeconds: 60, retentionPolicy, projection }),
   { code: 'attempt_conflict' });
-  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.fixture_leases')), false);
+  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.standalone_fixture_leases')), false);
 });
 
 test('PostgreSQL adapter accepts an injected transactional client and parameterizes key and metadata', async () => {
   const client = recordingClient();
   const store = createPostgresAttemptStore({ client, preflight, target });
-  await store.prepare({ attemptId: 'attempt-a', key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-a' },
+  await store.prepare({ attemptId: 'attempt-a', key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
     candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1, runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
     environment: preflight.expectedEnvironment, ttlSeconds: 60, retentionPolicy, projection });
@@ -477,16 +495,26 @@ test('PostgreSQL adapter accepts an injected transactional client and parameteri
     sql.includes('FROM billing_validation_control.attempts'));
   assert.ok(attemptLock >= 0 && attemptLock < attemptRead);
   assert.ok(client.calls.some(({ sql, values }) => /pg_advisory_xact_lock/.test(sql) && values?.[0]?.includes('invoice-a')));
-  assert.ok(client.calls.some(({ sql, values }) => /INSERT INTO billing_validation_control\.fixture_leases/.test(sql) &&
-    values?.includes('child-validation-1')));
+  assert.ok(client.calls.some(({ sql, values }) => /INSERT INTO billing_validation_control\.standalone_fixture_leases/.test(sql) &&
+    values?.includes(database.projectRef)));
   assert.ok(client.calls.some(({ sql }) => /INSERT INTO billing_validation_control\.retention_reservations/.test(sql)));
+  const leaseWriteIndex = client.calls.findIndex(({ sql }) =>
+    /INSERT INTO billing_validation_control\.standalone_fixture_leases/.test(sql));
+  const historyWrites = client.calls.map((call, index) => ({ ...call, index })).filter(({ sql }) =>
+    /INSERT INTO billing_validation_control\.fixture_lease_history/.test(sql));
+  assert.equal(historyWrites.length, 1);
+  assert.ok(historyWrites[0].index > leaseWriteIndex);
+  assert.deepEqual(historyWrites[0].values.slice(0, 8), [database.projectRef, 'billing', 'invoice-a',
+    'attempt-a', '00000000-0000-4000-8000-000000000001', '100', 1, 'acquired']);
+  assert.equal(client.calls.some(({ sql }) =>
+    /(?:UPDATE|DELETE FROM|TRUNCATE) billing_validation_control\.fixture_lease_history/i.test(sql)), false);
   assert.equal(client.calls.some(({ sql }) => sql.includes('invoice-a') || sql.includes('attempt-a')), false);
 });
 
 test('PostgreSQL admission locks both global provider resources before capacity and persists their exact owner', async () => {
   const client = recordingClient();
   const store = createPostgresAttemptStore({ client, preflight, target });
-  await store.prepare({ attemptId: 'attempt-a', key: { branchId: database.branchId,
+  await store.prepare({ attemptId: 'attempt-a', key: { projectRef: database.projectRef,
     suite: 'billing', fixtureKey: 'invoice-a' }, candidateSha: 'a'.repeat(40),
   workflow: { repository: 'lawxcompany-stack/billing-validation-control', ref: 'refs/heads/main',
     runId: '100', runAttempt: 1, runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
@@ -498,19 +526,19 @@ test('PostgreSQL admission locks both global provider resources before capacity 
       values?.[0]?.startsWith('["resource"'));
   const capacityIndex = client.calls.findIndex(({ sql }) => sql.includes('retention_capacity_snapshot'));
   const providerLockWrites = client.calls.filter(({ sql }) =>
-    /INSERT INTO billing_validation_control\.resource_locks/.test(sql));
+    /INSERT INTO billing_validation_control\.standalone_resource_locks/.test(sql));
   assert.equal(lockAttempts.length, 2);
   assert.ok(lockAttempts.every(({ index }) => index < capacityIndex));
   assert.ok(globalLocks.length >= 3);
   assert.equal(providerLockWrites.length, 2);
   assert.ok(providerLockWrites.some(({ values }) => values?.includes('attempt-a') &&
-    values?.includes(`${database.projectRef}:${database.branchId}`)));
+    values?.includes(`${database.projectRef}`)));
   assert.ok(providerLockWrites.some(({ values }) => values?.includes('acct_synthetic123') &&
     values?.includes('attempt-a')));
   const reservationIndex = client.calls.findIndex(({ sql }) =>
     /INSERT INTO billing_validation_control\.retention_reservations/.test(sql));
   const leaseIndex = client.calls.findIndex(({ sql }) =>
-    /INSERT INTO billing_validation_control\.fixture_leases/.test(sql));
+    /INSERT INTO billing_validation_control\.standalone_fixture_leases/.test(sql));
   assert.ok(capacityIndex < reservationIndex && reservationIndex < leaseIndex);
 });
 
@@ -523,7 +551,7 @@ test('fixture SQL executes behind an owner fence in the same transaction', async
     return fn({ async query(sql, values) {
       calls.push({ sql, values });
       if (sql.includes('FROM billing_validation_control.attempts')) return { rows: [{
-        attempt_id: 'attempt-a', branch_id: database.branchId, suite: 'billing', fixture_key: 'invoice-a',
+        attempt_id: 'attempt-a', branch_id: database.projectRef, suite: 'billing', fixture_key: 'invoice-a',
         candidate_sha: 'a'.repeat(40), workflow_repository: 'lawxcompany-stack/billing-validation-control',
         workflow_ref: 'refs/heads/main', workflow_run_id: '100', workflow_run_attempt: 1,
         runner_label: 'billing-validation-' + 'a'.repeat(32), database_project_ref: database.projectRef,
@@ -531,8 +559,8 @@ test('fixture SQL executes behind an owner fence in the same transaction', async
         stripe_account_id: 'acct_synthetic123', state: 'collecting', cleanup_status: 'pending',
         artifact_id: null, resource_ids: [], created_at_epoch: 1000, updated_at_epoch: 1000,
       }] };
-      if (sql.includes('FROM billing_validation_control.resource_locks')) return { rows: [
-        { resource_type: 'supabase_branch', resource_id: `${database.projectRef}:${database.branchId}`,
+      if (sql.includes('FROM billing_validation_control.standalone_resource_locks')) return { rows: [
+        { resource_type: 'supabase_project', resource_id: `${database.projectRef}`,
           owner_attempt_id: 'attempt-a', fence, candidate_sha: 'a'.repeat(40),
           workflow_repository: 'lawxcompany-stack/billing-validation-control',
           workflow_ref: 'refs/heads/main', workflow_run_id: '100', workflow_run_attempt: 1,
@@ -545,7 +573,7 @@ test('fixture SQL executes behind an owner fence in the same transaction', async
           runner_label: 'billing-validation-' + 'a'.repeat(32),
           environment_identity: preflight.expectedEnvironment, expires_at_epoch: 1060 },
       ] };
-      if (sql.includes('FROM billing_validation_control.fixture_leases')) return { rows: [{
+      if (sql.includes('FROM billing_validation_control.standalone_fixture_leases')) return { rows: [{
         attempt_id: 'attempt-a', fence, expires_at_epoch: 1060, owner_candidate_sha: 'a'.repeat(40),
         owner_repository: 'lawxcompany-stack/billing-validation-control', owner_ref: 'refs/heads/main',
         owner_run_id: '100', owner_run_attempt: 1,
@@ -560,7 +588,7 @@ test('fixture SQL executes behind an owner fence in the same transaction', async
   assert.equal(transactions, 1);
   assert.match(calls.at(-1).sql, /^UPDATE billing_fixture/);
   assert.ok(calls.some(({ sql }) => sql.includes('pg_advisory_xact_lock')));
-  assert.ok(calls.some(({ sql }) => sql.includes('fixture_leases') && sql.includes('FOR UPDATE')));
+  assert.ok(calls.some(({ sql }) => sql.includes('standalone_fixture_leases') && sql.includes('FOR UPDATE')));
 });
 
 test('PostgreSQL fixture reservation claim locks the exact owner and reservation before invoking the writer', async () => {
@@ -594,7 +622,7 @@ test('PostgreSQL fixture reservation claim locks the exact owner and reservation
   const caseClaimWrite = index(/INSERT INTO billing_validation_control\.fixture_case_claims/u);
   assert.deepEqual(client.calls[caseClaimWrite].values, ['attempt-fixture', 'payment.approved',
     'reservation-fixture', fence, 'a'.repeat(40), '00000000-0000-4000-8000-000000000001',
-    database.projectRef, database.branchId, preflight.expectedEnvironment.deployment.id,
+    database.projectRef, database.projectRef, preflight.expectedEnvironment.deployment.id,
     preflight.expectedEnvironment.deployment.origin, preflight.expectedEnvironment.stripe.accountId]);
   assert.equal(client.calls.filter(({ sql }) => /SET TRANSACTION ISOLATION LEVEL READ COMMITTED/u.test(sql)).length, 1);
   assert.deepEqual(events, ['writer']);
@@ -648,7 +676,7 @@ test('PostgreSQL persists Stripe intents, blocks replay, and appends one indepen
   const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1,
     runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
-  const attemptRow = { attempt_id: 'attempt-stripe', branch_id: database.branchId,
+  const attemptRow = { attempt_id: 'attempt-stripe', branch_id: database.projectRef,
     suite: 'billing', fixture_key: 'invoice-a', candidate_sha: 'a'.repeat(40),
     workflow_repository: workflow.repository, workflow_ref: workflow.ref, workflow_run_id: workflow.runId,
     workflow_run_attempt: workflow.runAttempt, runner_label: workflow.runnerLabel,
@@ -667,7 +695,7 @@ test('PostgreSQL persists Stripe intents, blocks replay, and appends one indepen
   let intentPersisted = false;
   let receiptRow = null;
   const ownerLocks = [
-    { resource_type: 'supabase_branch', resource_id: `${database.projectRef}:${database.branchId}` },
+    { resource_type: 'supabase_project', resource_id: `${database.projectRef}` },
     { resource_type: 'stripe_account', resource_id: 'acct_synthetic123' },
   ].map((resource) => ({ ...resource, owner_attempt_id: 'attempt-stripe', fence,
     candidate_sha: 'a'.repeat(40), workflow_repository: workflow.repository,
@@ -682,8 +710,8 @@ test('PostgreSQL persists Stripe intents, blocks replay, and appends one indepen
       transactionCalls.push({ sql, values });
       if (/clock_timestamp/.test(sql) && /SELECT/.test(sql)) return { rows: [{ now: 1000 }] };
       if (sql.includes('FROM billing_validation_control.attempts')) return { rows: [attemptRow] };
-      if (sql.includes('FROM billing_validation_control.resource_locks')) return { rows: ownerLocks };
-      if (sql.includes('FROM billing_validation_control.fixture_leases')) return { rows: [{
+      if (sql.includes('FROM billing_validation_control.standalone_resource_locks')) return { rows: ownerLocks };
+      if (sql.includes('FROM billing_validation_control.standalone_fixture_leases')) return { rows: [{
         attempt_id: 'attempt-stripe', fence, expires_at_epoch: 1060,
         owner_candidate_sha: 'a'.repeat(40), owner_repository: workflow.repository,
         owner_ref: workflow.ref, owner_run_id: workflow.runId, owner_run_attempt: 1,
@@ -763,7 +791,7 @@ test('PostgreSQL pending intent query is authorized by the current attempt fence
   const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1,
     runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
-  const attemptRow = { attempt_id: 'attempt-pending', branch_id: database.branchId,
+  const attemptRow = { attempt_id: 'attempt-pending', branch_id: database.projectRef,
     suite: 'billing', fixture_key: 'invoice-pending', candidate_sha: 'a'.repeat(40),
     workflow_repository: workflow.repository, workflow_ref: workflow.ref,
     workflow_run_id: workflow.runId, workflow_run_attempt: workflow.runAttempt,
@@ -772,7 +800,7 @@ test('PostgreSQL pending intent query is authorized by the current attempt fence
     stripe_account_id: 'acct_synthetic123', state: 'rechecking', cleanup_status: 'pending',
     artifact_id: null, resource_ids: [], created_at_epoch: 1000, updated_at_epoch: 1000 };
   const locks = [
-    { resource_type: 'supabase_branch', resource_id: `${database.projectRef}:${database.branchId}` },
+    { resource_type: 'supabase_project', resource_id: `${database.projectRef}` },
     { resource_type: 'stripe_account', resource_id: 'acct_synthetic123' },
   ].map((resource) => ({ ...resource, owner_attempt_id: 'attempt-pending', fence,
     candidate_sha: 'a'.repeat(40), workflow_repository: workflow.repository,
@@ -792,8 +820,8 @@ test('PostgreSQL pending intent query is authorized by the current attempt fence
       calls.push({ sql, values });
       if (/clock_timestamp/.test(sql) && /SELECT/.test(sql)) return { rows: [{ now: 1000 }] };
       if (sql.includes('FROM billing_validation_control.attempts')) return { rows: [attemptRow] };
-      if (sql.includes('FROM billing_validation_control.resource_locks')) return { rows: locks };
-      if (sql.includes('FROM billing_validation_control.fixture_leases')) return { rows: [{
+      if (sql.includes('FROM billing_validation_control.standalone_resource_locks')) return { rows: locks };
+      if (sql.includes('FROM billing_validation_control.standalone_fixture_leases')) return { rows: [{
         attempt_id: 'attempt-pending', fence, expires_at_epoch: 1060,
         owner_candidate_sha: 'a'.repeat(40), owner_repository: workflow.repository,
         owner_ref: workflow.ref, owner_run_id: workflow.runId, owner_run_attempt: 1,
@@ -817,7 +845,7 @@ test('PostgreSQL pending intent query is authorized by the current attempt fence
   assert.ok(pendingQuery.sql.includes('billing_validation_control.stripe_receipts'));
   assert.ok(pendingQuery.sql.includes('FOR UPDATE'));
   assert.deepEqual(pendingQuery.values, ['attempt-pending']);
-  assert.ok(calls.some(({ sql }) => sql.includes('fixture_leases') && sql.includes('FOR UPDATE')));
+  assert.ok(calls.some(({ sql }) => sql.includes('standalone_fixture_leases') && sql.includes('FOR UPDATE')));
   assert.ok(calls.some(({ sql, values }) => sql.includes('pg_advisory_xact_lock') &&
     values?.[0]?.startsWith('["resource"')));
   await assert.rejects(store.listPendingStripeIntents({ attemptId: 'attempt-pending',
@@ -833,7 +861,7 @@ test('PostgreSQL cleanup receipt persists before release and rolls receipt, stat
   const verifiedProjection = cleanupProjection;
   function makeFixture(failure = null) {
     const state = {
-      attempt: { attempt_id: attemptId, branch_id: database.branchId, suite: 'billing',
+      attempt: { attempt_id: attemptId, branch_id: database.projectRef, suite: 'billing',
         fixture_key: 'invoice-cleanup', candidate_sha: 'a'.repeat(40),
         workflow_repository: workflow.repository, workflow_ref: workflow.ref,
         workflow_run_id: workflow.runId, workflow_run_attempt: workflow.runAttempt,
@@ -845,7 +873,7 @@ test('PostgreSQL cleanup receipt persists before release and rolls receipt, stat
         owner_candidate_sha: 'a'.repeat(40), owner_repository: workflow.repository,
         owner_ref: workflow.ref, owner_run_id: workflow.runId, owner_run_attempt: workflow.runAttempt },
       resources: [
-        { resource_type: 'supabase_branch', resource_id: `${database.projectRef}:${database.branchId}` },
+        { resource_type: 'supabase_project', resource_id: `${database.projectRef}` },
         { resource_type: 'stripe_account', resource_id: 'acct_synthetic123' },
       ].map((resource) => ({ ...resource, owner_attempt_id: attemptId, fence,
         candidate_sha: 'a'.repeat(40), workflow_repository: workflow.repository,
@@ -853,7 +881,7 @@ test('PostgreSQL cleanup receipt persists before release and rolls receipt, stat
         runner_label: workflow.runnerLabel, environment_identity: preflight.expectedEnvironment,
         expires_at_epoch: 1200 })),
       reservation: { reservation_id: 'reservation-cleanup-pg', attempt_id: attemptId,
-        project_ref: database.projectRef, branch_id: database.branchId,
+        project_ref: database.projectRef, branch_id: database.projectRef,
         stripe_account_id: 'acct_synthetic123', policy_version: 1,
         quota_limits: retentionPolicy.quotas, projection: {
           attempts: 1, databaseRows: 10, authUsers: 1, stripeObjects: 10,
@@ -876,10 +904,10 @@ test('PostgreSQL cleanup receipt persists before release and rolls receipt, stat
           if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.attempts')) {
             return { rows: [state.attempt] };
           }
-          if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.resource_locks')) {
+          if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.standalone_resource_locks')) {
             return { rows: state.resources };
           }
-          if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.fixture_leases')) {
+          if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.standalone_fixture_leases')) {
             return { rows: state.lease ? [state.lease] : [] };
           }
           if (sql.includes('SELECT EXISTS') && sql.includes('billing_validation_control.stripe_intents')) {
@@ -908,11 +936,11 @@ test('PostgreSQL cleanup receipt persists before release and rolls receipt, stat
               updated_at_epoch: values[21] };
             return { rows: [], rowCount: 1 };
           }
-          if (sql.startsWith('DELETE FROM billing_validation_control.fixture_leases')) {
+          if (sql.startsWith('DELETE FROM billing_validation_control.standalone_fixture_leases')) {
             state.lease = null;
             return { rows: [], rowCount: 1 };
           }
-          if (sql.startsWith('DELETE FROM billing_validation_control.resource_locks')) {
+          if (sql.startsWith('DELETE FROM billing_validation_control.standalone_resource_locks')) {
             resourceDeletes++;
             if (failure === 'resource-release' && resourceDeletes === 2) {
               throw Object.assign(new Error('simulated_resource_release_failure'), {
@@ -947,8 +975,8 @@ test('PostgreSQL cleanup receipt persists before release and rolls receipt, stat
   const index = (pattern) => calls.findIndex(({ sql }) => pattern.test(sql));
   const receiptInsert = index(/^INSERT INTO billing_validation_control\.cleanup_receipts/);
   const attemptWrite = index(/^INSERT INTO billing_validation_control\.attempts/);
-  const leaseDelete = index(/^DELETE FROM billing_validation_control\.fixture_leases/);
-  const resourceDelete = index(/^DELETE FROM billing_validation_control\.resource_locks/);
+  const leaseDelete = index(/^DELETE FROM billing_validation_control\.standalone_fixture_leases/);
+  const resourceDelete = index(/^DELETE FROM billing_validation_control\.standalone_resource_locks/);
   assert.ok(receiptInsert >= 0 && receiptInsert < attemptWrite && attemptWrite < leaseDelete && leaseDelete < resourceDelete);
   assert.equal(successful.state.attempt.cleanup_status, 'complete');
   assert.equal(successful.state.lease, null);
@@ -976,7 +1004,7 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
   const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1,
     runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
-  const attempt = { attempt_id: attemptId, branch_id: database.branchId, suite: 'billing',
+  const attempt = { attempt_id: attemptId, branch_id: database.projectRef, suite: 'billing',
     fixture_key: 'invoice-recovery', candidate_sha: 'a'.repeat(40),
     workflow_repository: workflow.repository, workflow_ref: workflow.ref,
     workflow_run_id: workflow.runId, workflow_run_attempt: workflow.runAttempt,
@@ -995,7 +1023,7 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
     idempotency_key: providerIdempotencyKey(attemptId, 'stripe', 'checkout:create:recovery-pg'),
     state: 'in_flight', created_at_epoch: 1000 };
   const reservation = { reservation_id: 'reservation-recovery-pg', attempt_id: attemptId,
-    project_ref: database.projectRef, branch_id: database.branchId, stripe_account_id: 'acct_synthetic123',
+    project_ref: database.projectRef, branch_id: database.projectRef, stripe_account_id: 'acct_synthetic123',
     policy_version: 1, quota_limits: retentionPolicy.quotas, projection, capacity_snapshot: {},
     created_at_epoch: 1000 };
   let leaseFence = oldFence;
@@ -1005,10 +1033,11 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
   let pendingIntentsVisible = false;
   let stripeReceipt = null;
   let cleanupReceipt = null;
+  let fenceSequence = 0;
   let leaseOwner = { owner_repository: workflow.repository, owner_ref: workflow.ref,
     owner_run_id: workflow.runId, owner_run_attempt: workflow.runAttempt };
   const resources = [
-    { resource_type: 'supabase_branch', resource_id: `${database.projectRef}:${database.branchId}` },
+    { resource_type: 'supabase_project', resource_id: `${database.projectRef}` },
     { resource_type: 'stripe_account', resource_id: 'acct_synthetic123' },
   ].map((resource) => ({ ...resource, owner_attempt_id: attemptId, fence: oldFence,
     candidate_sha: 'a'.repeat(40), workflow_repository: workflow.repository,
@@ -1023,6 +1052,7 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
       const call = { sql, values };
       calls.push(call);
       transactionCalls.push(call);
+      if (/nextval\(/u.test(sql)) return { rows: [{ sequence_value: String(++fenceSequence) }] };
       if (sql.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
       if (/SELECT extract\(epoch FROM clock_timestamp\(\)\) AS now/.test(sql)) {
         return { rows: [{ now: 1100 }] };
@@ -1033,10 +1063,10 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
       if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.attempts')) {
         return { rows: [attempt] };
       }
-      if (sql.includes('FROM billing_validation_control.resource_locks')) {
+      if (sql.includes('FROM billing_validation_control.standalone_resource_locks')) {
         return { rows: resources };
       }
-      if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.fixture_leases')) {
+      if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.standalone_fixture_leases')) {
         return { rows: leaseExists ? [{ attempt_id: attemptId, fence: leaseFence,
           expires_at_epoch: leaseExpiry, recovery_only: leaseRecoveryOnly,
           owner_candidate_sha: 'a'.repeat(40), ...leaseOwner }] : [] };
@@ -1059,7 +1089,7 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
         return { rows: [reservation] };
       }
       if (sql.includes('FROM billing_validation_control.retention_receipts')) return { rows: [] };
-      if (sql.startsWith('INSERT INTO billing_validation_control.fixture_leases')) {
+      if (sql.startsWith('INSERT INTO billing_validation_control.standalone_fixture_leases')) {
         leaseExists = true;
         leaseFence = values[4];
         leaseExpiry = values[5];
@@ -1068,7 +1098,7 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
           owner_run_id: values[10], owner_run_attempt: values[11] };
         return { rows: [], rowCount: 1 };
       }
-      if (sql.startsWith('UPDATE billing_validation_control.resource_locks')) {
+      if (sql.startsWith('UPDATE billing_validation_control.standalone_resource_locks')) {
         const resource = resources.find((item) => item.resource_type === values[0] &&
           item.resource_id === values[1]);
         if (resource) {
@@ -1091,11 +1121,11 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
           resource_ids: JSON.parse(values[9]), observed_at_epoch: values[10] };
         return { rows: [], rowCount: 1 };
       }
-      if (sql.startsWith('DELETE FROM billing_validation_control.fixture_leases')) {
+      if (sql.startsWith('DELETE FROM billing_validation_control.standalone_fixture_leases')) {
         leaseExists = false;
         return { rows: [], rowCount: 1 };
       }
-      if (sql.startsWith('DELETE FROM billing_validation_control.resource_locks')) {
+      if (sql.startsWith('DELETE FROM billing_validation_control.standalone_resource_locks')) {
         const index = resources.findIndex((resource) => resource.owner_attempt_id === values[2] &&
           resource.fence === values[3]);
         if (index !== -1) resources.splice(index, 1);
@@ -1185,7 +1215,7 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
   await assert.rejects(store.handoffStripeIntentRecovery({ attemptId,
     fence: secondRecovery.fence }), { code: 'recovery_unverified' });
   cleanupReceipt = { receipt_id: 'receipt-existing', reservation_id: reservation.reservation_id,
-    attempt_id: attemptId, project_ref: database.projectRef, branch_id: database.branchId,
+    attempt_id: attemptId, project_ref: database.projectRef, branch_id: database.projectRef,
     deployment_id: attempt.deployment_id, deployment_origin: attempt.deployment_origin,
     stripe_account_id: 'acct_synthetic123', owner_fence: secondRecovery.fence,
     cleanup_digest: 'd'.repeat(64), verified_projection: cleanupProjection,
@@ -1210,27 +1240,27 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
   assert.equal((await store.listPendingStripeIntents({ attemptId,
     fence: thirdRecovery.fence })).length, 0);
 
-  const handoffWrite = /^(?:INSERT INTO billing_validation_control\.fixture_leases|UPDATE billing_validation_control\.resource_locks|INSERT INTO billing_validation_control\.attempts)/;
+  const handoffWrite = /^(?:INSERT INTO billing_validation_control\.standalone_fixture_leases|UPDATE billing_validation_control\.standalone_resource_locks|INSERT INTO billing_validation_control\.attempts)/;
   const handoffWrites = transactions.flat().filter(({ sql }) => handoffWrite.test(sql));
   assert.equal(handoffWrites.length, 12);
   assert.equal(transactions.filter((items) => items.some(({ sql }) => handoffWrite.test(sql))).length, 3);
-  const leaseWrite = handoffWrites.find(({ sql }) => sql.startsWith('INSERT INTO billing_validation_control.fixture_leases'));
+  const leaseWrite = handoffWrites.find(({ sql }) => sql.startsWith('INSERT INTO billing_validation_control.standalone_fixture_leases'));
   assert.equal(leaseWrite.values[4], recovery.fence);
   assert.equal(leaseWrite.values[6], oldFence);
   assert.equal(leaseWrite.values[10], '200');
-  const secondLeaseWrite = handoffWrites.filter(({ sql }) => sql.startsWith('INSERT INTO billing_validation_control.fixture_leases'))[1];
+  const secondLeaseWrite = handoffWrites.filter(({ sql }) => sql.startsWith('INSERT INTO billing_validation_control.standalone_fixture_leases'))[1];
   assert.equal(secondLeaseWrite.values[4], secondRecovery.fence);
   assert.equal(secondLeaseWrite.values[6], recovery.fence);
   assert.equal(secondLeaseWrite.values[10], '300');
-  const thirdLeaseWrite = handoffWrites.filter(({ sql }) => sql.startsWith('INSERT INTO billing_validation_control.fixture_leases'))[2];
+  const thirdLeaseWrite = handoffWrites.filter(({ sql }) => sql.startsWith('INSERT INTO billing_validation_control.standalone_fixture_leases'))[2];
   assert.equal(thirdLeaseWrite.values[4], thirdRecovery.fence);
   assert.equal(thirdLeaseWrite.values[6], secondRecovery.fence);
   assert.equal(thirdLeaseWrite.values[10], '400');
   assert.equal(thirdLeaseWrite.values[12], true);
   assert.ok(thirdLeaseWrite.sql.includes('recovery_only'));
-  assert.ok(leaseWrite.sql.includes('WHERE billing_validation_control.fixture_leases.fence = $7::uuid'));
+  assert.ok(leaseWrite.sql.includes('WHERE billing_validation_control.standalone_fixture_leases.fence IS NOT DISTINCT FROM $7::uuid'));
   const resourceWrites = handoffWrites.filter(({ sql }) =>
-    sql.startsWith('UPDATE billing_validation_control.resource_locks'));
+    sql.startsWith('UPDATE billing_validation_control.standalone_resource_locks'));
   assert.equal(resourceWrites.length, 6);
   assert.ok(resourceWrites.slice(0, 2).every(({ sql, values }) =>
     sql.includes('owner_attempt_id = $13') && sql.includes('fence = $14::uuid') &&
@@ -1285,8 +1315,8 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
     code: 'cleanup_unverified',
   });
   assert.equal(cleanupVerifierCalls, 1);
-  assert.equal(calls.some(({ sql }) => sql.startsWith('DELETE FROM billing_validation_control.fixture_leases') ||
-    sql.startsWith('DELETE FROM billing_validation_control.resource_locks')), false);
+  assert.equal(calls.some(({ sql }) => sql.startsWith('DELETE FROM billing_validation_control.standalone_fixture_leases') ||
+    sql.startsWith('DELETE FROM billing_validation_control.standalone_resource_locks')), false);
 });
 
 test('PostgreSQL recovery-only authority survives handoff and renewal after a terminal transition', async () => {
@@ -1295,7 +1325,7 @@ test('PostgreSQL recovery-only authority survives handoff and renewal after a te
   const oldFence = '22222222-2222-4222-8222-222222222222';
   const workflow = { repository: 'lawxcompany-stack/billing-validation-control', ref: 'refs/heads/main',
     runId: '100', runAttempt: 1, runnerLabel: 'billing-validation-' + 'b'.repeat(32) };
-  const attempt = { attempt_id: attemptId, branch_id: database.branchId, suite: 'billing',
+  const attempt = { attempt_id: attemptId, branch_id: database.projectRef, suite: 'billing',
     fixture_key: 'invoice-terminal-recovery', candidate_sha: 'a'.repeat(40),
     workflow_repository: workflow.repository, workflow_ref: workflow.ref,
     workflow_run_id: workflow.runId, workflow_run_attempt: workflow.runAttempt,
@@ -1313,7 +1343,7 @@ test('PostgreSQL recovery-only authority survives handoff and renewal after a te
     idempotency_key: providerIdempotencyKey(attemptId, 'stripe', 'checkout:create:terminal-existing-pg'),
     state: 'in_flight', created_at_epoch: 1000 };
   const reservation = { reservation_id: 'reservation-terminal-recovery-pg', attempt_id: attemptId,
-    project_ref: database.projectRef, branch_id: database.branchId, stripe_account_id: 'acct_synthetic123',
+    project_ref: database.projectRef, branch_id: database.projectRef, stripe_account_id: 'acct_synthetic123',
     policy_version: 1, quota_limits: retentionPolicy.quotas, projection, capacity_snapshot: {},
     created_at_epoch: 1000 };
   let fence = oldFence;
@@ -1323,8 +1353,9 @@ test('PostgreSQL recovery-only authority survives handoff and renewal after a te
   let fixtureWrites = 0;
   let providerDispatches = 0;
   let stripeIntentInserts = 0;
+  let fenceSequence = 0;
   const resources = [
-    { resource_type: 'supabase_branch', resource_id: `${database.projectRef}:${database.branchId}` },
+    { resource_type: 'supabase_project', resource_id: `${database.projectRef}` },
     { resource_type: 'stripe_account', resource_id: 'acct_synthetic123' },
   ].map((resource) => ({ ...resource, owner_attempt_id: attemptId, fence: oldFence,
     candidate_sha: 'a'.repeat(40), workflow_repository: workflow.repository,
@@ -1334,6 +1365,7 @@ test('PostgreSQL recovery-only authority survives handoff and renewal after a te
   const client = { async transaction(fn) {
     return fn({ async query(sql, values = []) {
       calls.push({ sql, values });
+      if (/nextval\(/u.test(sql)) return { rows: [{ sequence_value: String(++fenceSequence) }] };
       if (sql.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
       if (/SELECT extract\(epoch FROM clock_timestamp\(\)\) AS now/.test(sql)) {
         return { rows: [{ now: 1100 }] };
@@ -1341,8 +1373,8 @@ test('PostgreSQL recovery-only authority survives handoff and renewal after a te
       if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.attempts')) {
         return { rows: [attempt] };
       }
-      if (sql.includes('FROM billing_validation_control.resource_locks')) return { rows: resources };
-      if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.fixture_leases')) {
+      if (sql.includes('FROM billing_validation_control.standalone_resource_locks')) return { rows: resources };
+      if (sql.startsWith('SELECT') && sql.includes('FROM billing_validation_control.standalone_fixture_leases')) {
         return { rows: [{ attempt_id: attemptId, fence, expires_at_epoch: expiry,
           recovery_only: recoveryOnly, owner_candidate_sha: 'a'.repeat(40),
           owner_repository: workflow.repository, owner_ref: workflow.ref,
@@ -1354,14 +1386,14 @@ test('PostgreSQL recovery-only authority survives handoff and renewal after a te
       }
       if (sql.includes('FROM billing_validation_control.retention_reservations')) return { rows: [reservation] };
       if (sql.includes('FROM billing_validation_control.retention_receipts')) return { rows: [] };
-      if (sql.startsWith('INSERT INTO billing_validation_control.fixture_leases')) {
+      if (sql.startsWith('INSERT INTO billing_validation_control.standalone_fixture_leases')) {
         fence = values[4];
         expiry = values[5];
         ownerRunId = values[10];
         recoveryOnly = values[12] === true;
         return { rows: [], rowCount: 1 };
       }
-      if (sql.startsWith('UPDATE billing_validation_control.resource_locks')) {
+      if (sql.startsWith('UPDATE billing_validation_control.standalone_resource_locks')) {
         const resource = resources.find((item) => item.resource_type === values[0] &&
           item.resource_id === values[1]);
         if (resource) Object.assign(resource, { fence: values[3], workflow_run_id: values[7],
@@ -1414,7 +1446,7 @@ test('PostgreSQL recovery-only authority survives handoff and renewal after a te
   assert.equal(stripeIntentInserts, 0);
   assert.equal(recoveryOnly, true);
   assert.ok(calls.some(({ sql }) => sql.includes('recovery_only')));
-  assert.ok(calls.filter(({ sql }) => sql.startsWith('INSERT INTO billing_validation_control.fixture_leases'))
+  assert.ok(calls.filter(({ sql }) => sql.startsWith('INSERT INTO billing_validation_control.standalone_fixture_leases'))
     .every(({ values }) => values[12] === true));
 });
 
@@ -1422,13 +1454,12 @@ test('pinned adapter refuses a different stable environment tuple before SQL', a
   const client = recordingClient();
   const store = createPostgresAttemptStore({ client, preflight, target });
   await assert.rejects(store.prepare({ attemptId: 'attempt-a',
-    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-a' },
+    key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
     candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
-    environment: { ...preflight.expectedEnvironment, database: {
-      projectRef: 'zzzzzzzzzzzzzzzzzzzz', branchId: database.branchId,
-    } }, ttlSeconds: 60, retentionPolicy, projection }), { code: 'attempt_input_invalid' });
+    environment: { ...preflight.expectedEnvironment, database: { projectRef: 'zzzzzzzzzzzzzzzzzzzz' } },
+    ttlSeconds: 60, retentionPolicy, projection }), { code: 'attempt_input_invalid' });
   assert.equal(client.calls.length, 0);
 });
 
@@ -1441,9 +1472,11 @@ test('PostgreSQL admission locks and aggregates receipts plus unsettled reservat
     { bucket: 'reserved', quota_key: 'databaseRows', units: '3' },
     { bucket: 'committed', quota_key: 'authUsers', units: '1' },
   ];
+  let fenceSequence = 0;
   const client = { async transaction(fn) {
     return fn({ async query(sql, values) {
       calls.push({ sql, values });
+      if (/nextval\(/u.test(sql)) return { rows: [{ sequence_value: String(++fenceSequence) }] };
       if (sql.includes('retention_capacity_snapshot')) return { rows: capacityRows };
       if (/clock_timestamp/.test(sql) && /SELECT/.test(sql)) return { rows: [{ now: 1000 }] };
       return { rows: [], rowCount: 1 };
@@ -1451,7 +1484,7 @@ test('PostgreSQL admission locks and aggregates receipts plus unsettled reservat
   } };
   const store = createPostgresAttemptStore({ client, preflight, target });
   const result = await store.prepare({ attemptId: 'attempt-a',
-    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-a' },
+    key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
     candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
@@ -1490,7 +1523,7 @@ test('PostgreSQL admission refuses projected overflow before persisting an attem
   } };
   const store = createPostgresAttemptStore({ client, preflight, target });
   await assert.rejects(store.prepare({ attemptId: 'attempt-a',
-    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-a' },
+    key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
     candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
@@ -1500,7 +1533,7 @@ test('PostgreSQL admission refuses projected overflow before persisting an attem
   }), { code: 'retention_capacity_exceeded' });
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.attempts')), false);
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.retention_reservations')), false);
-  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.fixture_leases')), false);
+  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.standalone_fixture_leases')), false);
 });
 
 test('PostgreSQL admission refuses decimal-formatted integer usage instead of counting it ambiguously', async () => {
@@ -1517,7 +1550,7 @@ test('PostgreSQL admission refuses decimal-formatted integer usage instead of co
   } };
   const store = createPostgresAttemptStore({ client, preflight, target });
   await assert.rejects(store.prepare({ attemptId: 'attempt-a',
-    key: { branchId: database.branchId, suite: 'billing', fixtureKey: 'invoice-a' },
+    key: { projectRef: database.projectRef, suite: 'billing', fixtureKey: 'invoice-a' },
     candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
       ref: 'refs/heads/main', runId: '100', runAttempt: 1,
       runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
@@ -1527,5 +1560,5 @@ test('PostgreSQL admission refuses decimal-formatted integer usage instead of co
   }), { code: 'retention_ledger_invalid' });
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.attempts')), false);
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.retention_reservations')), false);
-  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.fixture_leases')), false);
+  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO billing_validation_control.standalone_fixture_leases')), false);
 });

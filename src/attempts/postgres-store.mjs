@@ -1,12 +1,12 @@
-import { readFile } from 'node:fs/promises';
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
+import { isValidStandaloneProjectRef } from '../billing/contracts.mjs';
 import { createAttemptStore, refuse } from './store.mjs';
+import { applyAttemptMigrations } from './migrations.mjs';
 import { RETENTION_QUOTA_KEYS } from './prepare.mjs';
 
-const PRODUCTION_LABEL = /(?:^|[-_.])(?:main|master|prod|production|primary|default)(?:$|[-_.])/i;
 const PROJECT_REF = /^[a-z0-9]{20}$/;
-const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
+const MAX_FENCE_SEQUENCE = 281474976710655n;
 function stringMatches(value, pattern) { return typeof value === 'string' && pattern.test(value); }
 function exactKeys(value, keys) {
   return value && typeof value === 'object' && !Array.isArray(value) &&
@@ -38,12 +38,12 @@ function snapshotDataRecord(value, fields, { exact = true } = {}) {
 function snapshotEnvironment(value) {
   const fields = snapshotDataRecord(value, ['database', 'deployment', 'stripe']);
   if (!fields) return null;
-  const database = snapshotDataRecord(fields.database, ['projectRef', 'branchId']);
+  const database = snapshotDataRecord(fields.database, ['projectRef']);
   const deployment = snapshotDataRecord(fields.deployment, ['id', 'origin']);
   const stripe = snapshotDataRecord(fields.stripe, ['accountId']);
   if (!database || !deployment || !stripe) return null;
   return Object.freeze({
-    database: Object.freeze({ projectRef: database.projectRef, branchId: database.branchId }),
+    database: Object.freeze({ projectRef: database.projectRef }),
     deployment: Object.freeze({ id: deployment.id, origin: deployment.origin }),
     stripe: Object.freeze({ accountId: stripe.accountId }),
   });
@@ -55,8 +55,8 @@ function snapshotPreflight(value) {
   const expectedEnvironment = snapshotEnvironment(fields.expectedEnvironment);
   const provider = snapshotDataRecord(fields.providerVerification, ['supabase', 'stripe']);
   if (!expectedEnvironment || !provider) return null;
-  const supabase = snapshotDataRecord(provider.supabase, ['projectRef', 'parentProjectRef', 'branchId',
-    'branchName', 'schemaFingerprintSha256', 'migrationHistorySha256']);
+  const supabase = snapshotDataRecord(provider.supabase, ['projectRef', 'isStandaloneProject', 'databaseVersion',
+    'schemaFingerprintSha256', 'migrationHistorySha256']);
   const stripe = snapshotDataRecord(provider.stripe, ['accountId', 'webhookEndpointId', 'webhookUrl', 'livemode']);
   if (!supabase || !stripe) return null;
   return Object.freeze({ expectedEnvironment,
@@ -64,8 +64,8 @@ function snapshotPreflight(value) {
 }
 
 function snapshotTarget(value) {
-  const fields = snapshotDataRecord(value, ['projectRef', 'parentProjectRef', 'branchId', 'branchName',
-    'isDefault', 'status', 'isolated'], { exact: false });
+  const fields = snapshotDataRecord(value, ['projectRef', 'isStandaloneProject', 'databaseVersion',
+    'status', 'schemaFingerprintSha256', 'migrationHistorySha256']);
   return fields ? Object.freeze(fields) : null;
 }
 
@@ -76,7 +76,7 @@ function verifiedTarget(preflight, target) {
   const stripe = preflight?.providerVerification?.stripe;
   return isValidExpectedEnvironment(expectedEnvironment) &&
     exactKeys(preflight?.providerVerification, ['supabase', 'stripe']) &&
-    exactKeys(verified, ['projectRef', 'parentProjectRef', 'branchId', 'branchName',
+    exactKeys(verified, ['projectRef', 'isStandaloneProject', 'databaseVersion',
       'schemaFingerprintSha256', 'migrationHistorySha256']) &&
     exactKeys(stripe, ['accountId', 'webhookEndpointId', 'webhookUrl', 'livemode']) &&
     typeof stripe.accountId === 'string' && typeof stripe.webhookUrl === 'string' &&
@@ -84,19 +84,18 @@ function verifiedTarget(preflight, target) {
     stringMatches(stripe.webhookEndpointId, /^we_[A-Za-z0-9]+$/) &&
     stripe.webhookUrl === `${expectedEnvironment.deployment.origin}/api/stripe/webhook` &&
     target &&
-    stringMatches(verified.projectRef, PROJECT_REF) && stringMatches(verified.parentProjectRef, PROJECT_REF) &&
-    stringMatches(verified.branchId, BRANCH) && stringMatches(verified.branchName, BRANCH) &&
+    stringMatches(verified.projectRef, PROJECT_REF) && isValidStandaloneProjectRef(verified.projectRef) &&
+    isValidStandaloneProjectRef(expectedEnvironment.database.projectRef) && verified.isStandaloneProject === true &&
+    typeof verified.databaseVersion === 'string' && /^[0-9][A-Za-z0-9._-]{0,63}$/u.test(verified.databaseVersion) &&
     stringMatches(verified.schemaFingerprintSha256, DIGEST) &&
     stringMatches(verified.migrationHistorySha256, DIGEST) &&
-    stringMatches(target.projectRef, PROJECT_REF) && stringMatches(target.parentProjectRef, PROJECT_REF) &&
-    stringMatches(target.branchId, BRANCH) && stringMatches(target.branchName, BRANCH) &&
-    target.projectRef === expected.projectRef && target.branchId === expected.branchId &&
-    verified.projectRef === target.projectRef && verified.branchId === target.branchId &&
-    verified.parentProjectRef === target.parentProjectRef && verified.branchName === target.branchName &&
-    typeof target.parentProjectRef === 'string' && target.parentProjectRef !== target.projectRef &&
-    target.isDefault === false && target.isolated === true && target.status === 'ACTIVE_HEALTHY' &&
-    !PRODUCTION_LABEL.test(target.branchId) && !PRODUCTION_LABEL.test(target.branchName) &&
-    !PRODUCTION_LABEL.test(verified.branchId) && !PRODUCTION_LABEL.test(verified.branchName);
+    stringMatches(target.projectRef, PROJECT_REF) && isValidStandaloneProjectRef(target.projectRef) &&
+    target.projectRef === expected.projectRef &&
+    verified.projectRef === target.projectRef && verified.databaseVersion === target.databaseVersion &&
+    verified.schemaFingerprintSha256 === target.schemaFingerprintSha256 &&
+    verified.migrationHistorySha256 === target.migrationHistorySha256 &&
+    target.isStandaloneProject === true && target.status === 'ACTIVE_HEALTHY' &&
+    DIGEST.test(target.schemaFingerprintSha256 ?? '') && DIGEST.test(target.migrationHistorySha256 ?? '');
 }
 
 function assertWiring({ client, preflight, target }) {
@@ -107,16 +106,17 @@ function assertWiring({ client, preflight, target }) {
   return { preflight: preflightSnapshot, target: targetSnapshot };
 }
 
-function keyValues(key) { return [key.branchId, key.suite, key.fixtureKey]; }
+function keyValues(key) { return [key.projectRef, key.suite, key.fixtureKey]; }
 function rowFromDb(db) {
   if (!db) return null;
+  if (db.branch_id !== db.database_project_ref.trim()) refuse('attempt_identity_invalid');
   return {
     attemptId: db.attempt_id,
-    key: { branchId: db.branch_id, suite: db.suite, fixtureKey: db.fixture_key },
+    key: { projectRef: db.database_project_ref.trim(), suite: db.suite, fixtureKey: db.fixture_key },
     candidateSha: db.candidate_sha.trim(),
     workflow: { repository: db.workflow_repository, ref: db.workflow_ref,
       runId: db.workflow_run_id, runAttempt: db.workflow_run_attempt, runnerLabel: db.runner_label },
-    environment: { database: { projectRef: db.database_project_ref.trim(), branchId: db.branch_id },
+    environment: { database: { projectRef: db.database_project_ref.trim() },
       deployment: { id: db.deployment_id, origin: db.deployment_origin },
       stripe: { accountId: db.stripe_account_id } },
     state: db.state, cleanupStatus: db.cleanup_status,
@@ -134,10 +134,11 @@ function jsonValue(value) {
 
 function retentionReservationFromDb(db) {
   if (!db) return null;
+  if (db.branch_id !== db.project_ref.trim()) refuse('retention_ledger_invalid');
   return {
     reservationId: db.reservation_id,
     attemptId: db.attempt_id,
-    scope: { projectRef: db.project_ref.trim(), branchId: db.branch_id,
+    scope: { projectRef: db.project_ref.trim(),
       stripeAccountId: db.stripe_account_id },
     policyVersion: db.policy_version,
     quotas: jsonValue(db.quota_limits),
@@ -150,11 +151,15 @@ function retentionReservationFromDb(db) {
 
 function retentionReceiptFromDb(db) {
   if (!db) return null;
+  if (db.branch_id !== db.project_ref.trim() || typeof db.owner_fence !== 'string') {
+    refuse('retention_ledger_invalid');
+  }
   return {
     receiptId: db.receipt_id,
     reservationId: db.reservation_id,
     attemptId: db.attempt_id,
-    scope: { projectRef: db.project_ref.trim(), branchId: db.branch_id,
+    ownerFence: db.owner_fence,
+    scope: { projectRef: db.project_ref.trim(),
       stripeAccountId: db.stripe_account_id },
     outcome: db.outcome,
     retained: jsonValue(db.retained_usage),
@@ -164,8 +169,9 @@ function retentionReceiptFromDb(db) {
 
 function cleanupReceiptFromDb(db) {
   if (!db) return null;
+  if (db.branch_id !== db.project_ref.trim()) refuse('cleanup_receipt_invalid');
   return { receiptId: db.receipt_id, reservationId: db.reservation_id, attemptId: db.attempt_id,
-    environment: { database: { projectRef: db.project_ref.trim(), branchId: db.branch_id },
+    environment: { database: { projectRef: db.project_ref.trim() },
       deployment: { id: db.deployment_id, origin: db.deployment_origin },
       stripe: { accountId: db.stripe_account_id } },
     fence: db.owner_fence, digest: db.cleanup_digest.trim(),
@@ -203,8 +209,7 @@ function stripeReceiptFromDb(db) {
 
 function resourceKeys(environment) {
   return [
-    { resourceType: 'supabase_branch', resourceId:
-      `${environment.database.projectRef}:${environment.database.branchId}` },
+    { resourceType: 'supabase_project', resourceId: environment.database.projectRef },
     { resourceType: 'stripe_account', resourceId: environment.stripe.accountId },
   ].sort((a, b) => `${a.resourceType}:${a.resourceId}`.localeCompare(`${b.resourceType}:${b.resourceId}`));
 }
@@ -216,13 +221,20 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
     if (typeof queryClient?.query !== 'function') refuse('store_client_invalid');
     await queryClient.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
     const tx = {
+      async nextFence() {
+        const result = await queryClient.query(`SELECT nextval(
+          'billing_validation_control.fixture_lease_fence_seq')::text AS sequence_value`);
+        const value = BigInt(result.rows?.[0]?.sequence_value ?? '0');
+        if (value < 1n || value > MAX_FENCE_SEQUENCE) refuse('lease_fence_store_unavailable');
+        return `00000000-0000-4000-8000-${value.toString(16).padStart(12, '0')}`;
+      },
       async lockAttempt(attemptId) {
         await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
           [JSON.stringify(['attempt', attemptId])]);
       },
       async lockRetention(scope) {
         await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
-          [JSON.stringify(['retention', scope.projectRef, scope.branchId, scope.stripeAccountId])]);
+          [JSON.stringify(['retention', scope.projectRef, scope.stripeAccountId])]);
       },
       async lockResourceLocks(environment) {
         for (const resource of resourceKeys(environment)) {
@@ -236,7 +248,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
         const result = await queryClient.query(`SELECT resource_type, resource_id, owner_attempt_id, fence,
           candidate_sha, workflow_repository, workflow_ref, workflow_run_id, workflow_run_attempt,
           runner_label, environment_identity, extract(epoch FROM expires_at) AS expires_at_epoch
-          FROM billing_validation_control.resource_locks
+          FROM billing_validation_control.standalone_resource_locks
           WHERE (resource_type = $1 AND resource_id = $2)
              OR (resource_type = $3 AND resource_id = $4)
           ORDER BY resource_type, resource_id FOR UPDATE`, values);
@@ -253,14 +265,14 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
             owner.expiresAt];
           let result;
           if (!old) {
-            result = await queryClient.query(`INSERT INTO billing_validation_control.resource_locks
+            result = await queryClient.query(`INSERT INTO billing_validation_control.standalone_resource_locks
               (resource_type, resource_id, owner_attempt_id, fence, candidate_sha, workflow_repository,
                workflow_ref, workflow_run_id, workflow_run_attempt, runner_label, environment_identity,
                expires_at)
               VALUES ($1,$2,$3,$4::uuid,$5,$6,$7,$8,$9,$10,$11::jsonb,to_timestamp($12))
               ON CONFLICT (resource_type, resource_id) DO NOTHING`, values);
           } else {
-            result = await queryClient.query(`UPDATE billing_validation_control.resource_locks
+            result = await queryClient.query(`UPDATE billing_validation_control.standalone_resource_locks
               SET owner_attempt_id = $3, fence = $4::uuid, candidate_sha = $5,
                   workflow_repository = $6, workflow_ref = $7, workflow_run_id = $8,
                   workflow_run_attempt = $9, runner_label = $10, environment_identity = $11::jsonb,
@@ -273,7 +285,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
       },
       async deleteResourceLocks(owner) {
         for (const resource of resourceKeys(owner.environment)) {
-          const result = await queryClient.query(`DELETE FROM billing_validation_control.resource_locks
+          const result = await queryClient.query(`DELETE FROM billing_validation_control.standalone_resource_locks
             WHERE resource_type = $1 AND resource_id = $2 AND owner_attempt_id = $3
               AND fence = $4::uuid AND expires_at > clock_timestamp()`,
           [resource.resourceType, resource.resourceId, owner.attemptId, owner.fence]);
@@ -330,24 +342,24 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
               usage.value::numeric AS units
             FROM billing_validation_control.retention_receipts AS receipt
             CROSS JOIN LATERAL jsonb_each_text(receipt.retained_usage) AS usage(key, value)
-            WHERE receipt.project_ref = $1 AND receipt.branch_id = $2 AND receipt.stripe_account_id = $3
+            WHERE receipt.project_ref = $1 AND receipt.branch_id = $1 AND receipt.stripe_account_id = $2
             UNION ALL
             SELECT 'reserved'::text AS bucket, usage.key AS quota_key,
               usage.value::numeric AS units
             FROM billing_validation_control.retention_reservations AS reservation
             CROSS JOIN LATERAL jsonb_each_text(reservation.projection) AS usage(key, value)
-            WHERE reservation.project_ref = $1 AND reservation.branch_id = $2 AND reservation.stripe_account_id = $3
+            WHERE reservation.project_ref = $1 AND reservation.branch_id = $1 AND reservation.stripe_account_id = $2
               AND NOT EXISTS (
                 SELECT 1 FROM billing_validation_control.retention_receipts AS settled
                 WHERE settled.reservation_id = reservation.reservation_id
               )
           ) AS ledger
-          GROUP BY bucket, quota_key`, [scope.projectRef, scope.branchId, scope.stripeAccountId]);
+          GROUP BY bucket, quota_key`, [scope.projectRef, scope.stripeAccountId]);
         const policies = await queryClient.query(`/* retention_policy_pin */
           SELECT quota_limits
           FROM billing_validation_control.retention_reservations
-          WHERE project_ref = $1 AND branch_id = $2 AND stripe_account_id = $3
-          GROUP BY quota_limits LIMIT 2`, [scope.projectRef, scope.branchId, scope.stripeAccountId]);
+          WHERE project_ref = $1 AND branch_id = $1 AND stripe_account_id = $2
+          GROUP BY quota_limits LIMIT 2`, [scope.projectRef, scope.stripeAccountId]);
         if ((policies.rows ?? []).length > 1) refuse('retention_ledger_invalid');
         const committed = Object.fromEntries(RETENTION_QUOTA_KEYS.map((key) => [key, 0]));
         const reserved = Object.fromEntries(RETENTION_QUOTA_KEYS.map((key) => [key, 0]));
@@ -400,7 +412,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
       async claimFixtureCase(claim) {
         const values = [claim.attemptId, claim.caseId, claim.reservationId, claim.fence,
           claim.candidateSha, claim.namespaceId, claim.environment.database.projectRef,
-          claim.environment.database.branchId, claim.environment.deployment.id,
+          claim.environment.database.projectRef, claim.environment.deployment.id,
           claim.environment.deployment.origin, claim.environment.stripe.accountId];
         await queryClient.query(`INSERT INTO billing_validation_control.fixture_case_claims
           (attempt_id, case_id, reservation_id, owner_fence, candidate_sha, namespace_id,
@@ -415,7 +427,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
         if (!prior || prior.reservation_id !== claim.reservationId || prior.owner_fence !== claim.fence ||
             prior.candidate_sha.trim() !== claim.candidateSha || prior.namespace_id !== claim.namespaceId ||
             prior.project_ref.trim() !== claim.environment.database.projectRef ||
-            prior.branch_id !== claim.environment.database.branchId ||
+            prior.branch_id !== claim.environment.database.projectRef ||
             prior.deployment_id !== claim.environment.deployment.id ||
             prior.deployment_origin !== claim.environment.deployment.origin ||
             prior.stripe_account_id !== claim.environment.stripe.accountId) {
@@ -429,7 +441,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
       },
       async getRetentionReceipt(reservationId) {
         const result = await queryClient.query(`SELECT receipt_id, reservation_id, attempt_id, project_ref,
-          branch_id, stripe_account_id, outcome, retained_usage,
+          branch_id, stripe_account_id, outcome, retained_usage, owner_fence,
           extract(epoch FROM created_at) AS created_at_epoch
           FROM billing_validation_control.retention_receipts WHERE reservation_id = $1`, [reservationId]);
         return retentionReceiptFromDb(result.rows[0]);
@@ -447,7 +459,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
            deployment_origin, stripe_account_id, owner_fence, cleanup_digest, verified_projection, created_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::uuid,$10,$11::jsonb,to_timestamp($12))`,
         [receipt.receiptId, receipt.reservationId, receipt.attemptId,
-          receipt.environment.database.projectRef, receipt.environment.database.branchId,
+          receipt.environment.database.projectRef, receipt.environment.database.projectRef,
           receipt.environment.deployment.id, receipt.environment.deployment.origin,
           receipt.environment.stripe.accountId, receipt.fence, receipt.digest,
           JSON.stringify(receipt.projection), receipt.createdAt]);
@@ -459,7 +471,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
            quota_limits, projection, capacity_snapshot, created_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,to_timestamp($10))`,
         [reservation.reservationId, reservation.attemptId, reservation.scope.projectRef,
-          reservation.scope.branchId, reservation.scope.stripeAccountId, reservation.policyVersion,
+          reservation.scope.projectRef, reservation.scope.stripeAccountId, reservation.policyVersion,
           JSON.stringify(reservation.quotas), JSON.stringify(reservation.projection),
           JSON.stringify(reservation.capacity), reservation.createdAt]);
         if (result.rowCount !== 1) refuse('retention_reservation_conflict');
@@ -467,11 +479,11 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
       async putRetentionReceipt(receipt) {
         const result = await queryClient.query(`INSERT INTO billing_validation_control.retention_receipts
           (receipt_id, reservation_id, attempt_id, project_ref, branch_id, stripe_account_id,
-           outcome, retained_usage, created_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,to_timestamp($9))`,
+           outcome, retained_usage, owner_fence, created_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::uuid,to_timestamp($10))`,
         [receipt.receiptId, receipt.reservationId, receipt.attemptId, receipt.scope.projectRef,
-          receipt.scope.branchId, receipt.scope.stripeAccountId, receipt.outcome,
-          JSON.stringify(receipt.retained), receipt.createdAt]);
+          receipt.scope.projectRef, receipt.scope.stripeAccountId, receipt.outcome,
+          JSON.stringify(receipt.retained), receipt.ownerFence, receipt.createdAt]);
         if (result.rowCount !== 1) refuse('retention_receipt_conflict');
       },
       async getStripeIntentByOperation(attemptId, operation) {
@@ -527,11 +539,11 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
       async getLease(key) {
         // This lock serializes even the first insert for an absent key. Hash collisions only reduce concurrency.
         await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [JSON.stringify(keyValues(key))]);
-        const result = await queryClient.query(`SELECT branch_id, suite, fixture_key, attempt_id, fence,
+        const result = await queryClient.query(`SELECT project_ref, suite, fixture_key, attempt_id, fence,
           owner_candidate_sha, owner_repository, owner_ref, owner_run_id, owner_run_attempt,
           recovery_only, extract(epoch FROM expires_at) AS expires_at_epoch
-          FROM billing_validation_control.fixture_leases
-          WHERE branch_id = $1 AND suite = $2 AND fixture_key = $3 FOR UPDATE`, keyValues(key));
+          FROM billing_validation_control.standalone_fixture_leases
+          WHERE project_ref = $1 AND suite = $2 AND fixture_key = $3 FOR UPDATE`, keyValues(key));
         const row = result.rows[0];
         return row ? { key, attemptId: row.attempt_id, fence: row.fence,
           candidateSha: row.owner_candidate_sha?.trim(), ownerRepository: row.owner_repository,
@@ -540,25 +552,50 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
           recoveryOnly: row.recovery_only === true,
           expiresAt: Number(row.expires_at_epoch) } : null;
       },
+      async appendLeaseHistory(lease, eventType = lease.eventType) {
+        if (!['acquired', 'renewed', 'takeover', 'recheck_handoff', 'recovery_handoff', 'released'].includes(eventType) ||
+            !lease?.workflow || !Number.isSafeInteger(lease.workflow.runAttempt) ||
+            typeof lease.workflow.runId !== 'string') refuse('lease_history_invalid');
+        const result = await queryClient.query(`INSERT INTO billing_validation_control.fixture_lease_history
+          (project_ref, suite, fixture_key, attempt_id, owner_fence, workflow_run_id,
+           workflow_run_attempt, event_type, expires_at)
+          VALUES ($1,$2,$3,$4,$5::uuid,$6,$7,$8,to_timestamp($9))`,
+        [lease.key.projectRef, lease.key.suite, lease.key.fixtureKey, lease.attemptId, lease.fence,
+          lease.workflow.runId, lease.workflow.runAttempt, eventType, lease.expiresAt]);
+        if (result.rowCount !== 1) refuse('lease_history_write_failed');
+      },
       async putLease(lease, expectedFence) {
-        const result = await queryClient.query(`INSERT INTO billing_validation_control.fixture_leases
-          (branch_id, suite, fixture_key, attempt_id, fence, expires_at,
+        const result = await queryClient.query(`INSERT INTO billing_validation_control.standalone_fixture_leases
+          (project_ref, suite, fixture_key, attempt_id, fence, expires_at,
            owner_candidate_sha, owner_repository, owner_ref, owner_run_id, owner_run_attempt, recovery_only)
           VALUES ($1,$2,$3,$4,$5,to_timestamp($6),$8,$9,$10,$11,$12,$13)
-          ON CONFLICT (branch_id, suite, fixture_key) DO UPDATE SET
+          ON CONFLICT (project_ref, suite, fixture_key) DO UPDATE SET
             attempt_id = EXCLUDED.attempt_id, fence = EXCLUDED.fence, expires_at = EXCLUDED.expires_at,
             owner_candidate_sha = EXCLUDED.owner_candidate_sha, owner_repository = EXCLUDED.owner_repository,
             owner_ref = EXCLUDED.owner_ref, owner_run_id = EXCLUDED.owner_run_id,
             owner_run_attempt = EXCLUDED.owner_run_attempt, recovery_only = EXCLUDED.recovery_only
-          WHERE billing_validation_control.fixture_leases.fence = $7::uuid`,
+          WHERE billing_validation_control.standalone_fixture_leases.fence IS NOT DISTINCT FROM $7::uuid`,
         [...keyValues(lease.key), lease.attemptId, lease.fence, lease.expiresAt, expectedFence,
           lease.candidateSha, lease.ownerRepository, lease.ownerRef,
           lease.ownerRunId, lease.ownerRunAttempt, lease.recoveryOnly === true]);
         if (result.rowCount === 0) refuse('lease_fence_lost');
+        await tx.appendLeaseHistory({ ...lease, workflow: { repository: lease.ownerRepository, ref: lease.ownerRef,
+          runId: lease.ownerRunId, runAttempt: lease.ownerRunAttempt } },
+        lease.eventType ?? (expectedFence === null ? 'acquired' : 'renewed'));
       },
       async deleteLease(key, attemptId, fence) {
-        const result = await queryClient.query(`DELETE FROM billing_validation_control.fixture_leases
-          WHERE branch_id = $1 AND suite = $2 AND fixture_key = $3 AND attempt_id = $4 AND fence = $5::uuid
+        const owner = await queryClient.query(`SELECT owner_run_id, owner_run_attempt, owner_repository,
+          owner_ref, extract(epoch FROM expires_at) AS expires_at_epoch
+          FROM billing_validation_control.standalone_fixture_leases
+          WHERE project_ref = $1 AND suite = $2 AND fixture_key = $3 AND attempt_id = $4 AND fence = $5::uuid
+          FOR UPDATE`, [...keyValues(key), attemptId, fence]);
+        const row = owner.rows?.[0];
+        if (!row) refuse('lease_fence_lost');
+        await tx.appendLeaseHistory({ key, attemptId, fence, expiresAt: Number(row.expires_at_epoch),
+          workflow: { repository: row.owner_repository, ref: row.owner_ref,
+            runId: row.owner_run_id, runAttempt: row.owner_run_attempt } }, 'released');
+        const result = await queryClient.query(`DELETE FROM billing_validation_control.standalone_fixture_leases
+          WHERE project_ref = $1 AND suite = $2 AND fixture_key = $3 AND attempt_id = $4 AND fence = $5::uuid
             AND expires_at > clock_timestamp()`, [...keyValues(key), attemptId, fence]);
         if (result.rowCount === 0) refuse('lease_fence_lost');
       },
@@ -575,12 +612,6 @@ export function createPostgresAttemptStore({ client, preflight, target, verifyRe
     verifyProviderObservation, verified.preflight.expectedEnvironment));
 }
 
-export async function installAttemptSchema({ client, preflight, target } = {}) {
-  assertWiring({ client, preflight, target });
-  const ddl = await readFile(new URL('./schema.sql', import.meta.url), 'utf8');
-  return client.transaction(async (queryClient) => {
-    if (typeof queryClient?.query !== 'function') refuse('store_client_invalid');
-    await queryClient.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
-    return queryClient.query(ddl);
-  });
+export async function installAttemptSchema({ client, policy, targetReadback, approval, migrationDirectory } = {}) {
+  return applyAttemptMigrations({ client, policy, targetReadback, approval, migrationDirectory });
 }

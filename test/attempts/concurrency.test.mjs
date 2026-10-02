@@ -11,6 +11,7 @@ function concurrentAdapter() {
   const resourceLocks = new Map();
   const stripeIntents = new Map();
   const locks = new Map();
+  let nextFence = 0;
   let delayLease = false;
   async function acquire(name, held) {
     const previous = locks.get(name) ?? Promise.resolve();
@@ -21,8 +22,7 @@ function concurrentAdapter() {
     held.push(release);
   }
   const resourceKeys = (environment) => [
-    { resourceType: 'supabase_branch', resourceId:
-      `${environment.database.projectRef}:${environment.database.branchId}` },
+    { resourceType: 'supabase_project', resourceId: environment.database.projectRef },
     { resourceType: 'stripe_account', resourceId: environment.stripe.accountId },
   ].sort((a, b) => `${a.resourceType}:${a.resourceId}`.localeCompare(`${b.resourceType}:${b.resourceId}`));
   const resourceMapKey = (resource) => `${resource.resourceType}:${resource.resourceId}`;
@@ -33,6 +33,10 @@ function concurrentAdapter() {
       const held = [];
       const tx = {
         now: async () => 1000,
+        nextFence: async () => {
+          nextFence += 1;
+          return `00000000-0000-4000-8000-${String(nextFence).padStart(12, '0')}`;
+        },
         lockAttempt: async (id) => acquire(`attempt:${id}`, held),
         lockRetention: async (scope) => acquire(`retention:${JSON.stringify(scope)}`, held),
         async lockResourceLocks(environment) {
@@ -109,12 +113,12 @@ function concurrentAdapter() {
   };
 }
 
-const key = { branchId: 'validation-child-1', suite: 'billing', fixtureKey: 'invoice-a' };
+const key = { projectRef: 'abcdefghijklmnopqrst', suite: 'billing', fixtureKey: 'invoice-a' };
 const candidateSha = 'a'.repeat(40);
 const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
   ref: 'refs/heads/main', runId: '100', runAttempt: 1,
   runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
-const environment = { database: { projectRef: 'abcdefghijklmnopqrst', branchId: key.branchId },
+const environment = { database: { projectRef: key.projectRef },
   deployment: { id: 'dpl_candidate123', origin: 'https://candidate.vercel.app' },
   stripe: { accountId: 'acct_synthetic123' } };
 const input = { attemptId: 'attempt-a', key, candidateSha, workflow, environment, ttlSeconds: 60 };
@@ -128,6 +132,7 @@ test('concurrent duplicate prepares serialize before reading attempt state', asy
   const store = createAttemptStore(adapter);
   adapter.delayNextLease();
   const [first, replay] = await Promise.all([store.prepare(input), store.prepare(input)]);
+  assert.equal(first.fence, '00000000-0000-4000-8000-000000000001');
   assert.equal(first.fence, replay.fence);
 });
 

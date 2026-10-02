@@ -4,10 +4,10 @@ import { createSnapshot, verifyRecheckSnapshot } from '../../src/contracts/attem
 import { createAttemptStore } from '../../src/attempts/store.mjs';
 
 const row = {
-  attemptId: 'attempt-123', key: { branchId: 'child-123', suite: 'billing', fixtureKey: 'invoice-a' },
+  attemptId: 'attempt-123', key: { projectRef: 'abcdefghijklmnopqrst', suite: 'billing', fixtureKey: 'invoice-a' },
   candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1, runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
-  environment: { database: { projectRef: 'abcdefghijklmnopqrst', branchId: 'child-123' },
+  environment: { database: { projectRef: 'abcdefghijklmnopqrst' },
     deployment: { id: 'dpl_candidate123', origin: 'https://candidate.vercel.app' },
     stripe: { accountId: 'acct_synthetic123' } },
   state: 'collected', cleanupStatus: 'pending', resourceIds: ['cus_synthetic'],
@@ -85,7 +85,7 @@ test('retention admission contract rejects accessors and malformed quota/project
   let transactions = 0;
   const store = createAttemptStore({ async transaction() { transactions++; } });
   const validInput = {
-    attemptId: 'attempt-retention', key: { branchId: 'child-123', suite: 'billing', fixtureKey: 'invoice-a' },
+    attemptId: 'attempt-retention', key: { projectRef: 'abcdefghijklmnopqrst', suite: 'billing', fixtureKey: 'invoice-a' },
     candidateSha: 'a'.repeat(40), workflow: row.workflow, environment: row.environment, ttlSeconds: 60,
     retentionPolicy: { version: 1, quotas: {
       attempts: 10, databaseRows: 100, authUsers: 10, stripeObjects: 100,

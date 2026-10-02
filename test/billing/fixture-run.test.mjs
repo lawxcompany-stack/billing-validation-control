@@ -15,11 +15,11 @@ const capacity = Object.freeze({ requested: Object.freeze({
   attempts: 1, databaseRows: 4, authUsers: 0, stripeObjects: 0,
 }) });
 
-function attemptContext({ currentFence, requested = capacity.requested, branchId = environment.database.branchId,
+function attemptContext({ currentFence, requested = capacity.requested, projectRef = environment.database.projectRef,
   admitted = true, attemptId = 'attempt-task6' } = {}) {
   const parts = makeAttemptParts({ attemptId });
   const owner = { ...parts.owner, environment: {
-    ...environment, database: { ...environment.database, branchId },
+    ...environment, database: { projectRef },
   } };
   if (admitted) Object.defineProperties(owner, {
     reservationId: { value: 'd74cf90a-0c2d-4f90-9d95-7727fe43260c', enumerable: false },
@@ -65,8 +65,7 @@ function createContext(parts, owner, attempts = parts.attempts) {
 
 function offlineReaders(store) {
   const create = needExport(observations, 'createIndependentBillingReaders');
-  const supabaseIdentity = { projectRef: environment.database.projectRef,
-    branchId: environment.database.branchId, readOnly: true };
+  const supabaseIdentity = { projectRef: environment.database.projectRef, readOnly: true };
   const stripeIdentity = { accountId: environment.stripe.accountId, webhookEndpointId: 'we_task6endpoint',
     webhookUrl: `${environment.deployment.origin}/api/stripe/webhook`, livemode: false, readOnly: true };
   const supabaseSource = {
@@ -101,8 +100,7 @@ function offlineReaders(store) {
 
 function offlinePublisher(parts, owner, store, { insertError } = {}) {
   const create = needExport(supabase, 'createSupabaseFixturePublisher');
-  const identity = { projectRef: environment.database.projectRef,
-    branchId: environment.database.branchId, appendOnly: true };
+  const identity = { projectRef: environment.database.projectRef, appendOnly: true };
   const capabilities = { transactionalFence: true, transactionalReservation: true,
     rejectsExistingIds: true, update: false, delete: false, authAdmin: false };
   const adapter = {
@@ -131,11 +129,10 @@ function integratedFixtureRig({ databaseRows = 2 } = {}) {
   const owner = { ...parts.owner, reservationId: 'reservation-integrated', capacity: {
     requested: { attempts: 1, databaseRows, authUsers: 0, stripeObjects: 0 },
   } };
-  const key = { branchId: environment.database.branchId, suite: 'billing', fixtureKey: 'fixture-integrated' };
+  const key = { projectRef: environment.database.projectRef, suite: 'billing', fixtureKey: 'fixture-integrated' };
   const now = 1_000;
   const locks = [
-    { resourceType: 'supabase_branch',
-      resourceId: `${environment.database.projectRef}:${environment.database.branchId}` },
+    { resourceType: 'supabase_project', resourceId: environment.database.projectRef },
     { resourceType: 'stripe_account', resourceId: environment.stripe.accountId },
   ].map((resource) => ({ ...resource, attemptId: owner.attemptId, fence: owner.fence,
     candidateSha: owner.candidateSha, workflow: owner.workflow, environment: owner.environment,
@@ -150,8 +147,7 @@ function integratedFixtureRig({ databaseRows = 2 } = {}) {
       ownerRunAttempt: owner.workflow.runAttempt, recoveryOnly: false },
     locks,
     reservation: { reservationId: owner.reservationId, attemptId: owner.attemptId,
-      scope: { projectRef: environment.database.projectRef,
-        branchId: environment.database.branchId, stripeAccountId: environment.stripe.accountId },
+      scope: { projectRef: environment.database.projectRef, stripeAccountId: environment.stripe.accountId },
       projection: { attempts: 1, databaseRows, authUsers: 0, stripeObjects: 0 },
       fixtureRowsUsed: 0 },
     receipt: null,
@@ -229,8 +225,7 @@ function integratedFixtureRig({ databaseRows = 2 } = {}) {
 
 function integratedPublisher(rig, store, { insertError } = {}) {
   const create = needExport(supabase, 'createSupabaseFixturePublisher');
-  const identity = { projectRef: environment.database.projectRef,
-    branchId: environment.database.branchId, appendOnly: true };
+  const identity = { projectRef: environment.database.projectRef, appendOnly: true };
   const adapter = {
     identity,
     capabilities: { transactionalFence: true, transactionalReservation: true,
@@ -339,13 +334,13 @@ test('fixture resources receive fresh cryptographic IDs in an attempt/case names
   assert.equal(store.fixtureRpc.length, 3);
 });
 
-test('missing admission, insufficient reservation, wrong branch, stale fence, or missing readers yield zero fixture RPCs', async () => {
+test('missing admission, insufficient reservation, wrong project, stale fence, or missing readers yield zero fixture RPCs', async () => {
   const createRun = needExport(fixtureRun, 'createAttemptFixtureRun');
 
   for (const variant of [
     { admitted: false },
     { requested: { attempts: 1, databaseRows: 0, authUsers: 0, stripeObjects: 0 } },
-    { branchId: 'wrong-validation-branch' },
+    { projectRef: 'mnopqrstabcdefghijkl' },
     { currentFence: 'successor-fence' },
   ]) {
     const parts = attemptContext(variant);
@@ -399,7 +394,7 @@ test('each fixture write is fenced, reservation-bound, insert-only, and independ
   assert.equal(store.fixtureRpc[0].attemptId, rig.owner.attemptId);
   assert.equal(store.fixtureRpc[0].reservationId, rig.owner.reservationId);
   assert.equal(store.fixtureRpc[0].fence, rig.owner.fence);
-  assert.equal(store.fixtureRpc[0].environment.database.branchId, environment.database.branchId);
+  assert.deepEqual(store.fixtureRpc[0].environment.database, { projectRef: environment.database.projectRef });
   assert.equal(store.fixtureRpc[0].synthetic, true);
   assert.match(store.fixtureRpc[0].transaction.transactionId, UUID);
   assert.equal(store.fixtureRpc[0].transaction.reservationLocked, true);
@@ -439,7 +434,7 @@ test('integrated publisher and concrete attempt store refuse invalid reservation
       'retention_attempt_settled'],
     ['reservation attempt mismatch', (rig) => { rig.state.reservation.attemptId = 'attempt-other'; },
       'fixture_reservation_invalid'],
-    ['reservation scope mismatch', (rig) => { rig.state.reservation.scope.branchId = 'other-branch'; },
+    ['reservation scope mismatch', (rig) => { rig.state.reservation.scope.projectRef = 'mnopqrstabcdefghijkl'; },
       'fixture_reservation_invalid'],
     ['reservation capacity too small', (rig) => { rig.state.reservation.projection.databaseRows = 0; },
       'fixture_reservation_insufficient'],
@@ -462,7 +457,7 @@ test('fixture writer rejects unconfigured or unsafe mutation capabilities before
   const parts = attemptContext();
   const unsafeCalls = [];
   const unsafe = create({ expectedEnvironment: environment, adapter: {
-    identity: { projectRef: environment.database.projectRef, branchId: environment.database.branchId,
+    identity: { projectRef: environment.database.projectRef, branchId: 'synthetic-branch',
       appendOnly: false },
     capabilities: { transactionalFence: false, transactionalReservation: false, rejectsExistingIds: false,
       update: true, delete: true, authAdmin: true },

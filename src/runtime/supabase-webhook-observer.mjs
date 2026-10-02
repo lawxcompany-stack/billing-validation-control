@@ -216,7 +216,7 @@ function snapshotExactDataRecord(value, keys) {
 function snapshotExpectedEnvironment(value) {
   const top = snapshotExactDataRecord(value, ['database', 'deployment', 'stripe']);
   if (!top) return null;
-  const database = snapshotExactDataRecord(top.database, ['projectRef', 'branchId']);
+  const database = snapshotExactDataRecord(top.database, ['projectRef']);
   const deployment = snapshotExactDataRecord(top.deployment, ['id', 'origin']);
   const stripe = snapshotExactDataRecord(top.stripe, ['accountId']);
   if (!database || !deployment || !stripe) return null;
@@ -333,18 +333,16 @@ export function createSupabaseWebhookObserver({ expectedEnvironment, password, c
   let validEnvironment = false;
   try { validEnvironment = environment !== null && isValidExpectedEnvironment(environment); } catch { /* Invalid bindings fail closed. */ }
   const pinnedProjectRef = CONTROL_POLICY.database?.projectRef;
-  const pinnedBranchId = CONTROL_POLICY.database?.branchId;
-  if (!validEnvironment || environment.database.projectRef !== pinnedProjectRef ||
-      environment.database.branchId !== pinnedBranchId || typeof password !== 'string' ||
+  if (!validEnvironment || !pinnedProjectRef || environment.database.projectRef !== pinnedProjectRef ||
+      typeof password !== 'string' ||
       password.length === 0 || password.length > 4096 || /[\0\r\n]/u.test(password) ||
       typeof clientFactory !== 'function') {
     refuse('supabase_webhook_observer_input_invalid');
   }
 
   const projectRef = environment.database.projectRef;
-  const branchId = environment.database.branchId;
   const host = `db.${projectRef}.supabase.co`;
-  const identity = Object.freeze({ projectRef, branchId, readerId: READER_ID, readOnly: true });
+  const identity = Object.freeze({ projectRef, readerId: READER_ID, readOnly: true });
   const clientConfig = Object.freeze({
     host,
     port: 5432,
