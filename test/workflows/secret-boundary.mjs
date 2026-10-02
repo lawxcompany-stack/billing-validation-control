@@ -276,6 +276,7 @@ function workflowConfigurationStrings(workflow) {
 
 function assertNoProviderRuntimeEnvironment(workflow, path) {
   const blocked = /^(?:DATABASE_URL|POSTGRES(?:_|$)|SUPABASE(?:_|$)|STRIPE(?:_|$)|VERCEL_(?:ACCESS_TOKEN|API_TOKEN|TOKEN)(?:_|$))/iu;
+  const providerReferences = /\$\{\{\s*(?:vars|secrets)\.([A-Za-z_][A-Za-z0-9_]*)/giu;
   const environments = [['workflow', workflow.env]];
   for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
     environments.push([jobId, job.env], ...(job.steps ?? []).map((step) => [jobId, step.env]));
@@ -283,6 +284,11 @@ function assertNoProviderRuntimeEnvironment(workflow, path) {
   for (const [scope, environment] of environments) {
     for (const [key, value] of Object.entries(environment ?? {})) {
       assert.ok(!blocked.test(key), `${path}:${scope} must not import provider runtime configuration`);
+      if (typeof value === 'string') {
+        for (const [, name] of value.matchAll(providerReferences)) {
+          assert.ok(!blocked.test(name), `${path}:${scope} must not import provider runtime configuration`);
+        }
+      }
       if (scope === 'workflow' && typeof value === 'string') {
         assert.ok(!/\$\{\{[^}]*\bsecrets\b[^}]*\}\}/iu.test(value),
           `${path}:workflow env must not import secrets`);

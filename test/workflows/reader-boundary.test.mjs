@@ -43,6 +43,22 @@ test('candidate policy job and financial placeholder still cannot receive secret
   }
 });
 
+for (const [scope, reference, mutate] of [
+  ['workflow', '${{ vars.DATABASE_URL }}', (value, env) => { value.env = env; }],
+  ['job', '${{ vars.SUPABASE_VALIDATION_DATABASE_URL }}', (value, env) => { value.jobs.test.env = env; }],
+  ['step', '${{ vars.DATABASE_URL }}', (value, env) => { value.jobs.test.steps[1].env = env; }],
+  ['workflow', '${{ secrets.DATABASE_URL }}', (value, env) => { value.env = env; }],
+  ['job', '${{ secrets.DATABASE_URL }}', (value, env) => { value.jobs.test.env = env; }],
+  ['step', '${{ secrets.DATABASE_URL }}', (value, env) => { value.jobs.test.steps[1].env = env; }],
+]) {
+  const source = reference.includes('vars.') ? 'vars' : 'secrets';
+  test(`workflow boundary rejects indirect ${source} database config reference in ${scope} env`, () => {
+    const value = workflow();
+    mutate(value, { APP_CONFIG: reference });
+    assert.throws(() => assertWorkflowSecretBoundary(value, path));
+  });
+}
+
 for (const [name, mutate] of [
   ['a local credential file', (value) => { value.jobs.test.steps[1].run = 'node --env-file=.env.local runner/collect.mjs'; }],
   ['a workflow-level env provider credential name', (value) => {
