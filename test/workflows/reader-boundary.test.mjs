@@ -48,8 +48,14 @@ for (const [name, mutate] of [
   ['a Production variable ref', (value) => {
     value.jobs.test.env = { SUPABASE_PROJECT_REF: '${{ vars.PRODUCTION_SUPABASE_PROJECT_REF }}' };
   }],
-  ['a Production database URL', (value) => {
-    value.jobs.test.env = { DATABASE_URL: 'postgresql://synthetic:synthetic@db.production.supabase.co:5432/postgres' };
+  ['an opaque Supabase URL', (value) => {
+    const ref = 'kvmmnwmfgkhipuxmuxbr';
+    value.jobs.test.steps[1].run = `printf '%s' 'postgresql://synthetic:synthetic@db.${ref}.supabase.co:5432/postgres'`;
+  }],
+  ['an opaque JWT credential', (value) => {
+    value.jobs.test.env = {
+      CANDIDATE_CREDENTIAL: 'eyJhbGciOiJIUzI1NiJ9.eyJyZWYiOiJ3bGtva2ZkYWF0dmdnaXR0aWtjciIsInJvbGUiOiJzZXJ2aWNlX3JvbGUifQ.synthetic_signature_123456',
+    };
   }],
   ['a Live Stripe key', (value) => { value.jobs.test.env = { STRIPE_SECRET_KEY: 'sk_live_synthetic12345678' }; }],
 ]) {
@@ -59,3 +65,9 @@ for (const [name, mutate] of [
     assert.throws(() => assertWorkflowSecretBoundary(value, path));
   });
 }
+
+test('workflow boundary ignores Production and Live words in harmless step labels', () => {
+  const value = workflow();
+  value.jobs.test.steps[1].name = 'Reject Production credentials and Live destinations';
+  assert.doesNotThrow(() => assertWorkflowSecretBoundary(value, path));
+});

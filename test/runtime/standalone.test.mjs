@@ -71,18 +71,25 @@ test('legacy branch policy cannot remain a final validation target even with com
   assert.deepEqual(f.calls, []);
 });
 
-test('known historical Production refs stay blocked when policy deny fields are edited together', () => {
+test('opaque denylisted Supabase refs with ordinary URLs refuse before mutation', () => {
   for (const blockedRef of ['kvmmnwmfgkhipuxmuxbr', 'gzemotsvxlgomamhtfie',
     'zjvqjdntasprusoqfsgw', 'zyxwvutsrqponmlkjihg']) {
     assert.equal(isValidStandaloneProjectRef(blockedRef), false, `${blockedRef} is immutable-denylisted`);
     const database = { ...databasePolicy, projectRef: blockedRef,
-      productionProjectRef: 'cccccccccccccccccccc', branchProjectRefs: [],
       connection: { ...databasePolicy.connection, host: `db.${blockedRef}.supabase.co` } };
-    assert.throws(() => assertSupabaseRuntimeConfiguration({ policy: { ...standalonePolicy, database }, token,
-      trustedConfiguration: { ...trustedConfiguration, SUPABASE_VALIDATION_PROJECT_REF: blockedRef,
-        databaseUrl: `postgresql://billing_validation_reader:synthetic-password@db.${blockedRef}.supabase.co:5432/postgres` },
-      fetchImpl: async () => { assert.fail('blocked ref must fail before any request'); } }),
+    const blockedPolicy = { ...standalonePolicy, database };
+    const blockedConfiguration = { ...trustedConfiguration,
+      SUPABASE_VALIDATION_PROJECT_REF: blockedRef,
+      databaseUrl: `postgresql://billing_validation_reader:synthetic-password@db.${blockedRef}.supabase.co:5432/postgres` };
+    let mutations = 0;
+    assert.throws(() => {
+      assertSupabaseRuntimeConfiguration({ policy: blockedPolicy, token,
+        trustedConfiguration: blockedConfiguration,
+        fetchImpl: async () => { assert.fail('blocked ref must fail before any request'); } });
+      mutations += 1;
+    },
     { code: 'supabase_policy_invalid' });
+    assert.equal(mutations, 0);
   }
 });
 

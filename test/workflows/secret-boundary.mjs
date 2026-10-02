@@ -252,13 +252,57 @@ function assertLocalAuthorizationBoundary(workflow) {
   });
 }
 
+function workflowConfigurationStrings(workflow) {
+  const configuration = structuredClone(workflow);
+  delete configuration.name;
+  for (const job of Object.values(configuration.jobs ?? {})) {
+    delete job.name;
+    for (const step of job.steps ?? []) delete step.name;
+  }
+  for (const event of Object.values(configuration.on ?? {})) {
+    for (const input of Object.values(event.inputs ?? {})) delete input.description;
+  }
+
+  const strings = [];
+  function visit(value) {
+    if (typeof value === 'string') strings.push(value);
+    else if (Array.isArray(value)) value.forEach(visit);
+    else if (value !== null && typeof value === 'object') Object.values(value).forEach(visit);
+  }
+  visit(configuration);
+  return strings;
+}
+
+function assertNoProviderRuntimeEnvironment(workflow, path) {
+  const blocked = /^(?:DATABASE_URL|POSTGRES(?:_|$)|SUPABASE(?:_|$)|STRIPE(?:_|$)|VERCEL_(?:ACCESS_TOKEN|API_TOKEN|TOKEN)(?:_|$))/iu;
+  for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
+    const maps = [job.env, ...(job.steps ?? []).map((step) => step.env)];
+    for (const environment of maps) {
+      for (const key of Object.keys(environment ?? {})) {
+        assert.ok(!blocked.test(key), `${path}:${jobId} must not import provider runtime configuration`);
+      }
+    }
+  }
+}
+
 export function assertWorkflowSecretBoundary(workflow, path) {
   // A workflow may not import local credentials or select a Production/Live
-  // source through an env value, expression, ref, URL, or literal key.
-  const serializedWorkflow = JSON.stringify(workflow);
-  assert.ok(!/\.env\.local\b/iu.test(serializedWorkflow), `${path} must not load local credentials`);
-  assert.ok(!/(?:^|[^a-z0-9])(?:production|prod|live)(?:$|[^a-z0-9])/iu.test(serializedWorkflow),
+  // source through executable/configuration values. Presentation labels do not
+  // choose a credential source or destination.
+  const configurationStrings = workflowConfigurationStrings(workflow);
+  assert.ok(!configurationStrings.some((value) => /\.env\.local\b/iu.test(value)),
+    `${path} must not load local credentials`);
+  assert.ok(!configurationStrings.some((value) => /(?:^|[^a-z0-9])(?:production|prod|live)(?:$|[^a-z0-9])/iu.test(value)),
     `${path} must not select Production or Live credentials or destinations`);
+  assert.ok(!configurationStrings.some((value) => /\b(?:https?|postgres(?:ql)?):\/\/[^\s"'<>]*\.supabase\.co\b/iu.test(value)),
+    `${path} must not import a Supabase destination`);
+  assert.ok(!configurationStrings.some((value) => /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/u.test(value)),
+    `${path} must not import a JWT credential`);
+  assert.ok(!configurationStrings.some((value) => /\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{8,}\b/iu.test(value)),
+    `${path} must not import a Supabase API key`);
+  assert.ok(!configurationStrings.some((value) => /\bwhsec_[A-Za-z0-9_]{8,}\b/u.test(value)),
+    `${path} must not import a Stripe webhook secret`);
+  assertNoProviderRuntimeEnvironment(workflow, path);
   if (path === workflowPaths[2]) return assertLocalAuthorizationBoundary(workflow);
   assert.deepEqual(workflow.permissions, { contents: 'read' }, `${path} must keep token permissions read-only`);
 
