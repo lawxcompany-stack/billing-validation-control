@@ -8,7 +8,7 @@ import { resolveCandidate } from '../../src/github/candidate.mjs';
 import { readCandidatePrerequisites } from '../../src/github/candidate-reader.mjs';
 
 const workflow = YAML.parse(readFileSync('.github/workflows/validate-billing.yml', 'utf8'));
-const repository = 'lawxcompany-stack/billing-validation-control';
+const repository = 'lawx-ai/billing-validation-control';
 const candidateRepository = 'lawxcompany-stack/Plataforma-LawX';
 const environments = ['billing-validation-reader', 'billing-validation-attestation',
   'billing-validation-tests', 'billing-validation-publisher', 'billing-validation-control'];
@@ -20,6 +20,15 @@ const needs = { authorize: { result: 'success', outputs: { operation: 'collect',
   'control-store': { result: 'success' }, test: { result: 'success' },
   'validate-result-input': { result: 'success' }, 'attest-result': { result: 'success' },
   'verify-result': { result: 'success' } };
+
+for (const [id, job] of Object.entries(workflow.jobs).filter(([, job]) => job.if.includes('workflow_dispatch'))) {
+  test(`${id} dispatch guard pins the transferred control repository and stable ID`, () => {
+    assert.match(job.if, /github\.repository\s*==\s*'lawx-ai\/billing-validation-control'/u);
+    assert.match(job.if, /github\.repository_id\s*==\s*'1384018279'/u);
+    assert.equal(eligible(id), true);
+    assert.equal(eligible(id, { ...github, repository: 'lawxcompany-stack/billing-validation-control' }), false);
+  });
+}
 
 function eligible(jobId, context = github, dependencies = needs, cancelled = false) {
   const expression = workflow.jobs[jobId].if.slice(3, -2)
@@ -178,11 +187,55 @@ test('trusted jobs never checkout or execute candidate inputs and keep shell exp
   }
 });
 
-const dispatchContext = { repository, ref: github.ref, defaultBranch: 'main', refProtected: true };
+const dispatchContext = { repository, repositoryId: github.repository_id,
+  ref: github.ref, defaultBranch: 'main', refProtected: true };
 const sha = 'a'.repeat(40);
 const input = { operation: 'collect', candidate_repository: candidateRepository, candidate_sha: sha,
   source_run_id: '', source_run_attempt: '', runner_label: `billing-validation-${'b'.repeat(32)}`,
   supervisor_activation: 'c'.repeat(64) };
+
+function runtimeControlEnv(step, context = github) {
+  return Object.fromEntries(Object.entries(step.env).filter(([key]) => key.startsWith('CONTROL_'))
+    .map(([key, expression]) => [key, String(vm.runInNewContext(expression.slice(3, -2), { github: context }))]));
+}
+
+test('inline dispatch parser receives the runtime repository ID and refuses absent or foreign IDs', () => {
+  const step = workflow.jobs.authorize.steps.find(step => step.id === 'authorize');
+  assert.equal(step.env.CONTROL_REPOSITORY_ID, '${{ github.repository_id }}');
+  const source = step.run.match(/<<'NODE'\n([\s\S]*?)\nNODE\n?$/u)?.[1]
+    .replace(/^import .*;\n/gmu, '');
+  assert.ok(source);
+  for (const repositoryId of ['1384018279', undefined, '999']) {
+    const env = { ...runtimeControlEnv(step), DISPATCH_INPUTS: JSON.stringify(input), GITHUB_OUTPUT: 'output' };
+    if (repositoryId === undefined) delete env.CONTROL_REPOSITORY_ID;
+    else env.CONTROL_REPOSITORY_ID = repositoryId;
+    const processFixture = { env, exitCode: 0 }, receipts = [], errors = [];
+    vm.runInNewContext(source, { process: processFixture, parseDispatch,
+      appendFileSync: (path, text) => { assert.equal(path, 'output'); receipts.push(text); },
+      console: { log() {}, error: text => errors.push(text) } });
+    assert.equal(processFixture.exitCode, repositoryId === '1384018279' ? 0 : 1);
+    assert.deepEqual(receipts, repositoryId === '1384018279'
+      ? [`operation=collect\ncandidate_sha=${sha}\nrunner_label=${input.runner_label}\nactivation_commitment=${input.supervisor_activation}\n`] : []);
+    assert.deepEqual(errors, repositoryId === '1384018279' ? [] : ['Dispatch refused (control_repository_not_allowed).']);
+  }
+});
+
+test('candidate reader receives the runtime repository ID before any candidate API access', async () => {
+  const step = workflow.jobs.reader.steps.find(step => step.id === 'candidate');
+  assert.equal(step.env.CONTROL_REPOSITORY_ID, '${{ github.repository_id }}');
+  const env = runtimeControlEnv(step);
+  const context = { repository: env.CONTROL_REPOSITORY, repositoryId: env.CONTROL_REPOSITORY_ID,
+    ref: env.CONTROL_REF, defaultBranch: env.CONTROL_DEFAULT_BRANCH,
+    refProtected: env.CONTROL_REF_PROTECTED === 'true', eventName: env.CONTROL_EVENT_NAME };
+  for (const repositoryId of [context.repositoryId, undefined, '999']) {
+    const calls = [];
+    await assert.rejects(readCandidatePrerequisites({ candidateSha: sha, context: { ...context, repositoryId },
+      api: { async get(path) { calls.push(path); return []; } } }),
+    { code: repositoryId === '1384018279' ? 'candidate_pr_not_found' : 'control_repository_not_allowed' });
+    assert.deepEqual(calls, repositoryId === '1384018279'
+      ? [`/repos/${candidateRepository}/commits/${sha}/pulls?per_page=100&page=1`] : []);
+  }
+});
 test('candidate IDs remain validated data, including shell-injection spellings', () => {
   assert.equal(parseDispatch(input, dispatchContext).candidateSha, sha);
   for (const value of ['$(touch /tmp/task4)', '`id`', 'a\noperation=recheck', sha + ';id']) {

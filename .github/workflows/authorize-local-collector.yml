@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   authorize:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -62,7 +62,7 @@ jobs:
         run: node scripts/authorize-local-collector.mjs
 
   reader:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' }}
     needs: authorize
     runs-on: ubuntu-latest
     environment: billing-validation-reader
@@ -113,7 +113,7 @@ jobs:
         run: node scripts/read-local-authorization-candidate.mjs
 
   attest-activation:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.reader.result == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.reader.result == 'success' }}
     needs: [authorize, reader]
     runs-on: ubuntu-latest
     environment: billing-validation-attestation
