@@ -135,7 +135,7 @@ test('control-store 0003 pins executable verifier SQL while 0004 adds the verifi
   const verifierRoleMigration = verifierRoleMigrationBytes.toString('utf8');
 
   assert.equal(sha256(oldVerifierBytes), '56ca6c77487900bbd9affc934665e08f5bc5246e42c1adb9a077d828c8034698');
-  assert.equal(sha256(verifierRoleMigrationBytes), '40e47a94aaab6e8513133a11896c8338e177588d1bd8278c64779767ea16f267');
+  assert.equal(sha256(verifierRoleMigrationBytes), 'b7320a78a302f3164d013232003fdc30279f31748a6f74de29b4440d7d555bcc');
   assert.match(verifierRoleMigration,
     /REVOKE EXECUTE ON FUNCTION billing_validation_control\.verify_attempt_control_store\(\)\s+FROM\b[^;]*\bbilling_validation_runtime\b[^;]*;/u);
   assert.match(verifierRoleMigration, /GRANT EXECUTE ON FUNCTION billing_validation_control\.verify_attempt_control_store\(\) TO billing_validation_verifier;/u);
@@ -206,6 +206,22 @@ test('renderer emits one guarded transaction in baseline then forward-migration 
   assert.match(sql, /control_store_install_receipts/u);
   assert.match(sql, /project_ref[\s\S]*baseline_sha256/u);
   assert.match(sql, /COMMIT;\s*$/u);
+});
+
+test('renderer temporarily grants SET ROLE to a CREATEROLE operator then revokes it before commit', async () => {
+  const { loadControlStoreBootstrapPlan, renderControlStoreBootstrap } = await loadApi();
+  const sql = renderControlStoreBootstrap(await loadControlStoreBootstrapPlan());
+  const createdOwner = sql.indexOf('CREATE ROLE billing_validation_owner NOLOGIN;');
+  const ownerGrant = sql.indexOf('GRANT billing_validation_owner TO postgres WITH INHERIT FALSE, SET TRUE;');
+  const setOwner = sql.indexOf('SET LOCAL ROLE billing_validation_owner;');
+  const resetRole = sql.indexOf('RESET ROLE;');
+  const revokeOwner = sql.indexOf('REVOKE billing_validation_owner FROM postgres;');
+  const commit = sql.lastIndexOf('COMMIT;');
+
+  assert.ok(createdOwner >= 0 && createdOwner < ownerGrant,
+    'the owner role must exist before the bootstrap operator receives SET membership');
+  assert.ok(ownerGrant < setOwner && setOwner < resetRole && resetRole < revokeOwner && revokeOwner < commit,
+    'the operator membership must be temporary and removed before the transaction commits');
 });
 
 test('operator migration renderer emits only the pending control-store suffix', async () => {

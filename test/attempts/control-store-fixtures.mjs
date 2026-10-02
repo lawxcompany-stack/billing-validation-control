@@ -137,14 +137,15 @@ export function parseControlStoreLocalTestUrl(value) {
     const hostname = url.hostname.replace(/^\[|\]$/gu, '');
     const loopback = hostname === '127.0.0.1' || hostname === '::1';
     const port = Number(url.port);
+    const user = decodeURIComponent(url.username);
     if (!['postgres:', 'postgresql:'].includes(url.protocol) || !loopback || !Number.isInteger(port) ||
-        port < 1 || port > 65535 || decodeURIComponent(url.username) !== 'postgres' ||
+        port < 1 || port > 65535 || !['postgres', 'billing_control_test_admin'].includes(user) ||
         url.pathname !== '/postgres' || url.search !== '' || url.hash !== '') refuseTarget();
     return {
       host: hostname,
       port,
       database: 'postgres',
-      user: 'postgres',
+      user,
       password: decodeURIComponent(url.password),
     };
   } catch {
@@ -168,7 +169,14 @@ export async function inspectControlStoreRuntimeRole(client) {
       runtime.rolbypassrls AS runtime_bypass_rls,
       pg_catalog.pg_has_role(runtime.oid, owner.oid, 'MEMBER') AS runtime_member_of_owner,
       EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members AS membership
-        WHERE membership.member = runtime.oid OR membership.roleid = runtime.oid)
+        WHERE (membership.member = runtime.oid OR membership.roleid = runtime.oid)
+          AND NOT (
+            bootstrap_operator.oid IS NOT NULL
+            AND membership.roleid = runtime.oid AND membership.member = bootstrap_operator.oid
+            AND membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option
+            AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS grantor
+              WHERE grantor.oid = membership.grantor AND grantor.rolsuper)
+          ))
         AS runtime_has_role_membership,
       EXISTS (SELECT 1 FROM pg_catalog.pg_class AS relation
         WHERE relation.relnamespace = namespace.oid AND relation.relowner = runtime.oid)
@@ -191,6 +199,7 @@ export async function inspectControlStoreRuntimeRole(client) {
       owner.oid AS owner_oid, runtime.oid AS runtime_oid, namespace.oid AS schema_oid
     FROM pg_catalog.pg_roles AS owner
     CROSS JOIN pg_catalog.pg_roles AS runtime
+    LEFT JOIN pg_catalog.pg_roles AS bootstrap_operator ON bootstrap_operator.rolname = 'postgres'
     JOIN pg_catalog.pg_namespace AS namespace ON namespace.nspname = $1
     WHERE owner.rolname = $2 AND runtime.rolname = $3`, [SCHEMA, OWNER_ROLE, RUNTIME_ROLE]);
   const role = roleResult.rows?.[0];

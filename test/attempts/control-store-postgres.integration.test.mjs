@@ -17,14 +17,31 @@ async function readVerifierGateDiagnostics(client) {
   const result = await client.query(`
     WITH state AS (
       SELECT owner.oid AS owner_oid, runtime.oid AS runtime_oid, verifier.oid AS verifier_oid,
+        bootstrap_operator.oid AS bootstrap_operator_oid,
         verifier_function.oid AS verifier_function_oid,
         verifier.rolcanlogin AS verifier_login, verifier.rolsuper AS verifier_superuser,
         verifier.rolcreaterole AS verifier_create_role, verifier.rolcreatedb AS verifier_create_database,
         verifier.rolreplication AS verifier_replication, verifier.rolbypassrls AS verifier_bypass_rls,
         pg_catalog.pg_has_role(verifier.oid, owner.oid, 'MEMBER') AS verifier_member_of_owner,
         EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members AS membership
-          WHERE membership.member = verifier.oid OR membership.roleid = verifier.oid)
+          WHERE (membership.member = verifier.oid OR membership.roleid = verifier.oid)
+            AND NOT (
+              bootstrap_operator.oid IS NOT NULL
+              AND membership.roleid = verifier.oid AND membership.member = bootstrap_operator.oid
+              AND membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option
+              AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS grantor
+                WHERE grantor.oid = membership.grantor AND grantor.rolsuper)
+            ))
           AS verifier_has_role_membership,
+        EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members AS membership
+          WHERE (membership.member = owner.oid OR membership.roleid = owner.oid)
+            AND NOT (
+              bootstrap_operator.oid IS NOT NULL
+              AND membership.roleid = owner.oid AND membership.member = bootstrap_operator.oid
+              AND membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option
+              AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS grantor
+                WHERE grantor.oid = membership.grantor AND grantor.rolsuper)
+            )) AS owner_has_role_membership,
         EXISTS (SELECT 1 FROM pg_catalog.pg_class AS relation
           WHERE relation.relnamespace = namespace.oid AND relation.relowner = verifier.oid)
           OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc AS routine
@@ -81,6 +98,7 @@ async function readVerifierGateDiagnostics(client) {
       CROSS JOIN pg_catalog.pg_roles AS anon
       CROSS JOIN pg_catalog.pg_roles AS authenticated
       CROSS JOIN pg_catalog.pg_roles AS service_role
+      LEFT JOIN pg_catalog.pg_roles AS bootstrap_operator ON bootstrap_operator.rolname = 'postgres'
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.nspname = $4
       JOIN pg_catalog.pg_proc AS verifier_function ON verifier_function.pronamespace = namespace.oid
         AND verifier_function.proname = 'verify_attempt_control_store' AND verifier_function.pronargs = 0
@@ -94,6 +112,7 @@ async function readVerifierGateDiagnostics(client) {
       'verifier_replication', verifier_replication, 'verifier_bypass_rls', verifier_bypass_rls,
       'verifier_member_of_owner', verifier_member_of_owner,
       'verifier_has_role_membership', verifier_has_role_membership,
+      'owner_has_role_membership', owner_has_role_membership,
       'verifier_owns_objects', verifier_owns_objects, 'owner_owns_objects', owner_owns_objects,
       'verifier_schema_usage', verifier_schema_usage, 'verifier_schema_create', verifier_schema_create,
       'verifier_table_privileges', verifier_table_privileges,
@@ -271,28 +290,45 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
 }, async () => {
   const { Client } = await import('pg');
   const connection = parseControlStoreLocalTestUrl(connectionUrl);
-  const client = new Client({ ...connection, connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
-  await client.connect();
+  assert.equal(connection.user, 'billing_control_test_admin',
+    'isolated PostgreSQL must use a non-bootstrap administrator to create the synthetic postgres operator');
+  const clusterAdmin = new Client({ ...connection, connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
+  await clusterAdmin.connect();
+  let client;
   try {
-    const identity = await client.query(`SELECT current_database() AS database_name,
+    const clusterIdentity = await clusterAdmin.query(`SELECT current_database() AS database_name,
       session_user AS session_role, current_user AS current_role,
       current_setting('server_version_num') AS version_num,
       role.rolsuper AS is_superuser
       FROM pg_catalog.pg_roles AS role WHERE role.rolname = current_user`);
-    assert.deepEqual(identity.rows, [{ database_name: 'postgres', session_role: 'postgres',
-      current_role: 'postgres', version_num: '170011', is_superuser: true }]);
+    assert.deepEqual(clusterIdentity.rows, [{ database_name: 'postgres', session_role: 'billing_control_test_admin',
+      current_role: 'billing_control_test_admin', version_num: '170011', is_superuser: true }]);
 
-    const preexisting = await client.query(`SELECT nspname FROM pg_catalog.pg_namespace
+    const preexisting = await clusterAdmin.query(`SELECT nspname FROM pg_catalog.pg_namespace
       WHERE nspname = $1`, [schema]);
     assert.deepEqual(preexisting.rows, [], 'the disposable database must start without a control schema');
-    const applicationRoles = await client.query(`SELECT rolname FROM pg_catalog.pg_roles
+    const applicationRoles = await clusterAdmin.query(`SELECT rolname FROM pg_catalog.pg_roles
       WHERE rolname IN ('anon', 'authenticated', 'service_role',
-        'billing_validation_owner', 'billing_validation_runtime', 'billing_validation_verifier')
+        'postgres', 'billing_validation_owner', 'billing_validation_runtime', 'billing_validation_verifier')
       ORDER BY rolname`);
-    assert.deepEqual(applicationRoles.rows, [], 'the disposable image must start with no Supabase/control roles');
+    assert.deepEqual(applicationRoles.rows, [], 'the disposable image must start without managed/control roles');
 
     // These no-login placeholders model only the three managed Supabase roles referenced by REVOKE/ACL SQL.
-    await client.query('CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN; CREATE ROLE service_role NOLOGIN;');
+    await clusterAdmin.query('CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN; CREATE ROLE service_role NOLOGIN;');
+    const postgresPassword = randomBytes(32).toString('base64url');
+    await clusterAdmin.query(`CREATE ROLE postgres WITH LOGIN SUPERUSER PASSWORD '${postgresPassword}'`);
+    await clusterAdmin.query('GRANT CONNECT, CREATE ON DATABASE postgres TO postgres');
+    client = new Client({ ...connection, user: 'postgres', password: postgresPassword,
+      connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
+    await client.connect();
+    const postgresIdentity = await client.query(`SELECT current_database() AS database_name,
+      session_user AS session_role, current_user AS current_role,
+      current_setting('server_version_num') AS version_num,
+      role.rolsuper AS is_superuser
+      FROM pg_catalog.pg_roles AS role WHERE role.rolname = current_user`);
+    assert.deepEqual(postgresIdentity.rows, [{ database_name: 'postgres', session_role: 'postgres',
+      current_role: 'postgres', version_num: '170011', is_superuser: true }]);
+
     const plan = await loadControlStoreBootstrapPlan();
     const bootstrapSql = renderControlStoreBootstrap(plan);
 
@@ -326,7 +362,61 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
     } finally {
       await client.query('ROLLBACK');
     }
-    await client.query(bootstrapSql);
+
+    // Supabase's `postgres` is a CREATEROLE/CREATEDB administrator, not a superuser.
+    // This is a synthetic role, separate from the cluster bootstrap administrator.
+    const operatorPassword = randomBytes(32).toString('base64url');
+    let operatorRoleMayBeDemoted = false;
+    let operatorClient;
+    try {
+      operatorRoleMayBeDemoted = true;
+      await clusterAdmin.query(`ALTER ROLE postgres WITH LOGIN NOSUPERUSER CREATEROLE CREATEDB
+        PASSWORD '${operatorPassword}'`);
+      operatorClient = new Client({ ...connection, user: 'postgres', password: operatorPassword,
+        connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
+      await operatorClient.connect();
+      const managedOperator = await operatorClient.query(`SELECT current_user, session_user,
+        role.rolsuper AS is_superuser, role.rolcreaterole AS can_create_roles,
+        role.rolcreatedb AS can_create_database
+        FROM pg_catalog.pg_roles AS role WHERE role.rolname = current_user`);
+      assert.deepEqual(managedOperator.rows, [{ current_user: 'postgres', session_user: 'postgres',
+        is_superuser: false, can_create_roles: true, can_create_database: true }]);
+
+      await operatorClient.query(bootstrapSql);
+      const memberships = await operatorClient.query(`SELECT granted.rolname AS granted_role,
+        member.rolname AS member_role, grantor.rolname AS grantor_role,
+        membership.admin_option, membership.inherit_option, membership.set_option
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member ON member.oid = membership.member
+        JOIN pg_catalog.pg_roles AS grantor ON grantor.oid = membership.grantor
+        WHERE granted.rolname IN ('billing_validation_owner', 'billing_validation_runtime',
+          'billing_validation_verifier') AND member.rolname = 'postgres'
+        ORDER BY granted.rolname`);
+      assert.deepEqual(memberships.rows, [
+        { granted_role: 'billing_validation_owner', member_role: 'postgres',
+          grantor_role: 'billing_control_test_admin', admin_option: true, inherit_option: false, set_option: false },
+        { granted_role: 'billing_validation_runtime', member_role: 'postgres',
+          grantor_role: 'billing_control_test_admin', admin_option: true, inherit_option: false, set_option: false },
+        { granted_role: 'billing_validation_verifier', member_role: 'postgres',
+          grantor_role: 'billing_control_test_admin', admin_option: true, inherit_option: false, set_option: false },
+      ], 'only PostgreSQL’s automatic non-inheriting, non-settable CREATEROLE memberships may remain');
+      await assert.rejects(operatorClient.query('SET ROLE billing_validation_owner'),
+        (error) => error.code === '42501',
+        'the temporary SET ROLE grant must be revoked before bootstrap commits');
+    } finally {
+      if (operatorClient) {
+        await operatorClient.end();
+      }
+      if (operatorRoleMayBeDemoted) {
+        await clusterAdmin.query('ALTER ROLE postgres WITH LOGIN SUPERUSER CREATEROLE CREATEDB');
+      }
+    }
+
+    const restoredOperator = await client.query(`SELECT rolcanlogin, rolsuper, rolcreaterole, rolcreatedb
+      FROM pg_catalog.pg_roles WHERE rolname = 'postgres'`);
+    assert.deepEqual(restoredOperator.rows, [{ rolcanlogin: true, rolsuper: true,
+      rolcreaterole: true, rolcreatedb: true }], 'the disposable superuser must be restored before later probes');
 
     const roleState = await client.query(`SELECT rolname, rolcanlogin, rolsuper, rolcreaterole,
         rolcreatedb, rolreplication, rolbypassrls
@@ -399,6 +489,31 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
     } finally {
       await client.query('ROLLBACK');
     }
+
+    for (const { options, changed } of [
+      { options: 'WITH ADMIN TRUE, INHERIT TRUE, SET FALSE', changed: 'INHERIT' },
+      { options: 'WITH ADMIN TRUE, INHERIT FALSE, SET TRUE', changed: 'SET' },
+      { options: 'WITH ADMIN FALSE, INHERIT FALSE, SET FALSE', changed: 'ADMIN' },
+    ]) {
+      await client.query('BEGIN');
+      try {
+        // A superuser simulates drift in each field of the immutable automatic row.
+        await client.query(`ALTER ROLE ${verifierRole} LOGIN`);
+        await client.query(`GRANT ${verifierRole} TO postgres ${options}`);
+        await client.query(`SET LOCAL SESSION AUTHORIZATION ${verifierRole}`);
+        const changedMembershipReceipt = await client.query(`SELECT * FROM ${schema}.verify_attempt_control_store()`);
+        assert.deepEqual(changedMembershipReceipt.rows, [],
+          `verifier must reject an automatic CREATEROLE membership with changed ${changed} option`);
+        const changedMembershipGates = await readVerifierGateDiagnostics(client);
+        assert.equal(changedMembershipGates.verifier_has_role_membership, true,
+          `diagnostics must identify changed ${changed} option as unexpected`);
+        await client.query('ROLLBACK');
+      } catch (error) {
+        try { await client.query('ROLLBACK'); } catch { /* preserve the original verification failure */ }
+        throw error;
+      }
+    }
+
     const verifierRoleState = await client.query(`SELECT rolcanlogin FROM pg_catalog.pg_roles
       WHERE rolname = $1`, [verifierRole]);
     assert.deepEqual(verifierRoleState.rows, [{ rolcanlogin: false }],
@@ -406,7 +521,13 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
 
     await proveLeaseRace(client, connection, randomBytes(16).toString('hex'));
   } finally {
-    await client.end();
+    if (client) await client.end();
+    try {
+      // The following ACL suite uses the same disposable database and verifies
+      // the CREATEROLE membership row; the harness removes this whole database.
+      await clusterAdmin.query('ALTER ROLE postgres WITH LOGIN NOSUPERUSER CREATEROLE CREATEDB');
+    } catch { /* a failed setup may not have created postgres; the harness removes the database */ }
+    await clusterAdmin.end();
   }
 });
 

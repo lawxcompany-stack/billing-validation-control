@@ -9,6 +9,7 @@ export const CONTROL_STORE_SERVICE_ACCOUNT = 'billing-validation';
 const LABEL_ROLE = 'io.lawx.billing-validation.role';
 const LABEL_RUN_ID = 'io.lawx.billing-validation.run-id';
 const CONTAINER_ROLE = 'control-store-postgres17-test';
+const POSTGRES_TEST_ADMIN_ROLE = 'billing_control_test_admin';
 const SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const CREATE_TIMEOUT_MS = 30_000;
 const HEALTH_TIMEOUT_MS = 120_000;
@@ -132,9 +133,9 @@ export function buildPostgres17ContainerArgs({ containerName, runId } = {}) {
     '--label', `${LABEL_RUN_ID}=${runId}`,
     '--publish', '127.0.0.1::5432/tcp',
     '--env', 'POSTGRES_DB=postgres',
-    '--env', 'POSTGRES_USER=postgres',
+    '--env', `POSTGRES_USER=${POSTGRES_TEST_ADMIN_ROLE}`,
     '--env', 'POSTGRES_PASSWORD',
-    '--health-cmd', 'pg_isready -U postgres -d postgres',
+    '--health-cmd', `pg_isready -U ${POSTGRES_TEST_ADMIN_ROLE} -d postgres`,
     '--health-interval', '1s',
     '--health-timeout', '3s',
     '--health-retries', '60',
@@ -293,7 +294,7 @@ function identityFromDocker(docker, account) {
 function localDatabaseUrl(port, password) {
   if (!Number.isInteger(port) || port < 1 || port > 65535 ||
       typeof password !== 'string' || password.length < 32) refuse('isolated_database_target_invalid');
-  return `postgresql://postgres:${encodeURIComponent(password)}@127.0.0.1:${port}/postgres`;
+  return `postgresql://${POSTGRES_TEST_ADMIN_ROLE}:${encodeURIComponent(password)}@127.0.0.1:${port}/postgres`;
 }
 
 function parseNodeTestCounts(output) {

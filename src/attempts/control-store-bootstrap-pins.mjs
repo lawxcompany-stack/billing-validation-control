@@ -23,7 +23,7 @@ export const CONTROL_STORE_BOOTSTRAP_PINS = Object.freeze({
       version: '202610040001',
       name: 'control-verifier-role',
       file: '202610040001-control-verifier-role.sql',
-      sha256: '40e47a94aaab6e8513133a11896c8338e177588d1bd8278c64779767ea16f267',
+      sha256: 'b7320a78a302f3164d013232003fdc30279f31748a6f74de29b4440d7d555bcc',
     }),
   ]),
 });

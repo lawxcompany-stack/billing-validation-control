@@ -68,6 +68,31 @@ test('workflow token defaults are limited to contents read', () => {
   }
 });
 
+test('pull-request policy proves control-store bootstrap and ACLs on disposable PostgreSQL 17', () => {
+  const job = readWorkflow(workflowPaths[0]).jobs.policy;
+  const service = job.services?.postgres;
+  const bootstrap = job.steps.find((step) => step.name === 'Prove bootstrap against PostgreSQL 17');
+  const privileges = job.steps.find((step) => step.name === 'Prove control-store ACLs against PostgreSQL 17');
+  const disposableUrl = "${{ format('{0}:{1}{1}{2}:{3}@{4}:{5}/{6}', 'postgresql', '/', 'billing_control_test_admin', 'disposable-ci-only', '127.0.0.1', '5432', 'postgres') }}";
+
+  assert.equal(service?.image, 'postgres:17.11');
+  assert.deepEqual(service?.env, {
+    POSTGRES_DB: 'postgres',
+    POSTGRES_USER: 'billing_control_test_admin',
+    POSTGRES_PASSWORD: 'disposable-ci-only',
+  });
+  assert.deepEqual(service?.ports, ['5432:5432']);
+  assert.match(service?.options ?? '', /pg_isready/u);
+  assert.equal(job.env, undefined, 'database test access must not become job-wide configuration');
+  assert.deepEqual(bootstrap?.env, { BILLING_CONTROL_STORE_LOCAL_TEST_URL: disposableUrl });
+  assert.equal(bootstrap?.run, 'node --test test/attempts/control-store-postgres.integration.test.mjs');
+  assert.deepEqual(privileges?.env, {
+    BILLING_CONTROL_RUNTIME_PG_TEST: '1',
+    BILLING_CONTROL_RUNTIME_PG_TEST_URL: disposableUrl,
+  });
+  assert.equal(privileges?.run, 'node --test test/attempts/control-store-privileges.test.mjs');
+});
+
 test('every external action is pinned to a full immutable commit SHA', () => {
   for (const path of workflowPaths) {
     for (const action of allActions(readWorkflow(path))) {
