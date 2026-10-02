@@ -2,10 +2,14 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import YAML from 'yaml';
 import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID, matchesControlRepository } from '../../src/contracts/control-identity.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const read = (path) => readFileSync(resolve(root, path), 'utf8');
+const LEGACY_CONTROL_OWNER = 'lawxcompany-stack/billing-validation-control';
+const LEGACY_COLLECTOR_IMAGE_PREFIX = `ghcr.io/${LEGACY_CONTROL_OWNER}@sha256:`;
+const RELEASE_POLICY_IMAGE_MATCHER = String.raw`/^ghcr\.io\/lawxcompany-stack\/billing-validation-control@sha256:[a-f0-9]{64}$/u`;
 const IDENTITY_PATHS = [
   '.github/workflows/authorize-local-collector.yml',
   '.github/workflows/validate-billing.yml',
@@ -27,10 +31,97 @@ const IDENTITY_PATHS = [
   'runner/billing-result-manifest.mjs',
   'runner/billing-result-verifier-internal.mjs',
 ];
-const OLD_OWNER_PACKAGE_ALLOWLIST = new Map([
-  ['src/authorization/manifest.mjs', 'ghcr.io/lawxcompany-stack/billing-validation-control@sha256:'],
-  ['src/authorization/release-policy.mjs', String.raw`ghcr\.io\/lawxcompany-stack\/billing-validation-control@sha256:`],
-]);
+
+function normalizeAsciiEscapes(source) {
+  let normalized = '';
+  let index = 0;
+
+  while (index < source.length) {
+    if (source[index] !== '\\') {
+      normalized += source[index++];
+      continue;
+    }
+
+    const start = index;
+    while (source[index] === '\\') index++;
+    const slashes = index - start;
+    normalized += '\\'.repeat(Math.floor(slashes / 2));
+    if (slashes % 2 === 0) continue;
+
+    if (source[index] === '/' || source[index] === '.') {
+      normalized += source[index++];
+      continue;
+    }
+
+    let digits;
+    let end;
+    if (source.startsWith('u{', index)) {
+      end = source.indexOf('}', index + 2);
+      digits = end < 0 ? undefined : source.slice(index + 2, end);
+      if (!digits || !/^[a-f\d]+$/iu.test(digits)) digits = undefined;
+      else end++;
+    } else if (source.startsWith('u', index) && /^[a-f\d]{4}$/iu.test(source.slice(index + 1, index + 5))) {
+      digits = source.slice(index + 1, index + 5);
+      end = index + 5;
+    } else if (source.startsWith('x', index) && /^[a-f\d]{2}$/iu.test(source.slice(index + 1, index + 3))) {
+      digits = source.slice(index + 1, index + 3);
+      end = index + 3;
+    }
+
+    const codePoint = digits === undefined ? undefined : Number.parseInt(digits, 16);
+    if (codePoint !== undefined && codePoint <= 0x7f) {
+      normalized += String.fromCharCode(codePoint);
+      index = end;
+    } else {
+      normalized += '\\';
+    }
+  }
+
+  return normalized;
+}
+
+function assertNoLegacyControlOwner(path, rawSource) {
+  let source = rawSource;
+
+  if (path === 'src/authorization/manifest.mjs') {
+    const imageField = /collectorRelease:\s*\(value\)\s*=>\s*record\(value,\s*\{\s*image:\s*prefixedDigest\('([^']+)'\)/u.exec(source);
+    assert.ok(imageField, `${path} must scope the legacy image prefix to collectorRelease.image`);
+    assert.equal(imageField[1], LEGACY_COLLECTOR_IMAGE_PREFIX,
+      `${path} must retain the current collectorRelease.image prefix`);
+    source = source.replace(imageField[0], imageField[0].replace(imageField[1], ''));
+  }
+
+  if (path === 'src/authorization/release-policy.mjs') {
+    const collectorRelease = /collectorRelease:\s*\(pin\)\s*=>\s*record\(pin,\s*\{([\s\S]*?)\n\s*\}\)/u.exec(source);
+    assert.ok(collectorRelease, `${path} must declare collectorRelease`);
+    const imageMatcher = /^\s*image:\s*matches\((\/.*\/u)\),?\s*$/mu.exec(collectorRelease[1]);
+    assert.equal(imageMatcher?.[1], RELEASE_POLICY_IMAGE_MATCHER,
+      `${path} collectorRelease.image must use the exact pinned GHCR digest matcher`);
+    source = source.replace(imageMatcher[1], '');
+  }
+
+  assert.doesNotMatch(normalizeAsciiEscapes(source), /lawxcompany-stack\/billing-validation-control/u,
+    `${path} contains a legacy control owner outside the allowed collector image field`);
+}
+
+function assertCanonicalWorkflowGuards(workflow, path) {
+  assert.ok(workflow?.on && Object.hasOwn(workflow.on, 'workflow_dispatch'),
+    `${path} must declare workflow_dispatch`);
+  assert.ok(workflow.jobs && typeof workflow.jobs === 'object', `${path} must declare jobs`);
+
+  const guardedJobs = Object.hasOwn(workflow.jobs, 'authorize')
+    ? [['authorize', workflow.jobs.authorize]]
+    : Object.entries(workflow.jobs);
+  assert.ok(guardedJobs.length > 0, `${path} must have a protected workflow_dispatch job`);
+
+  for (const [jobName, job] of guardedJobs) {
+    assert.equal(typeof job?.if, 'string', `${path} jobs.${jobName} must have an identity guard`);
+    assert.match(job.if, /github\.repository\s*==\s*['"]lawx-ai\/billing-validation-control['"]/u,
+      `${path} jobs.${jobName} must guard the canonical control repository`);
+    assert.match(job.if, /github\.repository_id\s*==\s*['"]1384018279['"]/u,
+      `${path} jobs.${jobName} must guard the canonical control repository ID`);
+  }
+}
 
 assert.equal(CONTROL_REPOSITORY, 'lawx-ai/billing-validation-control');
 assert.equal(CONTROL_REPOSITORY_ID, '1384018279');
@@ -42,18 +133,50 @@ for (const workflowPath of [
   '.github/workflows/authorize-local-collector.yml',
   '.github/workflows/validate-billing.yml',
 ]) {
-  const workflow = read(workflowPath);
-  assert.match(workflow, /github\.repository == 'lawx-ai\/billing-validation-control'/u);
-  assert.match(workflow, /github\.repository_id == '1384018279'/u);
+  assertCanonicalWorkflowGuards(YAML.parse(read(workflowPath)), workflowPath);
 }
 
 for (const path of IDENTITY_PATHS) {
-  let source = read(path).replaceAll('\\.', '.').replaceAll('\\/', '/');
-  const packageReference = OLD_OWNER_PACKAGE_ALLOWLIST.get(path);
-  if (packageReference !== undefined) {
-    const normalizedReference = packageReference.replaceAll('\\.', '.').replaceAll('\\/', '/');
-    assert.equal(source.split(normalizedReference).length - 1, 1, `${path} must retain exactly one pinned GHCR reference`);
-    source = source.replace(normalizedReference, '');
-  }
-  assert.doesNotMatch(source, /lawxcompany-stack\/billing-validation-control/u, `${path} contains a legacy control owner`);
+  assertNoLegacyControlOwner(path, read(path));
 }
+
+const broadReleaseMatcher = read('src/authorization/release-policy.mjs')
+  .replace('billing-validation-control@sha256:[a-f0-9]{64}$/u', 'billing-validation-control@sha256:.*$/u');
+assert.throws(() => assertNoLegacyControlOwner('src/authorization/release-policy.mjs', broadReleaseMatcher),
+  /exact pinned GHCR digest matcher/u,
+  'a broad suffix must not satisfy the legacy package exception');
+
+const misplacedManifestImage = read('src/authorization/manifest.mjs').replace(
+  `image: prefixedDigest('${LEGACY_COLLECTOR_IMAGE_PREFIX}'),`,
+  `image: prefixedDigest('sha256:'),\n    // unused: ${LEGACY_COLLECTOR_IMAGE_PREFIX}`,
+);
+assert.throws(() => assertNoLegacyControlOwner('src/authorization/manifest.mjs', misplacedManifestImage),
+  /current collectorRelease\.image prefix/u,
+  'the legacy package prefix must not be allowed outside collectorRelease.image');
+
+const workflowMissingAuthorizeGuard = {
+  on: { workflow_dispatch: {} },
+  jobs: {
+    authorize: { if: "${{ github.event_name == 'workflow_dispatch' }}" },
+    another: { if: "${{ github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279' }}" },
+  },
+};
+assert.throws(() => assertCanonicalWorkflowGuards(workflowMissingAuthorizeGuard, 'synthetic-workflow.yml'),
+  /jobs\.authorize must guard the canonical control repository/u,
+  'a guard elsewhere in the workflow must not compensate for a missing authorize-job guard');
+
+for (const encodedSlug of [
+  String.raw`lawxcompany-stack\/billing-validation-control`,
+  String.raw`lawxcompany-stack\u002fbilling-validation-control`,
+  String.raw`lawxcompany-stack\u{2f}billing-validation-control`,
+  String.raw`lawxcompany-stack\x2fbilling-validation-control`,
+  String.raw`ghcr\u002eio/lawxcompany-stack\u002fbilling-validation-control`,
+]) {
+  assert.throws(() => assertNoLegacyControlOwner('scripts/read-candidate.mjs', `const owner = '${encodedSlug}';`),
+    /legacy control owner/u,
+    `ASCII escapes must not hide a legacy owner: ${encodedSlug}`);
+}
+
+assert.doesNotMatch(normalizeAsciiEscapes(String.raw`lawxcompany-stack\\u002fbilling-validation-control`),
+  /lawxcompany-stack\/billing-validation-control/u,
+  'escaped backslashes must not be mistaken for an encoded slash');
