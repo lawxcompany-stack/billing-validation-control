@@ -207,16 +207,11 @@ jobs:
               record(entry.reviewer) && positiveId(entry.reviewer.id)));
             requireCondition(new Set(approval.reviewers.map(entry => `${entry.type}:${entry.reviewer.id}`)).size === approval.reviewers.length);
             const branch = value.deployment_branch_policy;
-            requireCondition(record(branch) && typeof branch.protected_branches === 'boolean' &&
-              typeof branch.custom_branch_policies === 'boolean' && branch.protected_branches !== branch.custom_branch_policies);
+            // List responses do not prove a custom rule is branch-only. Require
+            // protected-only mode; the context guard already pins protected main.
+            requireCondition(record(branch) && branch.protected_branches === true &&
+              branch.custom_branch_policies === false);
             requireCondition(rules.some(rule => rule.type === 'branch_policy'));
-            if (branch.custom_branch_policies) {
-              const policies = await get(`${name}/deployment-branch-policies?per_page=100&page=1`);
-              requireCondition(record(policies) && policies.total_count === 1 && Array.isArray(policies.branch_policies) &&
-                policies.branch_policies.length === 1 && record(policies.branch_policies[0]) &&
-                positiveId(policies.branch_policies[0].id) && policies.branch_policies[0].type === 'branch' &&
-                policies.branch_policies[0].name === 'main');
-            }
           }
 
           try {

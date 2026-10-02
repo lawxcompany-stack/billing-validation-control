@@ -166,7 +166,7 @@ function environment(name) {
       { id: 3755, node_id: 'review-rule', type: 'required_reviewers', prevent_self_review: true,
         reviewers: [{ type: 'User', reviewer: { id: 42, login: 'synthetic-reviewer', type: 'User' } }] },
       { id: 3756, node_id: 'branch-rule', type: 'branch_policy' },
-    ], deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } };
+    ], deployment_branch_policy: { protected_branches: true, custom_branch_policies: false } };
 }
 
 async function runPreflight({ transform = value => value, respond, env = {}, expire = false, clock = performance } = {}) {
@@ -198,7 +198,8 @@ async function runPreflight({ transform = value => value, respond, env = {}, exp
     calls.push(url);
     if (respond) return respond(url, options);
     return Response.json(suffix === name ? transform(environment(name)) : {
-      total_count: 1, branch_policies: [{ id: 11, node_id: 'branch-node', name: 'main', type: 'branch' }],
+      // Documented list response; it does not prove branch-vs-tag type.
+      total_count: 1, branch_policies: [{ id: 11, node_id: 'branch-node', name: 'main' }],
     });
   };
   const context = { process: processFixture, fetch, AbortController, TextDecoder, Uint8Array,
@@ -211,10 +212,10 @@ async function runPreflight({ transform = value => value, respond, env = {}, exp
   return { code: processFixture.exitCode, calls, output, errors };
 }
 
-test('preflight checks all four fixed Environments and exact main branch restrictions read-only', async () => {
+test('preflight accepts protected-only Environments for exact protected main without listing custom rules', async () => {
   const result = await runPreflight();
   assert.equal(result.code, 0);
-  assert.equal(result.calls.length, 8);
+  assert.deepEqual(result.calls, environments.map(name => `https://api.github.com/repos/${repository}/environments/${name}`));
   assert.deepEqual(result.output, ['Environment protection verified for all required jobs.']);
   assert.deepEqual(result.errors, []);
 });
@@ -233,6 +234,12 @@ for (const [name, transform] of [
   ['missing rules', value => { delete value.protection_rules; return value; }],
   ['unrestricted branches', value => ({ ...value, deployment_branch_policy: null })],
   ['conflicting branch mode', value => ({ ...value, deployment_branch_policy: { protected_branches: true, custom_branch_policies: true } })],
+  ['both branch flags false', value => ({ ...value, deployment_branch_policy: { protected_branches: false, custom_branch_policies: false } })],
+  ['missing protected flag', value => ({ ...value, deployment_branch_policy: { custom_branch_policies: false } })],
+  ['missing custom flag', value => ({ ...value, deployment_branch_policy: { protected_branches: true } })],
+  ['nonboolean protected flag', value => ({ ...value, deployment_branch_policy: { protected_branches: 'true', custom_branch_policies: false } })],
+  ['nonboolean custom flag', value => ({ ...value, deployment_branch_policy: { protected_branches: true, custom_branch_policies: 0 } })],
+  ['array branch policy', value => ({ ...value, deployment_branch_policy: [] })],
 ]) test(`preflight refuses ${name} with sanitized output`, async () => {
   const result = await runPreflight({ transform });
   assert.equal(result.code, 1);
@@ -258,6 +265,26 @@ test('preflight accepts a documented Team reviewer and protected-branch mode', a
   assert.equal(result.calls.length, 4);
 });
 
+for (const [name, list] of [
+  ['documented main list without type', { total_count: 1, branch_policies: [{ id: 11, node_id: 'branch-node', name: 'main' }] }],
+  ['main with injected branch type', { total_count: 1, branch_policies: [{ id: 11, node_id: 'branch-node', name: 'main', type: 'branch' }] }],
+  ['main tag', { total_count: 1, branch_policies: [{ id: 11, node_id: 'tag-node', name: 'main', type: 'tag' }] }],
+  ['wildcard', { total_count: 1, branch_policies: [{ id: 11, node_id: 'branch-node', name: '*' }] }],
+  ['broad pattern', { total_count: 1, branch_policies: [{ id: 11, node_id: 'branch-node', name: 'release/*' }] }],
+  ['malformed list', null],
+]) test(`custom policy refuses ${name} before attempting a rule-list read`, async () => {
+  const result = await runPreflight({ respond: async url => {
+    if (url.includes('/deployment-branch-policies?')) return Response.json(list);
+    const value = environment(url.split('/').at(-1));
+    value.deployment_branch_policy = { protected_branches: false, custom_branch_policies: true };
+    return Response.json(value);
+  } });
+  assert.equal(result.code, 1);
+  assert.deepEqual(result.output, []);
+  assert.deepEqual(result.errors, ['Environment protection preflight refused.']);
+  assert.deepEqual(result.calls, [`https://api.github.com/repos/${repository}/environments/billing-validation-reader`]);
+});
+
 for (const [name, respond] of [
   ['HTTP 403', async () => new Response('private-upstream-body', { status: 403 })],
   ['HTTP 404', async () => new Response('private-upstream-body', { status: 404 })],
@@ -266,12 +293,6 @@ for (const [name, respond] of [
   ['null JSON', async () => Response.json(null)],
   ['oversized body', async () => new Response('x'.repeat(65537))],
   ['unavailable readback', async () => { throw new Error('private-upstream-body synthetic-token'); }],
-  ['wrong main branch restriction', async url => Response.json(url.includes('/deployment-branch-policies?') ? {
-    total_count: 1, branch_policies: [{ id: 1, name: '*', type: 'branch' }],
-  } : environment(url.split('/').at(-1)))],
-  ['extra branch page', async url => Response.json(url.includes('/deployment-branch-policies?') ? {
-    total_count: 101, branch_policies: [{ id: 1, name: 'main', type: 'branch' }],
-  } : environment(url.split('/').at(-1)))],
 ]) test(`preflight fails closed on ${name}`, async () => {
   const result = await runPreflight({ respond });
   assert.equal(result.code, 1);
@@ -305,7 +326,7 @@ test('elapsed readback deadline is checked while consuming the body', async () =
 });
 
 for (const change of [{ CONTROL_REPOSITORY: 'attacker/control' }, { CONTROL_REPOSITORY_ID: '9' },
-  { CONTROL_REF: 'refs/heads/feature' }, { CONTROL_REF_PROTECTED: 'false' },
+  { CONTROL_REF: 'refs/heads/feature' }, { CONTROL_REF: 'refs/tags/main' }, { CONTROL_REF_PROTECTED: 'false' },
   { CONTROL_DEFAULT_BRANCH: 'preview' }, { CONTROL_EVENT_NAME: 'pull_request' },
   { ENVIRONMENT_READ_TOKEN: '' }]) test(`preflight refuses invalid ${Object.keys(change)[0]} before API use`, async () => {
   const result = await runPreflight({ env: change });
