@@ -7,8 +7,8 @@ import { assertAuthorizationChallenge } from './challenge.mjs';
 import { selectRelease, validateTrustPolicy } from './release-policy.mjs';
 import { withAuthorizationDeadline } from './context.mjs';
 import { verifyDeploymentEnvironment } from '../../runner/attestation-environment.mjs';
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID } from '../contracts/control-identity.mjs';
 
-const CONTROL = 'lawxcompany-stack/billing-validation-control';
 const WORKFLOW = '.github/workflows/authorize-local-collector.yml';
 const REF = 'refs/heads/main';
 const ISSUER = 'https://token.actions.githubusercontent.com';
@@ -99,12 +99,12 @@ function checkOutput(stdout, digest, manifest, now) {
   const { attestation, verificationResult: result } = output[0];
   const certificate = result?.signature?.certificate;
   if (!isRecord(attestation) || !isRecord(result) || !isRecord(certificate)) refuse();
-  const repo = `https://github.com/${CONTROL}`;
+  const repo = `https://github.com/${CONTROL_REPOSITORY}`;
   const identity = `${repo}/${WORKFLOW}@${REF}`;
   const expected = {
     issuer: ISSUER, subjectAlternativeName: identity, buildSignerURI: identity,
     buildSignerDigest: manifest.control.sha, sourceRepositoryURI: repo,
-    sourceRepositoryIdentifier: '1384018279', sourceRepositoryRef: REF,
+    sourceRepositoryIdentifier: CONTROL_REPOSITORY_ID, sourceRepositoryRef: REF,
     sourceRepositoryDigest: manifest.control.sha, githubWorkflowTrigger: 'workflow_dispatch',
     githubWorkflowRef: REF, githubWorkflowSHA: manifest.control.sha, runnerEnvironment: 'github-hosted',
     runInvocationURI: `${repo}/actions/runs/${manifest.control.runId}/attempts/${manifest.control.runAttempt}`,
@@ -178,7 +178,7 @@ export async function verifyLocalAuthorizationWithDependencies(input) {
         await writeFile(file, manifestBytes, { flag: 'wx', mode: 0o600 });
         fresh();
         const args = ['attestation', 'verify', file,
-          '--repo', CONTROL, '--signer-workflow', `${CONTROL}/${WORKFLOW}`,
+          '--repo', CONTROL_REPOSITORY, '--signer-workflow', `${CONTROL_REPOSITORY}/${WORKFLOW}`,
           '--signer-digest', manifest.control.sha, '--source-ref', REF,
           '--source-digest', manifest.control.sha, '--deny-self-hosted-runners',
           '--predicate-type', PREDICATE, '--format', 'json'];

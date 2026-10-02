@@ -2,12 +2,13 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID } from '../../src/contracts/control-identity.mjs';
 import { createAuthorizationChallenge } from '../../src/authorization/challenge.mjs';
 import { serializeAuthorizationManifest } from '../../src/authorization/manifest.mjs';
 import { certificateFixture } from '../runner/certificate-fixture.mjs';
 import { authorizationFixture } from './fixtures.mjs';
 
-export const CONTROL = 'lawxcompany-stack/billing-validation-control';
+export const CONTROL = CONTROL_REPOSITORY;
 export const WORKFLOW = '.github/workflows/authorize-local-collector.yml';
 export const ROOT = `https://api.github.com/repos/${CONTROL}`;
 export const NOW = Date.parse('2026-09-29T12:05:00.000Z');
@@ -19,7 +20,7 @@ export function releaseFixture(manifest = authorizationFixture()) {
 
 // Offline API responses. Only the fixed public control repository is read.
 export function authorizationApiFixture(manifest = authorizationFixture()) {
-  const repo = { id: 1384018279, full_name: CONTROL, name: 'billing-validation-control',
+  const repo = { id: Number(CONTROL_REPOSITORY_ID), full_name: CONTROL, name: 'billing-validation-control',
     default_branch: 'main', private: false, visibility: 'public' };
   const run = { id: Number(manifest.control.runId), run_attempt: Number(manifest.control.runAttempt),
     workflow_id: 901234567, path: WORKFLOW, event: 'workflow_dispatch', head_branch: 'main',
@@ -60,7 +61,7 @@ export function verifiedOutput(manifest, digest) {
     signature: { certificate: {
       issuer: 'https://token.actions.githubusercontent.com', subjectAlternativeName: identity,
       buildSignerURI: identity, buildSignerDigest: manifest.control.sha,
-      sourceRepositoryURI: repo, sourceRepositoryIdentifier: '1384018279',
+      sourceRepositoryURI: repo, sourceRepositoryIdentifier: CONTROL_REPOSITORY_ID,
       sourceRepositoryRef: 'refs/heads/main', sourceRepositoryDigest: manifest.control.sha,
       githubWorkflowTrigger: 'workflow_dispatch', githubWorkflowRef: 'refs/heads/main',
       githubWorkflowSHA: manifest.control.sha, runnerEnvironment: 'github-hosted',

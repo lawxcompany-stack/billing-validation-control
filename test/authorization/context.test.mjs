@@ -213,6 +213,7 @@ test('completed current/exact attempt, three hosted jobs and protected current m
   assert.ok(Object.isFrozen(result));
   assert.ok(Object.isFrozen(result.jobs));
   assert.equal(api.calls.length, 7);
+  assert.equal(api.calls[0].url, 'https://api.github.com/repos/lawx-ai/billing-validation-control');
   assert.equal(api.calls.at(-1).url, `${ROOT}${api.runPath}`);
   for (const { url, options } of api.calls) {
     assert.ok(url.startsWith(`${ROOT}`));
@@ -254,6 +255,27 @@ for (const [name, mutate] of [
     const api = authorizationApiFixture(); mutate(api);
     await assert.rejects(read({ manifest: authorizationFixture(), get: api.get }), invalid);
   });
+}
+
+for (const endpoint of ['repository', 'current run', 'exact attempt']) {
+  for (const field of endpoint === 'repository' ? [null] : ['repository', 'head_repository']) {
+    for (const [name, identity] of [
+      ['old owner', { full_name: 'lawxcompany-stack/billing-validation-control', id: 1384018279 }],
+      ['arbitrary owner', { full_name: 'other/billing-validation-control', id: 1384018279 }],
+      ['wrong ID', { full_name: 'lawx-ai/billing-validation-control', id: 1384018280 }],
+      ['candidate as control', { full_name: 'lawxcompany-stack/Plataforma-LawX', id: 1234079266 }],
+      ['string ID', { full_name: 'lawx-ai/billing-validation-control', id: '1384018279' }],
+    ]) {
+      test(`context refuses ${name} in ${endpoint} ${field ?? ''}`, async () => {
+        const { readAuthorizationContextWithDependencies: read } = required();
+        const api = authorizationApiFixture();
+        const payload = api.payloads[endpoint === 'repository' ? ''
+          : endpoint === 'current run' ? api.runPath : api.attemptPath];
+        Object.assign(field === null ? payload : payload[field], identity);
+        await assert.rejects(read({ manifest: authorizationFixture(), get: api.get }), invalid);
+      });
+    }
+  }
 }
 
 for (const [name, mutate] of [

@@ -1,7 +1,7 @@
 import { types } from 'node:util';
 import { AuthorizationRefusal } from './manifest.mjs';
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID } from '../contracts/control-identity.mjs';
 
-const CONTROL = 'lawxcompany-stack/billing-validation-control';
 const WORKFLOW = '.github/workflows/authorize-local-collector.yml';
 const INPUTS = ['candidate_sha', 'execution_id', 'activation_commitment', 'suite'];
 const CONTEXT = ['repository', 'repositoryId', 'ref', 'defaultBranch', 'refProtected', 'eventName',
@@ -26,9 +26,9 @@ export function snapshotRecord(value, keys) {
 
 export function validateLocalAuthorizationContext(value) {
   const c = snapshotRecord(value, CONTEXT);
-  if (c.repository !== CONTROL || c.repositoryId !== '1384018279' || c.ref !== 'refs/heads/main'
+  if (c.repository !== CONTROL_REPOSITORY || c.repositoryId !== CONTROL_REPOSITORY_ID || c.ref !== 'refs/heads/main'
     || c.defaultBranch !== 'main' || c.refProtected !== true || c.eventName !== 'workflow_dispatch'
-    || c.workflowRef !== `${CONTROL}/${WORKFLOW}@refs/heads/main`
+    || c.workflowRef !== `${CONTROL_REPOSITORY}/${WORKFLOW}@refs/heads/main`
     || typeof c.sha !== 'string' || !/^[a-f0-9]{40}$/u.test(c.sha) || c.workflowSha !== c.sha
     || ![c.runId, c.runAttempt].every(id => typeof id === 'string' && /^[1-9][0-9]*$/u.test(id)
       && Number.isSafeInteger(Number(id)) && String(Number(id)) === id)) invalid();

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID } from '../../src/contracts/control-identity.mjs';
 import {
   createAuthorizationManifest,
   serializeAuthorizationManifest,
@@ -14,7 +15,7 @@ const EXPECTED = '{"schemaVersion":2,"kind":"billing-collector-authorization","e
   + '"executionId":"11111111111111111111111111111111","activationCommitment":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
   + '"candidate":{"repository":"lawxcompany-stack/Plataforma-LawX","repositoryId":"1234079266","pullNumber":"123","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","treeSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","baseSha":"cccccccccccccccccccccccccccccccccccccccc"},'
   + '"prerequisites":{"workflowId":"290018021","workflowPath":".github/workflows/ci.yml","runId":"345678901","runAttempt":"1","jobs":[{"key":"quality","jobId":"456789012","conclusion":"success"},{"key":"regression","jobId":"456789013","conclusion":"success"},{"key":"build","jobId":"456789014","conclusion":"success"}]},'
-  + '"control":{"repository":"lawxcompany-stack/billing-validation-control","repositoryId":"1384018279","ref":"refs/heads/main","workflowPath":".github/workflows/authorize-local-collector.yml","sha":"dddddddddddddddddddddddddddddddddddddddd","runId":"567890123","runAttempt":"2","event":"workflow_dispatch"},'
+  + '"control":{"repository":"lawx-ai/billing-validation-control","repositoryId":"1384018279","ref":"refs/heads/main","workflowPath":".github/workflows/authorize-local-collector.yml","sha":"dddddddddddddddddddddddddddddddddddddddd","runId":"567890123","runAttempt":"2","event":"workflow_dispatch"},'
   + '"collectorRelease":{"image":"ghcr.io/lawxcompany-stack/billing-validation-control@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","configDigest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","sourceSha":"1111111111111111111111111111111111111111","sourceTreeSha":"2222222222222222222222222222222222222222","policyDigest":"3333333333333333333333333333333333333333333333333333333333333333"},'
   + '"policy":{"environmentDigest":"4444444444444444444444444444444444444444444444444444444444444444","contractsDigest":"5555555555555555555555555555555555555555555555555555555555555555","egressDigest":"6666666666666666666666666666666666666666666666666666666666666666","limitsDigest":"7777777777777777777777777777777777777777777777777777777777777777"},'
   + '"suite":"billing-43","issuedAt":"2026-09-29T12:00:00.000Z","expiresAt":"2026-09-29T12:20:00.000Z","sourceExecutionId":null}\n';
@@ -31,6 +32,28 @@ function assertInvalid(value) {
     message: 'authorization_manifest_invalid',
   });
 }
+
+test('control identity migrates while candidate identity and the legacy image pin stay unchanged', () => {
+  const manifest = createAuthorizationManifest(authorizationFixture());
+  assert.equal(manifest.control.repository, CONTROL_REPOSITORY);
+  assert.equal(manifest.control.repositoryId, CONTROL_REPOSITORY_ID);
+  assert.equal(manifest.candidate.repository, 'lawxcompany-stack/Plataforma-LawX');
+  assert.equal(manifest.candidate.repositoryId, '1234079266');
+  assert.match(manifest.collectorRelease.image,
+    /^ghcr\.io\/lawxcompany-stack\/billing-validation-control@sha256:[a-f0-9]{64}$/u);
+  assert.equal(manifest.collectorRelease.image,
+    'ghcr.io/lawxcompany-stack/billing-validation-control@sha256:' + 'e'.repeat(64));
+});
+
+test('old-owner control manifest is rejected by construction, parsing and hashing', () => {
+  const old = authorizationFixture();
+  old.control.repository = 'lawxcompany-stack/billing-validation-control';
+  assertInvalid(old);
+  const bytes = EXPECTED.replace('"control":{"repository":"lawx-ai/billing-validation-control"',
+    '"control":{"repository":"lawxcompany-stack/billing-validation-control"');
+  assert.throws(() => parseAuthorizationManifest(bytes), { code: 'authorization_noncanonical' });
+  assert.throws(() => authorizationDigest(bytes), { code: 'authorization_noncanonical' });
+});
 
 test('canonical bytes have the exact closed field order independent of input insertion order', () => {
   const input = authorizationFixture();
@@ -124,6 +147,7 @@ for (const [field, bad] of [
   ['executionMode', 'hosted'], ['operation', 'deploy'], ['suite', 'billing-44'],
   ['candidate.repository', 'other/Plataforma-LawX'], ['candidate.repositoryId', '1234079267'],
   ['control.repository', 'other/billing-validation-control'], ['control.repositoryId', '1384018280'],
+  ['control.repository', 'lawxcompany-stack/Plataforma-LawX'], ['control.repositoryId', '1234079266'],
   ['control.ref', 'refs/heads/preview'], ['control.workflowPath', '.github/workflows/validate-billing.yml'],
   ['control.event', 'pull_request'], ['prerequisites.workflowId', '290018022'],
   ['prerequisites.workflowPath', '.github/workflows/other.yml'],

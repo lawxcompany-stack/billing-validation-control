@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { types } from 'node:util';
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID } from '../contracts/control-identity.mjs';
 
 const MAX_MANIFEST_BYTES = 16_384;
 const MAX_WINDOW_MS = 1_200_000;
@@ -100,8 +101,8 @@ const SCHEMA = {
     jobs,
   }),
   control: (value) => record(value, {
-    repository: literal('lawxcompany-stack/billing-validation-control'),
-    repositoryId: literal('1384018279'),
+    repository: literal(CONTROL_REPOSITORY),
+    repositoryId: literal(CONTROL_REPOSITORY_ID),
     ref: literal('refs/heads/main'),
     workflowPath: literal('.github/workflows/authorize-local-collector.yml'),
     sha,

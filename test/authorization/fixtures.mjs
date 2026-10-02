@@ -1,4 +1,6 @@
 // Synthetic schema fixtures only; these values are not reviewed release pins.
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID } from '../../src/contracts/control-identity.mjs';
+
 export function authorizationFixture() {
   return {
     schemaVersion: 2,
@@ -27,8 +29,8 @@ export function authorizationFixture() {
       ],
     },
     control: {
-      repository: 'lawxcompany-stack/billing-validation-control',
-      repositoryId: '1384018279',
+      repository: CONTROL_REPOSITORY,
+      repositoryId: CONTROL_REPOSITORY_ID,
       ref: 'refs/heads/main',
       workflowPath: '.github/workflows/authorize-local-collector.yml',
       sha: 'dddddddddddddddddddddddddddddddddddddddd',
