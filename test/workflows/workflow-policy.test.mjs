@@ -42,6 +42,10 @@ test('workflow token defaults are limited to contents read', () => {
     const workflow = readWorkflow(path);
     assert.deepEqual(workflow.permissions, { contents: 'read' }, `${path} must use least-privilege defaults`);
     for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
+      if (path === workflowPaths[0] && jobId === 'authorize') {
+        assert.deepEqual(job.permissions, { contents: 'read', actions: 'read' });
+        continue;
+      }
       if (path === workflowPaths[0] && jobId === 'attest-activation') {
         assert.deepEqual(job.permissions, {
           contents: 'read',
@@ -86,7 +90,7 @@ test('dispatch authorization runs hosted without an environment before all privi
   assert.equal(authorize['timeout-minutes'] <= 10, true);
   assert.equal(reader.needs, 'authorize');
   assert.deepEqual(testJob.needs, ['authorize', 'reader', 'attest-activation']);
-  assert.deepEqual(publisher.needs, ['authorize', 'reader', 'test']);
+  assert.deepEqual(publisher.needs, ['authorize', 'reader', 'attest-activation', 'test']);
   for (const job of [reader, testJob, publisher]) {
     assert.match(job.if, /needs\.authorize\.result\s*==\s*'success'/);
   }

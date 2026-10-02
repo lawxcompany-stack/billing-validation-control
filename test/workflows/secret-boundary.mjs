@@ -24,7 +24,7 @@ function assertReaderBoundary(job) {
   assert.equal(job.needs, 'authorize');
   assert.equal(job['continue-on-error'], undefined);
   assert.equal(job.env, undefined);
-  assert.equal(job.if, "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && needs.authorize.result == 'success' }}");
+  assert.equal(job.if, "${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' }}");
   assert.equal(job.steps.length, 4, 'credentialed reader runs only the reviewed fixed steps');
   const [checkout, setup, token, consumer] = job.steps;
   for (const [step, allowed] of [
@@ -153,6 +153,11 @@ export function assertWorkflowSecretBoundary(workflow, path) {
         'id-token': 'write',
         attestations: 'write',
       }, `${path}:${jobId} must scope signing permissions to the hosted activation attestation`);
+    } else if (path === workflowPaths[0] && jobId === 'authorize') {
+      assert.deepEqual(job.permissions, { contents: 'read', actions: 'read' },
+        'only the hosted, secret-free authorization job may read Environment configuration');
+      assert.equal(job.environment, undefined);
+      assert.equal(job['runs-on'], 'ubuntu-latest');
     } else {
       assert.ok(!job.permissions || JSON.stringify(job.permissions) === JSON.stringify({ contents: 'read' }),
         `${path}:${jobId} must not widen token permissions`);

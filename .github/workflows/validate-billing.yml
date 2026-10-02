@@ -68,14 +68,18 @@ jobs:
         run: npx --yes pnpm@11.5.1 --ignore-workspace check:secret-boundary
 
   authorize:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     outputs:
       operation: ${{ steps.authorize.outputs.operation }}
       candidate_sha: ${{ steps.authorize.outputs.candidate_sha }}
       runner_label: ${{ steps.authorize.outputs.runner_label }}
       activation_commitment: ${{ steps.authorize.outputs.activation_commitment }}
+      environments_verified: ${{ steps.environments.outputs.verified }}
     steps:
       - name: Checkout exact triggering workflow SHA
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -122,8 +126,116 @@ jobs:
           }
           NODE
 
+      # Configuration proof precedes every Environment job. This does not grant
+      # execution approval: each downstream job still waits on its Environment.
+      - name: Verify required Environment protection before accessing secrets
+        id: environments
+        env:
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          CONTROL_REPOSITORY_ID: ${{ github.repository_id }}
+          CONTROL_REF: ${{ github.ref }}
+          CONTROL_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CONTROL_REF_PROTECTED: ${{ github.ref_protected }}
+          CONTROL_EVENT_NAME: ${{ github.event_name }}
+          ENVIRONMENT_READ_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+
+          const repository = 'lawxcompany-stack/billing-validation-control';
+          const requiredEnvironments = [
+            'billing-validation-reader', 'billing-validation-attestation',
+            'billing-validation-tests', 'billing-validation-publisher',
+          ];
+          const baseUrl = `https://api.github.com/repos/${repository}/environments/`;
+          const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+          const positiveId = value => Number.isSafeInteger(value) && value > 0;
+          function requireCondition(condition) { if (!condition) throw new Error('environment_protection_invalid'); }
+
+          async function get(path) {
+            const controller = new AbortController();
+            const deadline = performance.now() + 10000;
+            let timer, response, reader;
+            async function read() {
+              response = await fetch(baseUrl + path, {
+                method: 'GET', redirect: 'error', cache: 'no-store', credentials: 'omit', signal: controller.signal,
+                headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${process.env.ENVIRONMENT_READ_TOKEN}`,
+                  'X-GitHub-Api-Version': '2022-11-28' },
+              });
+              requireCondition(!controller.signal.aborted && performance.now() < deadline &&
+                response?.ok === true && response.status === 200 && !response.redirected);
+              requireCondition(response.body && typeof response.body.getReader === 'function');
+              reader = response.body.getReader();
+              const decoder = new TextDecoder('utf-8', { fatal: true });
+              let size = 0, text = '';
+              for (;;) {
+                const { done, value } = await reader.read();
+                requireCondition(!controller.signal.aborted && performance.now() < deadline);
+                if (done) break;
+                requireCondition(value instanceof Uint8Array);
+                size += value.byteLength;
+                requireCondition(size <= 65536);
+                text += decoder.decode(value, { stream: true });
+              }
+              return JSON.parse(text + decoder.decode());
+            }
+            try {
+              return await Promise.race([read(), new Promise((resolve, reject) => {
+                timer = setTimeout(() => { controller.abort(); reject(new Error('environment_read_timeout')); }, 10000);
+              })]);
+            } finally {
+              clearTimeout(timer);
+              controller.abort();
+              // Cancellation acknowledgement cannot extend the read deadline.
+              try { Promise.resolve(reader ? reader.cancel() : response?.body?.cancel()).catch(() => {}); }
+              catch { /* no upstream details */ }
+            }
+          }
+
+          async function verify(name) {
+            const value = await get(name);
+            requireCondition(record(value) && positiveId(value.id) && value.name === name && value.url === baseUrl + name);
+            requireCondition(Array.isArray(value.protection_rules) && value.protection_rules.length <= 6);
+            const rules = value.protection_rules;
+            requireCondition(rules.every(rule => record(rule) && positiveId(rule.id) &&
+              ['required_reviewers', 'wait_timer', 'branch_policy'].includes(rule.type)));
+            requireCondition(new Set(rules.map(rule => rule.type)).size === rules.length);
+            const approval = rules.find(rule => rule.type === 'required_reviewers');
+            requireCondition(approval?.prevent_self_review === true && Array.isArray(approval.reviewers) &&
+              approval.reviewers.length > 0 && approval.reviewers.length <= 6);
+            requireCondition(approval.reviewers.every(entry => record(entry) && ['User', 'Team'].includes(entry.type) &&
+              record(entry.reviewer) && positiveId(entry.reviewer.id)));
+            requireCondition(new Set(approval.reviewers.map(entry => `${entry.type}:${entry.reviewer.id}`)).size === approval.reviewers.length);
+            const branch = value.deployment_branch_policy;
+            requireCondition(record(branch) && typeof branch.protected_branches === 'boolean' &&
+              typeof branch.custom_branch_policies === 'boolean' && branch.protected_branches !== branch.custom_branch_policies);
+            requireCondition(rules.some(rule => rule.type === 'branch_policy'));
+            if (branch.custom_branch_policies) {
+              const policies = await get(`${name}/deployment-branch-policies?per_page=100&page=1`);
+              requireCondition(record(policies) && policies.total_count === 1 && Array.isArray(policies.branch_policies) &&
+                policies.branch_policies.length === 1 && record(policies.branch_policies[0]) &&
+                positiveId(policies.branch_policies[0].id) && policies.branch_policies[0].type === 'branch' &&
+                policies.branch_policies[0].name === 'main');
+            }
+          }
+
+          try {
+            requireCondition(process.env.CONTROL_REPOSITORY === repository && process.env.CONTROL_REPOSITORY_ID === '1384018279' &&
+              process.env.CONTROL_REF === 'refs/heads/main' && process.env.CONTROL_DEFAULT_BRANCH === 'main' &&
+              process.env.CONTROL_REF_PROTECTED === 'true' && process.env.CONTROL_EVENT_NAME === 'workflow_dispatch');
+            requireCondition(typeof process.env.ENVIRONMENT_READ_TOKEN === 'string' &&
+              /^[\x21-\x7e]+$/u.test(process.env.ENVIRONMENT_READ_TOKEN));
+            for (const name of requiredEnvironments) await verify(name);
+            appendFileSync(process.env.GITHUB_OUTPUT, 'verified=true\n');
+            console.log('Environment protection verified for all required jobs.');
+          } catch {
+            console.error('Environment protection preflight refused.');
+            process.exitCode = 1;
+          }
+          NODE
+
   attest-activation:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && needs.authorize.result == 'success' && needs.reader.result == 'success' && needs.authorize.outputs.operation == 'collect' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.authorize.outputs.operation == 'collect' }}
     needs: [authorize, reader]
     runs-on: ubuntu-latest
     environment: billing-validation-attestation
@@ -165,7 +277,7 @@ jobs:
 
 
   reader:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && needs.authorize.result == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' }}
     needs: authorize
     runs-on: ubuntu-latest
     environment: billing-validation-reader
@@ -215,7 +327,7 @@ jobs:
         run: node scripts/read-candidate.mjs
 
   test:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && needs.reader.result == 'success' && ((needs.authorize.outputs.operation == 'collect' && needs.attest-activation.result == 'success') || (needs.authorize.outputs.operation == 'recheck' && needs.attest-activation.result == 'skipped')) }}
+    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && ((needs.authorize.outputs.operation == 'collect' && needs.attest-activation.result == 'success') || (needs.authorize.outputs.operation == 'recheck' && needs.attest-activation.result == 'skipped')) }}
     needs: [authorize, reader, attest-activation]
     runs-on: ${{ needs.authorize.outputs.runner_label != '' && fromJSON(format('["{0}"]', needs.authorize.outputs.runner_label)) || 'ubuntu-latest' }}
     environment: billing-validation-tests
@@ -266,8 +378,8 @@ jobs:
           exit 1
 
   publisher:
-    if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && needs.test.result == 'success' }}
-    needs: [authorize, reader, test]
+    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && ((needs.authorize.outputs.operation == 'collect' && needs.attest-activation.result == 'success') || (needs.authorize.outputs.operation == 'recheck' && needs.attest-activation.result == 'skipped')) }}
+    needs: [authorize, reader, attest-activation, test]
     runs-on: ubuntu-latest
     environment: billing-validation-publisher
     timeout-minutes: 10
