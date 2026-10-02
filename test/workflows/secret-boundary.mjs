@@ -255,6 +255,7 @@ function assertLocalAuthorizationBoundary(workflow) {
 function workflowConfigurationStrings(workflow) {
   const configuration = structuredClone(workflow);
   delete configuration.name;
+  delete configuration['run-name'];
   for (const job of Object.values(configuration.jobs ?? {})) {
     delete job.name;
     for (const step of job.steps ?? []) delete step.name;
@@ -275,11 +276,16 @@ function workflowConfigurationStrings(workflow) {
 
 function assertNoProviderRuntimeEnvironment(workflow, path) {
   const blocked = /^(?:DATABASE_URL|POSTGRES(?:_|$)|SUPABASE(?:_|$)|STRIPE(?:_|$)|VERCEL_(?:ACCESS_TOKEN|API_TOKEN|TOKEN)(?:_|$))/iu;
+  const environments = [['workflow', workflow.env]];
   for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
-    const maps = [job.env, ...(job.steps ?? []).map((step) => step.env)];
-    for (const environment of maps) {
-      for (const key of Object.keys(environment ?? {})) {
-        assert.ok(!blocked.test(key), `${path}:${jobId} must not import provider runtime configuration`);
+    environments.push([jobId, job.env], ...(job.steps ?? []).map((step) => [jobId, step.env]));
+  }
+  for (const [scope, environment] of environments) {
+    for (const [key, value] of Object.entries(environment ?? {})) {
+      assert.ok(!blocked.test(key), `${path}:${scope} must not import provider runtime configuration`);
+      if (scope === 'workflow' && typeof value === 'string') {
+        assert.ok(!/\$\{\{[^}]*\bsecrets\b[^}]*\}\}/iu.test(value),
+          `${path}:workflow env must not import secrets`);
       }
     }
   }
@@ -296,10 +302,14 @@ export function assertWorkflowSecretBoundary(workflow, path) {
     `${path} must not select Production or Live credentials or destinations`);
   assert.ok(!configurationStrings.some((value) => /\b(?:https?|postgres(?:ql)?):\/\/[^\s"'<>]*\.supabase\.co\b/iu.test(value)),
     `${path} must not import a Supabase destination`);
+  assert.ok(!configurationStrings.some((value) => /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|sqlserver|mssql):\/\/[^\s"'<>]+/iu.test(value)),
+    `${path} must not import a database URL`);
   assert.ok(!configurationStrings.some((value) => /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/u.test(value)),
     `${path} must not import a JWT credential`);
   assert.ok(!configurationStrings.some((value) => /\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{8,}\b/iu.test(value)),
     `${path} must not import a Supabase API key`);
+  assert.ok(!configurationStrings.some((value) => /\b[rs]k_(?:test|live)_[A-Za-z0-9_-]{8,}\b/iu.test(value)),
+    `${path} must not import a Stripe secret or restricted API key`);
   assert.ok(!configurationStrings.some((value) => /\bwhsec_[A-Za-z0-9_]{8,}\b/u.test(value)),
     `${path} must not import a Stripe webhook secret`);
   assertNoProviderRuntimeEnvironment(workflow, path);

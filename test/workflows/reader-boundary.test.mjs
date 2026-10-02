@@ -45,6 +45,12 @@ test('candidate policy job and financial placeholder still cannot receive secret
 
 for (const [name, mutate] of [
   ['a local credential file', (value) => { value.jobs.test.steps[1].run = 'node --env-file=.env.local runner/collect.mjs'; }],
+  ['a workflow-level env provider credential name', (value) => {
+    value.env = { SUPABASE_SERVICE_ROLE_KEY: 'synthetic-provider-key-sentinel' };
+  }],
+  ['a workflow-level env secret reference', (value) => {
+    value.env = { SYNTHETIC_CREDENTIAL: '${{ secrets.SYNTHETIC_TEST_CREDENTIAL }}' };
+  }],
   ['a Production variable ref', (value) => {
     value.jobs.test.env = { SUPABASE_PROJECT_REF: '${{ vars.PRODUCTION_SUPABASE_PROJECT_REF }}' };
   }],
@@ -66,8 +72,29 @@ for (const [name, mutate] of [
   });
 }
 
+for (const [name, literal] of [
+  ['Stripe sk_test secret key', 'sk_test_synthetic_secret_key_0123456789'],
+  ['Stripe rk_test restricted key', 'rk_test_synthetic_restricted_key_0123456789'],
+  ['Stripe sk_live secret key', 'sk_live_synthetic_secret_key_0123456789'],
+  ['Stripe rk_live restricted key', 'rk_live_synthetic_restricted_key_0123456789'],
+  ['PostgreSQL database URL', 'postgresql://synthetic:synthetic@db.attacker.invalid:5432/billing_validation'],
+  ['MySQL database URL', 'mysql://synthetic:synthetic@db.attacker.invalid:3306/billing_validation'],
+]) {
+  test(`workflow credential boundary rejects an embedded ${name}`, () => {
+    const value = workflow();
+    value.jobs.test.steps[1].run = `printf '%s' '${literal}'`;
+    assert.throws(() => assertWorkflowSecretBoundary(value, path));
+  });
+}
+
 test('workflow boundary ignores Production and Live words in harmless step labels', () => {
   const value = workflow();
   value.jobs.test.steps[1].name = 'Reject Production credentials and Live destinations';
+  assert.doesNotThrow(() => assertWorkflowSecretBoundary(value, path));
+});
+
+test('workflow boundary ignores Production in harmless workflow run-name', () => {
+  const value = workflow();
+  value['run-name'] = 'Production billing-validation check';
   assert.doesNotThrow(() => assertWorkflowSecretBoundary(value, path));
 });
