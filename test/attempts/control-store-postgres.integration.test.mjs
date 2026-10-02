@@ -364,10 +364,27 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
         is_superuser: false, can_create_roles: true, can_create_database: true }]);
 
       await operatorClient.query(bootstrapSql);
-      const membership = await operatorClient.query(`SELECT pg_catalog.pg_has_role(
-        'postgres', 'billing_validation_owner', 'MEMBER') AS operator_is_owner_member`);
-      assert.deepEqual(membership.rows, [{ operator_is_owner_member: false }],
-        'temporary bootstrap owner membership must not persist after commit');
+      const memberships = await operatorClient.query(`SELECT granted.rolname AS granted_role,
+        member.rolname AS member_role, grantor.rolname AS grantor_role,
+        membership.admin_option, membership.inherit_option, membership.set_option
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member ON member.oid = membership.member
+        JOIN pg_catalog.pg_roles AS grantor ON grantor.oid = membership.grantor
+        WHERE granted.rolname IN ('billing_validation_owner', 'billing_validation_runtime',
+          'billing_validation_verifier') AND member.rolname = 'postgres'
+        ORDER BY granted.rolname`);
+      assert.deepEqual(memberships.rows, [
+        { granted_role: 'billing_validation_owner', member_role: 'postgres',
+          grantor_role: 'billing_control_test_admin', admin_option: true, inherit_option: false, set_option: false },
+        { granted_role: 'billing_validation_runtime', member_role: 'postgres',
+          grantor_role: 'billing_control_test_admin', admin_option: true, inherit_option: false, set_option: false },
+        { granted_role: 'billing_validation_verifier', member_role: 'postgres',
+          grantor_role: 'billing_control_test_admin', admin_option: true, inherit_option: false, set_option: false },
+      ], 'only PostgreSQL’s automatic non-inheriting, non-settable CREATEROLE memberships may remain');
+      await assert.rejects(operatorClient.query('SET ROLE billing_validation_owner'),
+        (error) => error.code === '42501',
+        'the temporary SET ROLE grant must be revoked before bootstrap commits');
     } finally {
       if (operatorClient) {
         await operatorClient.end();
