@@ -1,13 +1,13 @@
 # Isolated billing-validation control store
 
-**Status:** design approved for documentation; implementation is gated on user review of this spec.
+**Status:** approved for local implementation; remote migrations, credentials, financial-target provisioning, and production-impacting actions remain separately gated.
 **Date:** 2026-10-02
 
 ## Goal and approved boundary
 
 The new Supabase project `ceindkuafycqdcplfrgs` (“LawX Billing Validation”, `sa-east-1`, PostgreSQL 17.11) is exclusively the trusted control store for validation attempts, leases, capacity reservations, provider intents, and receipts. It is not the application database and must contain no customer or financial-fixture data.
 
-The existing isolated Preview validation branch `zjvq…` remains the only database target for billing scenarios and their synthetic financial fixtures. The app Preview receives no credential or API key for the control project. The two databases have distinct identities and URLs; neither workflow may silently substitute one for the other.
+The initial plan named `zjvq…` as the Preview validation target. Implementation review found that ref in the application's immutable protected/historical-target denylist; read-only Supabase metadata returned `Project not found`, and the current project inventory does not contain it. The current `policy/environment-policy.json` consequently remains fail-closed with `projectRef` and `connection` set to `null`. Do not remove the denylist or connect to that historical ref. A distinct financial validation project must be separately approved and provisioned, with cost confirmed, before any financial scenario can run remotely. The app Preview receives no credential or API key for the control project; it must never be substituted for a financial database.
 
 Supabase main/production, the other existing Supabase projects, Vercel Production, Stripe Live, and unrelated local Docker services are out of scope. No remote DDL, secret creation, environment modification, deployment, or financial test is authorized by this design document.
 
@@ -70,7 +70,7 @@ Local verification must run against disposable PostgreSQL 17 in Docker and prove
 6. The existing attempt/lease fencing, append-only receipts, capacity reservation, concurrency, recovery, and migration-scanner suites remain green.
 7. Workflow tests prove no CI job invokes migration application and no candidate/Preview job receives the control URL.
 
-After local review, remote rollout is a separate gated phase: inspect the new project read-only, apply only the reviewed bootstrap/migrations to `ceindkuafycqdcplfrgs` via MCP, independently verify role and schema state, then provision the runtime secret only in the protected control Environment. No action in that phase targets `zjvq…` except its already-scoped financial validation, and none targets production.
+After local review, remote control-store rollout is a separate gated phase: inspect the new project read-only, apply only the reviewed bootstrap/migrations to `ceindkuafycqdcplfrgs` via MCP, independently verify role and schema state, then provision the runtime secret only in the protected control Environment. Financial scenario rollout additionally requires a different, explicitly approved isolated project. No action targets `zjvq…`, production, Vercel Production, or Stripe Live.
 
 ## Explicit non-claims
 
