@@ -72,16 +72,14 @@ done
 
 Require active protected `main`: PR and at least one maintainer approval, CODEOWNER approval, stale-review dismissal, latest-push approval, administrator enforcement, no force pushes/deletions, and no bypass actors. Read back an active ruleset and its bypass/enforcement settings if it supplies any of those controls. A missing protection response is a stop; do not infer protection from workflow YAML.
 
-Require all five environment names above, required reviewers with self-review disabled, and deployment rules limited to the protected default branch. If a custom branch policy is reported, resolve and read back its exact branch rules; require branch `main`, not a tag or wildcard. Use these supplemental read-only queries when needed:
+Require all five environment names above, required reviewers with self-review disabled, and `deployment_branch_policy` with `protected_branches: true` and `custom_branch_policies: false` for each environment. The workflow's environment preflight requires these exact values; custom branch policies currently block it even when restricted to `main`. Separately review and change runtime support before considering custom branch policies. The workflow context guard still pins protected `main`. Use this supplemental read-only query when needed:
 
 ```bash
 gh api --paginate repos/lawx-ai/billing-validation-control/rulesets \
   --jq '.[] | {id,name,enforcement,source_type,source}'
-gh api --paginate repos/lawx-ai/billing-validation-control/environments/billing-validation-tests/deployment-branch-policies \
-  --jq '.branch_policies[] | {name,type}'
 ```
 
-For any returned ruleset ID, independently inspect its full rules and bypass actors through its read-only settings/API view. Repeat the deployment-branch-policy query for each environment reporting custom policies. Existence alone, empty reviewer lists or ambiguous branch rules do not pass. The secret loop emits names only; never retrieve or print values. Record non-secret IDs, policies and timestamps.
+For any returned ruleset ID, independently inspect its full rules and bypass actors through its read-only settings/API view. Existence alone, empty reviewer lists or ambiguous branch rules do not pass. The secret loop emits names only; never retrieve or print values. Record non-secret IDs, policies and timestamps.
 
 Preserve the existing Task 9 environment approval gate: exercise `billing-validation-tests` protection with a secret-free hosted check and obtain the user's explicit confirmation that the required reviewer approved that exact run and intended validation branch/deployment before any Preview secret provisioning. Provisioning is separate from this transfer procedure and this PR.
 
@@ -128,6 +126,18 @@ gh api --paginate "orgs/lawx-ai/actions/runner-groups/${billing_runner_group_id}
 ```
 
 The complete returned list must contain exactly `lawx-ai/billing-validation-control`, with group visibility limited to selected repositories. Require `restricted_to_workflows: true` and the exact selected workflow `lawx-ai/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main`. Inspect `workflow_restrictions_read_only` and any inherited policy to establish the effective restriction. Public-repository access may be enabled only when required for this public repository and that exact restriction is independently confirmed. Never allow general repository access, PR/fork workflows, unprotected refs or candidate code.
+
+After those restrictions are read back, inspect the group's attached runner membership before the separately supervised first registration. Use the already-resolved `billing_runner_group_id`:
+
+```bash
+set -o pipefail
+gh api --paginate "orgs/lawx-ai/actions/runner-groups/${billing_runner_group_id}/runners?per_page=100" |
+  jq -s -e 'if length == 1 and .[0].total_count == 0 and (.[0].runners | type == "array" and length == 0)
+    then {readback_at_utc: (now | todateiso8601), total_count: .[0].total_count, attached_runner_count: (.[0].runners | length)}
+    else error("runner membership unreadable, ambiguous, or nonzero") end'
+```
+
+Require a successful readback showing zero attached runners; record its UTC timestamp and non-secret count/output as evidence. Treat an API or parsing error, ambiguous response, or any attached runner as a stop: keep registration blocked and seek independent review. Do not remove or mutate runners to satisfy this check.
 
 If GitHub cannot apply or expose these exact restrictions, do not register the runner. Do not remove `--runnergroup`, use a default/broader group, substitute a persistent or shared runner, or rely on `runs-on` labels as admission proof. Preserve ephemeral, single-job, no-default-labels registration and the random 128-bit per-attempt label with trusted reservation and stale-registration checks.
 
