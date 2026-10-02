@@ -29,9 +29,13 @@ SECURITY DEFINER
 SET search_path = pg_catalog
 AS $control_store_verifier$
   WITH control_state AS (
+    -- PostgreSQL 17 CREATEROLE leaves one superuser-granted ADMIN membership
+    -- from bootstrap role postgres to each created role, with INHERIT and SET off.
+    -- The checks below allow only that exact catalog row and reject any drift.
     SELECT owner.oid AS owner_oid,
       runtime.oid AS runtime_oid,
       verifier.oid AS verifier_oid,
+      bootstrap_operator.oid AS bootstrap_operator_oid,
       verifier_function.oid AS verifier_function_oid,
       schema_role.rolname AS schema_owner,
       owner.rolcanlogin AS owner_login,
@@ -43,7 +47,13 @@ AS $control_store_verifier$
       runtime.rolbypassrls AS runtime_bypass_rls,
       pg_catalog.pg_has_role(runtime.oid, owner.oid, 'MEMBER') AS runtime_member_of_owner,
       EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members AS membership
-        WHERE membership.member = runtime.oid OR membership.roleid = runtime.oid)
+        WHERE (membership.member = runtime.oid OR membership.roleid = runtime.oid)
+          AND NOT (
+            membership.roleid = runtime.oid AND membership.member = bootstrap_operator.oid
+            AND membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option
+            AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS grantor
+              WHERE grantor.oid = membership.grantor AND grantor.rolsuper)
+          ))
         AS runtime_has_role_membership,
       EXISTS (SELECT 1 FROM pg_catalog.pg_class AS relation
         WHERE relation.relnamespace = namespace.oid AND relation.relowner = runtime.oid)
@@ -58,7 +68,13 @@ AS $control_store_verifier$
       verifier.rolbypassrls AS verifier_bypass_rls,
       pg_catalog.pg_has_role(verifier.oid, owner.oid, 'MEMBER') AS verifier_member_of_owner,
       EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members AS membership
-        WHERE membership.member = verifier.oid OR membership.roleid = verifier.oid)
+        WHERE (membership.member = verifier.oid OR membership.roleid = verifier.oid)
+          AND NOT (
+            membership.roleid = verifier.oid AND membership.member = bootstrap_operator.oid
+            AND membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option
+            AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS grantor
+              WHERE grantor.oid = membership.grantor AND grantor.rolsuper)
+          ))
         AS verifier_has_role_membership,
       EXISTS (SELECT 1 FROM pg_catalog.pg_class AS relation
         WHERE relation.relnamespace = namespace.oid AND relation.relowner = verifier.oid)
@@ -142,6 +158,7 @@ AS $control_store_verifier$
     CROSS JOIN pg_catalog.pg_roles AS anon
     CROSS JOIN pg_catalog.pg_roles AS authenticated
     CROSS JOIN pg_catalog.pg_roles AS service_role
+    JOIN pg_catalog.pg_roles AS bootstrap_operator ON bootstrap_operator.rolname = 'postgres'
     JOIN pg_catalog.pg_namespace AS namespace ON namespace.nspname = 'billing_validation_control'
     JOIN pg_catalog.pg_roles AS schema_role ON schema_role.oid = namespace.nspowner
     JOIN pg_catalog.pg_proc AS verifier_function ON verifier_function.pronamespace = namespace.oid
@@ -288,6 +305,17 @@ AS $control_store_verifier$
     AND NOT control_state.verifier_bypass_rls
     AND NOT control_state.verifier_member_of_owner
     AND NOT control_state.verifier_has_role_membership
+    AND NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_auth_members AS membership
+      WHERE (membership.member = control_state.owner_oid OR membership.roleid = control_state.owner_oid)
+        AND NOT (
+          membership.roleid = control_state.owner_oid
+          AND membership.member = control_state.bootstrap_operator_oid
+          AND membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option
+          AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS grantor
+            WHERE grantor.oid = membership.grantor AND grantor.rolsuper)
+        )
+    )
     AND NOT control_state.verifier_owns_objects
     AND control_state.verifier_schema_usage
     AND NOT control_state.verifier_schema_create

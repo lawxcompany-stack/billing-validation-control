@@ -443,6 +443,8 @@ test('opt-in local PostgreSQL 17 runtime-identity verifier and NOLOGIN privilege
       { grantedRole: 'service_role', memberRole: 'billing_validation_runtime' },
       { grantedRole: 'billing_validation_verifier', memberRole: 'billing_validation_owner' },
       { grantedRole: 'service_role', memberRole: 'billing_validation_verifier' },
+      { grantedRole: 'billing_validation_owner', memberRole: 'service_role' },
+      { grantedRole: 'service_role', memberRole: 'billing_validation_owner' },
     ];
     for (const { grantedRole, memberRole } of unexpectedMemberships) {
       await client.query('BEGIN');

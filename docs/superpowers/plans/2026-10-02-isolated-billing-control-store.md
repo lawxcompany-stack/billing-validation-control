@@ -225,7 +225,7 @@ Expected: FAIL because the explicit privilege inventory and final role grants do
 
 - [ ] **Step 3: Derive an operation-to-column matrix from the store SQL**
 
-Inventory each query in `postgres-store.mjs` and map it to only the required table and columns. Preserve the current state upserts for attempts/leases/locks, grant UPDATE only for columns assigned by those statements, and grant only required sequence use. Give append-only relations only SELECT/INSERT. Give runtime no privileges on `schema_migrations`. Do not use schema-wide, table-wide, default, or role-membership grants as a shortcut.
+Inventory each query in `postgres-store.mjs` and map it to only the required table and columns. Preserve the current state upserts for attempts/leases/locks, grant UPDATE only for columns assigned by those statements, and grant only required sequence use. Give append-only relations only SELECT/INSERT. Give runtime no privileges on `schema_migrations`. Do not use schema-wide, table-wide, default, or role-membership grants as a shortcut. The exact PostgreSQL 17 CREATEROLE-created admin membership from bootstrap role `postgres` to each new role is a managed-platform exception, not an application grant; allow only `ADMIN=true, INHERIT=false, SET=false` and reject all other memberships.
 
 - [ ] **Step 4: Remove row-lock requirements from immutable relations**
 
@@ -237,7 +237,7 @@ The current `setRetentionFixtureRowsUsed` uses `ON CONFLICT DO UPDATE` on `fixtu
 
 - [ ] **Step 6: Add role and negative-operation PostgreSQL tests**
 
-Test owner is `NOLOGIN` and schema/object owner; runtime is not owner/member and has no elevated role attributes; exact SELECT/INSERT/column-UPDATE/DELETE/sequence/function rights match the manifest; runtime operations required by the store succeed; runtime cannot create/alter schema objects, alter or disable triggers, write/read the migration ledger, update/delete/truncate append-only history, or access these tables as `anon`, `authenticated`, `service_role`, or `PUBLIC`. Assert no default ACL expands future grants.
+Test owner is `NOLOGIN` and schema/object owner; runtime is not owner or a member of owner/elevated roles and has no elevated role attributes; allow only the exact PostgreSQL 17 automatic `postgres` admin-membership row (`ADMIN=true, INHERIT=false, SET=false`) for each created role, and reject additional memberships. Assert exact SELECT/INSERT/column-UPDATE/DELETE/sequence/function rights match the manifest; runtime operations required by the store succeed; runtime cannot create/alter schema objects, alter or disable triggers, write/read the migration ledger, update/delete/truncate append-only history, or access these tables as `anon`, `authenticated`, `service_role`, or `PUBLIC`. Assert no default ACL expands future grants.
 
 - [ ] **Step 7: Prove migration-directory isolation and run focused behavior/concurrency regressions**
 
@@ -300,7 +300,7 @@ Delete `applyAttemptMigrations` and `installAttemptSchema` from the runtime stor
 
 - [ ] **Step 4: Add a bounded read-only database verifier**
 
-Keep migration `202610030001-control-store-verifier.sql` immutable and add a forward-only `202610040001-control-verifier-role.sql` migration; append only the latter's exact digest to `CONTROL_STORE_BOOTSTRAP_PINS`. The owner-owned, fixed-search-path, read-only function exposes only the control project sentinel, server identity/version, runtime and verifier role flags/membership, schema owner, baseline/migration digest summary, and canonical privilege fingerprint. It does not return rows, credentials, SQL, or financial values and does not grant runtime access to `schema_migrations`. The new migration revokes function `EXECUTE` from `billing_validation_runtime` and grants it only to `billing_validation_verifier`; tests prove no writes and no caller-supplied SQL/role changes. Preserve exact hashes for already-pinned `0001`, `0002`, and `0003` migrations.
+Keep migration `202610030001-control-store-verifier.sql` immutable and add a forward-only `202610040001-control-verifier-role.sql` migration; append only the latter's exact digest to `CONTROL_STORE_BOOTSTRAP_PINS`. The owner-owned, fixed-search-path, read-only function exposes only the control project sentinel, server identity/version, runtime and verifier role flags/membership, schema owner, baseline/migration digest summary, and canonical privilege fingerprint. It does not return rows, credentials, SQL, or financial values and does not grant runtime access to `schema_migrations`. The new migration revokes function `EXECUTE` from `billing_validation_runtime` and grants it only to `billing_validation_verifier`; tests prove no writes and no caller-supplied SQL/role changes. Membership verification permits only the exact PostgreSQL 17 non-inheriting/non-settable admin membership from `postgres` to each created role; any other membership or option state is rejected. Preserve exact hashes for already-pinned `0001`, `0002`, and `0003` migrations.
 
 - [ ] **Step 5: Bind every transaction to the control store before work**
 

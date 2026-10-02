@@ -17,14 +17,29 @@ async function readVerifierGateDiagnostics(client) {
   const result = await client.query(`
     WITH state AS (
       SELECT owner.oid AS owner_oid, runtime.oid AS runtime_oid, verifier.oid AS verifier_oid,
+        bootstrap_operator.oid AS bootstrap_operator_oid,
         verifier_function.oid AS verifier_function_oid,
         verifier.rolcanlogin AS verifier_login, verifier.rolsuper AS verifier_superuser,
         verifier.rolcreaterole AS verifier_create_role, verifier.rolcreatedb AS verifier_create_database,
         verifier.rolreplication AS verifier_replication, verifier.rolbypassrls AS verifier_bypass_rls,
         pg_catalog.pg_has_role(verifier.oid, owner.oid, 'MEMBER') AS verifier_member_of_owner,
         EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members AS membership
-          WHERE membership.member = verifier.oid OR membership.roleid = verifier.oid)
+          WHERE (membership.member = verifier.oid OR membership.roleid = verifier.oid)
+            AND NOT (
+              membership.roleid = verifier.oid AND membership.member = bootstrap_operator.oid
+              AND membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option
+              AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS grantor
+                WHERE grantor.oid = membership.grantor AND grantor.rolsuper)
+            ))
           AS verifier_has_role_membership,
+        EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members AS membership
+          WHERE (membership.member = owner.oid OR membership.roleid = owner.oid)
+            AND NOT (
+              membership.roleid = owner.oid AND membership.member = bootstrap_operator.oid
+              AND membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option
+              AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS grantor
+                WHERE grantor.oid = membership.grantor AND grantor.rolsuper)
+            )) AS owner_has_role_membership,
         EXISTS (SELECT 1 FROM pg_catalog.pg_class AS relation
           WHERE relation.relnamespace = namespace.oid AND relation.relowner = verifier.oid)
           OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc AS routine
@@ -81,6 +96,7 @@ async function readVerifierGateDiagnostics(client) {
       CROSS JOIN pg_catalog.pg_roles AS anon
       CROSS JOIN pg_catalog.pg_roles AS authenticated
       CROSS JOIN pg_catalog.pg_roles AS service_role
+      JOIN pg_catalog.pg_roles AS bootstrap_operator ON bootstrap_operator.rolname = 'postgres'
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.nspname = $4
       JOIN pg_catalog.pg_proc AS verifier_function ON verifier_function.pronamespace = namespace.oid
         AND verifier_function.proname = 'verify_attempt_control_store' AND verifier_function.pronargs = 0
@@ -94,6 +110,7 @@ async function readVerifierGateDiagnostics(client) {
       'verifier_replication', verifier_replication, 'verifier_bypass_rls', verifier_bypass_rls,
       'verifier_member_of_owner', verifier_member_of_owner,
       'verifier_has_role_membership', verifier_has_role_membership,
+      'owner_has_role_membership', owner_has_role_membership,
       'verifier_owns_objects', verifier_owns_objects, 'owner_owns_objects', owner_owns_objects,
       'verifier_schema_usage', verifier_schema_usage, 'verifier_schema_create', verifier_schema_create,
       'verifier_table_privileges', verifier_table_privileges,
@@ -470,6 +487,31 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
     } finally {
       await client.query('ROLLBACK');
     }
+
+    for (const { options, changed } of [
+      { options: 'WITH ADMIN TRUE, INHERIT TRUE, SET FALSE', changed: 'INHERIT' },
+      { options: 'WITH ADMIN TRUE, INHERIT FALSE, SET TRUE', changed: 'SET' },
+      { options: 'WITH ADMIN FALSE, INHERIT FALSE, SET FALSE', changed: 'ADMIN' },
+    ]) {
+      await client.query('BEGIN');
+      try {
+        // A superuser simulates drift in each field of the immutable automatic row.
+        await client.query(`ALTER ROLE ${verifierRole} LOGIN`);
+        await client.query(`GRANT ${verifierRole} TO postgres ${options}`);
+        await client.query(`SET LOCAL SESSION AUTHORIZATION ${verifierRole}`);
+        const changedMembershipReceipt = await client.query(`SELECT * FROM ${schema}.verify_attempt_control_store()`);
+        assert.deepEqual(changedMembershipReceipt.rows, [],
+          `verifier must reject an automatic CREATEROLE membership with changed ${changed} option`);
+        const changedMembershipGates = await readVerifierGateDiagnostics(client);
+        assert.equal(changedMembershipGates.verifier_has_role_membership, true,
+          `diagnostics must identify changed ${changed} option as unexpected`);
+        await client.query('ROLLBACK');
+      } catch (error) {
+        try { await client.query('ROLLBACK'); } catch { /* preserve the original verification failure */ }
+        throw error;
+      }
+    }
+
     const verifierRoleState = await client.query(`SELECT rolcanlogin FROM pg_catalog.pg_roles
       WHERE rolname = $1`, [verifierRole]);
     assert.deepEqual(verifierRoleState.rows, [{ rolcanlogin: false }],

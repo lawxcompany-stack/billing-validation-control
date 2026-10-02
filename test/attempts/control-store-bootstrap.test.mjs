@@ -135,7 +135,7 @@ test('control-store 0003 pins executable verifier SQL while 0004 adds the verifi
   const verifierRoleMigration = verifierRoleMigrationBytes.toString('utf8');
 
   assert.equal(sha256(oldVerifierBytes), '56ca6c77487900bbd9affc934665e08f5bc5246e42c1adb9a077d828c8034698');
-  assert.equal(sha256(verifierRoleMigrationBytes), '40e47a94aaab6e8513133a11896c8338e177588d1bd8278c64779767ea16f267');
+  assert.equal(sha256(verifierRoleMigrationBytes), 'b7320a78a302f3164d013232003fdc30279f31748a6f74de29b4440d7d555bcc');
   assert.match(verifierRoleMigration,
     /REVOKE EXECUTE ON FUNCTION billing_validation_control\.verify_attempt_control_store\(\)\s+FROM\b[^;]*\bbilling_validation_runtime\b[^;]*;/u);
   assert.match(verifierRoleMigration, /GRANT EXECUTE ON FUNCTION billing_validation_control\.verify_attempt_control_store\(\) TO billing_validation_verifier;/u);
