@@ -87,6 +87,24 @@ for (const [name, literal] of [
   });
 }
 
+test('workflow credential boundary rejects driver-qualified database URLs at opaque hosts', () => {
+  for (const databaseUrl of [
+    'postgresql+psycopg://synthetic:synthetic@db.attacker.invalid:5432/billing_validation',
+    'postgres+psycopg://synthetic:synthetic@db.attacker.invalid:5432/billing_validation',
+    'mysql+pymysql://synthetic:synthetic@db.attacker.invalid:3306/billing_validation',
+    'mariadb+asyncmy://synthetic:synthetic@db.attacker.invalid:3306/billing_validation',
+    'mongodb+srv://synthetic:synthetic@cluster.attacker.invalid/billing_validation',
+    'redis://synthetic:synthetic@cache.attacker.invalid:6379/0',
+    'rediss://synthetic:synthetic@cache.attacker.invalid:6379/0',
+    'sqlserver://synthetic:synthetic@db.attacker.invalid:1433/billing_validation',
+    'mssql+pyodbc://synthetic:synthetic@db.attacker.invalid:1433/billing_validation',
+  ]) {
+    const value = workflow();
+    value.jobs.test.steps[1].run = `printf '%s' '${databaseUrl}'`;
+    assert.throws(() => assertWorkflowSecretBoundary(value, path), /must not import a database URL/u);
+  }
+});
+
 test('workflow boundary ignores Production and Live words in harmless step labels', () => {
   const value = workflow();
   value.jobs.test.steps[1].name = 'Reject Production credentials and Live destinations';

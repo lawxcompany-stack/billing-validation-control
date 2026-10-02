@@ -302,7 +302,7 @@ export function assertWorkflowSecretBoundary(workflow, path) {
     `${path} must not select Production or Live credentials or destinations`);
   assert.ok(!configurationStrings.some((value) => /\b(?:https?|postgres(?:ql)?):\/\/[^\s"'<>]*\.supabase\.co\b/iu.test(value)),
     `${path} must not import a Supabase destination`);
-  assert.ok(!configurationStrings.some((value) => /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|sqlserver|mssql):\/\/[^\s"'<>]+/iu.test(value)),
+  assert.ok(!configurationStrings.some((value) => /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|sqlserver|mssql)(?:\+[a-z0-9_-]+)?:\/\/[^\s"'<>]+/iu.test(value)),
     `${path} must not import a database URL`);
   assert.ok(!configurationStrings.some((value) => /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/u.test(value)),
     `${path} must not import a JWT credential`);
