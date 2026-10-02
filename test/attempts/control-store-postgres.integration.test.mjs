@@ -229,7 +229,7 @@ async function assertPreflightRefusal(client, sql, savepoint, expectedMessage) {
 
 function testAttemptRow(attemptId, runId, suffix) {
   return [attemptId, projectRef, 'control-store-db-harness', `fixture-${runId}`, 'c'.repeat(40),
-    'lawxcompany-stack/billing-validation-control', 'refs/heads/local-db-harness', String(700000 + suffix),
+    'lawx-ai/billing-validation-control', 'refs/heads/local-db-harness', String(700000 + suffix),
     1, `billing-validation-${'d'.repeat(32)}`, projectRef, `dpl_local_${suffix}`,
     'https://preview.invalid', `acct_local_${suffix}`];
 }
@@ -261,7 +261,7 @@ async function putLease(client, { attemptId, runId, suffix, fence, expectedFence
       owner_run_attempt = EXCLUDED.owner_run_attempt, recovery_only = EXCLUDED.recovery_only
     WHERE ${schema}.standalone_fixture_leases.fence IS NOT DISTINCT FROM $7::uuid`,
   [ref, suite, fixtureKey, attemptId, fence, expiresAt, expectedFence, 'c'.repeat(40),
-    'lawxcompany-stack/billing-validation-control', 'refs/heads/local-db-harness', String(700000 + suffix), 1]);
+    'lawx-ai/billing-validation-control', 'refs/heads/local-db-harness', String(700000 + suffix), 1]);
 }
 
 async function appendLeaseHistory(client, { attemptId, runId, suffix, fence, projectRef: ref,

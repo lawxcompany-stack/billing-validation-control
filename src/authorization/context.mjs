@@ -1,7 +1,8 @@
 import { types } from 'node:util';
 import { AuthorizationRefusal, createAuthorizationManifest } from './manifest.mjs';
+import { CONTROL_REPOSITORY, matchesControlRepository } from '../contracts/control-identity.mjs';
 
-const ROOT = 'https://api.github.com/repos/lawxcompany-stack/billing-validation-control';
+const ROOT = `https://api.github.com/repos/${CONTROL_REPOSITORY}`;
 const WORKFLOW = '.github/workflows/authorize-local-collector.yml';
 const JOB_NAMES = ['authorize', 'reader', 'attest-activation'];
 const MAX_RESPONSE_BYTES = 65_536;
@@ -78,15 +79,15 @@ async function readJson(response, signal) {
   }
 }
 
-function repositoryMatches(repo, manifest) {
-  return record(repo) && id(repo.id, manifest.control.repositoryId) && repo.full_name === manifest.control.repository;
+function repositoryMatches(repo) {
+  return record(repo) && id(repo.id) && matchesControlRepository(repo.full_name, repo.id);
 }
 
 function checkRun(run, manifest, workflowId) {
   const control = manifest.control;
   if (!record(run) || !id(run.id, control.runId) || !id(run.run_attempt, control.runAttempt)
     || !id(run.workflow_id) || (workflowId !== undefined && run.workflow_id !== workflowId)
-    || !repositoryMatches(run.repository, manifest) || !repositoryMatches(run.head_repository, manifest)
+    || !repositoryMatches(run.repository) || !repositoryMatches(run.head_repository)
     || ![WORKFLOW, `${WORKFLOW}@main`].includes(run.path) || run.event !== 'workflow_dispatch'
     || run.head_branch !== 'main' || run.head_sha !== control.sha
     || run.status !== 'completed' || run.conclusion !== 'success') refuse();
@@ -145,7 +146,7 @@ export async function readAuthorizationContextWithDependencies(input) {
       return readJson(response, requestSignal);
     });
     const repo = await request('');
-    if (!repositoryMatches(repo, manifest) || repo.name !== 'billing-validation-control'
+    if (!repositoryMatches(repo) || repo.name !== 'billing-validation-control'
       || repo.default_branch !== 'main' || repo.private !== false || repo.visibility !== 'public') refuse();
     const runPath = `/actions/runs/${manifest.control.runId}`;
     const attemptPath = `${runPath}/attempts/${manifest.control.runAttempt}`;

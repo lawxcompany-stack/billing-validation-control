@@ -171,7 +171,7 @@ function concurrentAdapter() {
 
 const key = { projectRef: 'abcdefghijklmnopqrst', suite: 'billing', fixtureKey: 'invoice-a' };
 const candidateSha = 'a'.repeat(40);
-const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
+const workflow = { repository: 'lawx-ai/billing-validation-control',
   ref: 'refs/heads/main', runId: '100', runAttempt: 1,
   runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
 const environment = { database: { projectRef: key.projectRef },

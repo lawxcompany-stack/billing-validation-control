@@ -3,7 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createActivationManifest, serializeActivationManifest } from './activation-manifest.mjs';
 
-const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
+import { CONTROL_REPOSITORY } from '../src/contracts/control-identity.mjs';
 const CONTROL_REF = 'refs/heads/main';
 const CONTROL_WORKFLOW_PATH = '.github/workflows/validate-billing.yml';
 

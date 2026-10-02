@@ -28,6 +28,29 @@ function isHostedRunner(runsOn) {
   return typeof runsOn === 'string' && runsOn.endsWith('-latest') && !runsOn.includes('self-hosted');
 }
 
+for (const path of [workflowPaths[0], '.github/workflows/authorize-local-collector.yml']) {
+  for (const [id, job] of Object.entries(readWorkflow(path).jobs)) {
+    if (!job.if?.includes('workflow_dispatch')) continue;
+    test(`${path}:${id} operational guard pins the canonical repository and unchanged ID`, () => {
+      assert.match(job.if, /github\.repository\s*==\s*'lawx-ai\/billing-validation-control'/u);
+      assert.match(job.if, /github\.repository_id\s*==\s*'1384018279'/u);
+    });
+  }
+}
+
+test('every pull-request validation job stays on a GitHub-hosted runner', () => {
+  let policyJobs = 0;
+  for (const path of workflowPaths) {
+    for (const [id, job] of Object.entries(readWorkflow(path).jobs)) {
+      if (!job.if?.includes("github.event_name == 'pull_request'")) continue;
+      policyJobs++;
+      assert.ok(isHostedRunner(job['runs-on']), `${path}:${id}`);
+      assert.equal(job['runs-on'], 'ubuntu-latest');
+    }
+  }
+  assert.ok(policyJobs > 0);
+});
+
 test('both workflow files parse as YAML and use only supported event triggers', () => {
   const workflows = workflowPaths.map(readWorkflow);
   const eventNames = workflows.flatMap((workflow) => Object.keys(workflow.on ?? {}));

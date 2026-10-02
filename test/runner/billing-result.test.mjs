@@ -8,7 +8,7 @@ const manifestModule = await import('../../runner/billing-result-manifest.mjs').
 const verifierModule = await import('../../runner/billing-result-verifier-internal.mjs').catch(() => null);
 const writerModule = await import('../../runner/write-billing-result-manifest.mjs').catch(() => null);
 
-const repository = 'lawxcompany-stack/billing-validation-control';
+const repository = 'lawx-ai/billing-validation-control';
 const workflowPath = '.github/workflows/validate-billing.yml';
 const controlRef = 'refs/heads/main';
 const workflowSha = 'd'.repeat(40);
@@ -373,6 +373,9 @@ test('verifier accepts only the exact result subject signed by the protected wor
   const [{ command, args }] = boundary.calls;
   assert.equal(command, 'gh');
   assert.deepEqual(args.slice(0, 2), ['attestation', 'verify']);
+  assert.equal(args[args.indexOf('--repo') + 1], 'lawx-ai/billing-validation-control');
+  assert.equal(args[args.indexOf('--signer-workflow') + 1],
+    'lawx-ai/billing-validation-control/.github/workflows/validate-billing.yml');
   assert.ok(args.includes('--deny-self-hosted-runners'));
 });
 
@@ -388,12 +391,16 @@ test('verifier rejects a missing attestation result', async () => {
 });
 
 for (const [claim, mutation] of [
+  ...['subjectAlternativeName', 'buildSignerURI', 'sourceRepositoryURI', 'runInvocationURI'].map((field) => [
+    `old owner in ${field} with correct repository ID`,
+    (certificate) => ({ ...certificate, [field]: certificate[field].replace('lawx-ai/', 'lawxcompany-stack/') }),
+  ]),
   ['OIDC issuer', (certificate) => ({ ...certificate, issuer: 'https://evil.invalid' })],
   ['repository identity', (certificate) => ({ ...certificate, sourceRepositoryURI: 'https://github.com/attacker/control' })],
   ['repository numeric ID', (certificate) => ({ ...certificate, sourceRepositoryIdentifier: '999' })],
   ['protected source ref', (certificate) => ({ ...certificate, sourceRepositoryRef: 'refs/heads/feature' })],
   ['workflow identity', (certificate) => ({ ...certificate, subjectAlternativeName: 'https://github.com/attacker/control/.github/workflows/validate-billing.yml@refs/heads/main' })],
-  ['workflow path', (certificate) => ({ ...certificate, buildSignerURI: 'https://github.com/lawxcompany-stack/billing-validation-control/.github/workflows/other.yml@refs/heads/main' })],
+  ['workflow path', (certificate) => ({ ...certificate, buildSignerURI: 'https://github.com/lawx-ai/billing-validation-control/.github/workflows/other.yml@refs/heads/main' })],
   ['workflow ref', (certificate) => ({ ...certificate, githubWorkflowRef: 'refs/heads/feature' })],
   ['workflow SHA', (certificate) => ({ ...certificate, githubWorkflowSHA: 'e'.repeat(40) })],
   ['replayed run attempt', (certificate) => ({ ...certificate, runInvocationURI: `https://github.com/${repository}/actions/runs/${runId}/attempts/1` })],

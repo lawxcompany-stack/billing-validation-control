@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createSnapshot, verifyRecheckSnapshot } from '../../src/contracts/attempt.mjs';
+import { createSnapshot, validWorkflow, verifyRecheckSnapshot } from '../../src/contracts/attempt.mjs';
 import { createAttemptStore } from '../../src/attempts/store.mjs';
 
 const row = {
   attemptId: 'attempt-123', key: { projectRef: 'abcdefghijklmnopqrst', suite: 'billing', fixtureKey: 'invoice-a' },
-  candidateSha: 'a'.repeat(40), workflow: { repository: 'lawxcompany-stack/billing-validation-control',
+  candidateSha: 'a'.repeat(40), workflow: { repository: 'lawx-ai/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1, runnerLabel: 'billing-validation-' + 'a'.repeat(32) },
   environment: { database: { projectRef: 'abcdefghijklmnopqrst' },
     deployment: { id: 'dpl_candidate123', origin: 'https://candidate.vercel.app' },
@@ -21,6 +21,25 @@ function fixture() {
     candidateSha: row.candidateSha, currentHeadSha: row.candidateSha,
     artifactId: 'artifact-321', artifactDigest: digest,
   } };
+}
+
+test('persisted attempt accepts the canonical control workflow identity', () => {
+  assert.equal(validWorkflow(row.workflow), true);
+  const { snapshot, expected } = fixture();
+  assert.equal(snapshot.workflow.repository, 'lawx-ai/billing-validation-control');
+  assert.equal(verifyRecheckSnapshot(snapshot, expected), true);
+});
+
+for (const repository of [
+  'lawxcompany-stack/billing-validation-control',
+  'lawxcompany-stack/Plataforma-LawX',
+]) {
+  test(`persisted attempt refuses workflow repository ${repository}`, () => {
+    const workflow = { ...row.workflow, repository };
+    assert.equal(validWorkflow(workflow), false);
+    assert.throws(() => createSnapshot({ ...row, workflow }, 'artifact-321'),
+      { code: 'attempt_private_material' });
+  });
 }
 
 test('snapshot contains only synthetic public fields and has a 48-hour maximum retention', () => {

@@ -8,7 +8,7 @@ import {
   serializeActivationManifest,
 } from './activation-manifest.mjs';
 
-const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID } from '../src/contracts/control-identity.mjs';
 const CONTROL_WORKFLOW_PATH = '.github/workflows/validate-billing.yml';
 const CONTROL_REF = 'refs/heads/main';
 const OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
@@ -112,8 +112,7 @@ export async function verifyActivationAttestationWithBoundary({ manifest, proces
   let temporaryDirectory;
   try {
     if (!processBoundary || typeof processBoundary.run !== 'function' ||
-        typeof reviewedControlRepositoryId !== 'string' ||
-        !/^[1-9][0-9]{0,19}$/u.test(reviewedControlRepositoryId) ||
+        reviewedControlRepositoryId !== CONTROL_REPOSITORY_ID ||
         signal?.aborted === true || (signal !== undefined && (!signal ||
           typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function'))) {
       refuse();

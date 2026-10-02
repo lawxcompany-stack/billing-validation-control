@@ -8,6 +8,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { authorizationFixture } from './fixtures.mjs';
 import { releaseFixture } from './task2-fixtures.mjs';
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID } from '../../src/contracts/control-identity.mjs';
 
 const root = path.resolve(import.meta.dirname, '../..');
 const dispatchModule = path.join(root, 'src/authorization/dispatch.mjs');
@@ -52,6 +53,12 @@ test('emission binds the exact candidate receipt and selected release in an immu
   assert.ok(Object.isFrozen(dispatch));
   const manifest = emitLocalAuthorization({ ...f, dispatch });
   assert.deepEqual(manifest, authorizationFixture());
+  assert.equal(manifest.control.repository, CONTROL_REPOSITORY);
+  assert.equal(manifest.control.repositoryId, CONTROL_REPOSITORY_ID);
+  assert.equal(manifest.candidate.repository, 'lawxcompany-stack/Plataforma-LawX');
+  assert.equal(manifest.candidate.repositoryId, '1234079266');
+  assert.equal(manifest.collectorRelease.image,
+    'ghcr.io/lawxcompany-stack/billing-validation-control@sha256:' + 'e'.repeat(64));
   f.receipt.jobs[0].jobId = '99';
   f.releasePolicy.releases[0].policy.limitsDigest = '0'.repeat(64);
   assert.equal(manifest.prerequisites.jobs[0].jobId, '456789012');
@@ -73,6 +80,15 @@ for (const [name, change] of [
   ['other branch', f => { f.context.ref = 'refs/heads/preview'; }],
   ['other default branch', f => { f.context.defaultBranch = 'preview'; }],
   ['other repo', f => { f.context.repository = 'other/repo'; }],
+  ['old owner', f => {
+    f.context.repository = 'lawxcompany-stack/billing-validation-control';
+    f.context.workflowRef = `${f.context.repository}/.github/workflows/authorize-local-collector.yml@refs/heads/main`;
+  }],
+  ['candidate as control', f => {
+    f.context.repository = 'lawxcompany-stack/Plataforma-LawX';
+    f.context.repositoryId = '1234079266';
+    f.context.workflowRef = `${f.context.repository}/.github/workflows/authorize-local-collector.yml@refs/heads/main`;
+  }],
   ['other repo ID', f => { f.context.repositoryId = '123'; }],
   ['PR event', f => { f.context.eventName = 'pull_request'; }],
   ['old workflow', f => { f.context.workflowRef = f.context.workflowRef.replace('authorize-local-collector', 'validate-billing'); }],
@@ -167,6 +183,10 @@ test('real authorize and writer scripts create one private canonical subject and
   const bytes = await fs.readFile(target, 'utf8');
   const m = JSON.parse(bytes);
   assert.equal(m.candidate.repositoryId, '1234079266');
+  assert.equal(m.control.repository, CONTROL_REPOSITORY);
+  assert.equal(m.control.repositoryId, CONTROL_REPOSITORY_ID);
+  assert.equal(m.collectorRelease.image,
+    'ghcr.io/lawxcompany-stack/billing-validation-control@sha256:' + 'e'.repeat(64));
   assert.equal(m.operation, 'collect'); assert.equal(m.sourceExecutionId, null);
   assert.equal(Date.parse(m.expiresAt) - Date.parse(m.issuedAt), 1_200_000);
   assert.equal(bytes, JSON.stringify(m) + '\n');

@@ -4,8 +4,8 @@ import { test } from 'node:test';
 import { serializeActivationManifest } from '../../runner/activation-manifest.mjs';
 import { createRunnerSupervisor } from '../../runner/supervisor-internal.mjs';
 
-const REPOSITORY = 'lawxcompany-stack/billing-validation-control';
-const REPOSITORY_ID = '12345678';
+const REPOSITORY = 'lawx-ai/billing-validation-control';
+const REPOSITORY_ID = '1384018279';
 const WORKFLOW_PATH = '.github/workflows/validate-billing.yml';
 const RUN_ID = '123456789';
 const RUN_ATTEMPT = '2';

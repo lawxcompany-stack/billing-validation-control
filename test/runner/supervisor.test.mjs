@@ -12,8 +12,8 @@ const workflowContextInternal = await import('../../runner/workflow-context-inte
 const activationVerifierInternal = await import('../../runner/activation-verifier-internal.mjs').catch(() => ({}));
 const egress = await import('../../runner/egress-proxy.mjs').catch(() => ({}));
 const IMAGE = `sha256:${'c'.repeat(64)}`;
-const REPOSITORY = 'lawxcompany-stack/billing-validation-control';
-const REPOSITORY_ID = '12345678';
+const REPOSITORY = 'lawx-ai/billing-validation-control';
+const REPOSITORY_ID = '1384018279';
 const RUN_ID = '123456789';
 const RUN_ATTEMPT = '2';
 const CONTROL_SHA = 'd'.repeat(40);

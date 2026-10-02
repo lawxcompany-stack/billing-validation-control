@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import YAML from 'yaml';
 
 const workflow = YAML.parse(readFileSync('.github/workflows/validate-billing.yml', 'utf8'));
-const repository = 'lawxcompany-stack/billing-validation-control';
+const repository = 'lawx-ai/billing-validation-control';
 const github = {
   event_name: 'workflow_dispatch',
   repository,

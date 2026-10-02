@@ -24,7 +24,7 @@ function assertReaderBoundary(job) {
   assert.equal(job.needs, 'authorize');
   assert.equal(job['continue-on-error'], undefined);
   assert.equal(job.env, undefined);
-  assert.equal(job.if, "${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' }}");
+  assert.equal(job.if, "${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' }}");
   assert.equal(job.steps.length, 4, 'credentialed reader runs only the reviewed fixed steps');
   const [checkout, setup, token, consumer] = job.steps;
   for (const [step, allowed] of [
@@ -51,6 +51,7 @@ function assertReaderBoundary(job) {
   assert.equal(consumer.run, 'node scripts/read-candidate.mjs');
   assert.deepEqual(consumer.env, {
     CONTROL_REPOSITORY: '${{ github.repository }}',
+    CONTROL_REPOSITORY_ID: '${{ github.repository_id }}',
     CONTROL_REF: '${{ github.ref }}',
     CONTROL_DEFAULT_BRANCH: '${{ github.event.repository.default_branch }}',
     CONTROL_REF_PROTECTED: '${{ github.ref_protected }}',
@@ -66,7 +67,7 @@ function assertReaderBoundary(job) {
 
 function assertResultAttestationBoundary(job) {
   const expression = value => '${{ ' + value + ' }}';
-  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.validate-result-input.result == 'success' && needs.authorize.outputs.operation == 'collect'";
+  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.validate-result-input.result == 'success' && needs.authorize.outputs.operation == 'collect'";
   assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'environment', 'timeout-minutes', 'permissions', 'steps'].sort());
   assert.equal(job.if, expression(guard));
   assert.deepEqual(job.needs, ['authorize', 'reader', 'test', 'validate-result-input']);
@@ -116,7 +117,7 @@ function assertResultAttestationBoundary(job) {
 
 function assertResultInputValidationBoundary(job) {
   const expression = value => '${{ ' + value + ' }}';
-  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.authorize.outputs.operation == 'collect'";
+  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.authorize.outputs.operation == 'collect'";
   assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'timeout-minutes', 'permissions', 'steps'].sort());
   assert.equal(job.if, expression(guard));
   assert.deepEqual(job.needs, ['authorize', 'reader', 'test']);
@@ -141,7 +142,7 @@ function assertResultInputValidationBoundary(job) {
 
 function assertResultVerificationBoundary(job) {
   const expression = value => '${{ ' + value + ' }}';
-  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.attest-result.result == 'success' && needs.authorize.outputs.operation == 'collect'";
+  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.attest-result.result == 'success' && needs.authorize.outputs.operation == 'collect'";
   assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'timeout-minutes', 'permissions', 'steps'].sort());
   assert.equal(job.if, expression(guard));
   assert.deepEqual(job.needs, ['authorize', 'reader', 'test', 'attest-result']);
@@ -182,7 +183,7 @@ function assertResultVerificationBoundary(job) {
 
 function assertControlStoreRuntimeBoundary(workflow) {
   const expression = (value) => '${{ ' + value + ' }}';
-  const guard = "github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.authorize.outputs.operation == 'collect'";
+  const guard = "github.event_name == 'workflow_dispatch' && github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.authorize.outputs.operation == 'collect'";
   const job = workflow.jobs['control-store'];
 
   assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'environment', 'timeout-minutes', 'permissions', 'steps'].sort());
@@ -236,7 +237,7 @@ function assertControlStoreRuntimeBoundary(workflow) {
 // commands and expressions also cover bracket/toJSON credential exfiltration and
 // job/step defaults, containers, paths, shell or conditional execution bypasses.
 function assertLocalAuthorizationBoundary(workflow) {
-  const guard = "github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected";
+  const guard = "github.event_name == 'workflow_dispatch' && github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected";
   const expression = text => '${{ ' + text + ' }}';
   const setup = () => [
     { name: 'Checkout exact triggering workflow SHA',

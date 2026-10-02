@@ -22,7 +22,7 @@ const retentionPolicy = { version: 1, quotas: {
   attempts: 20, databaseRows: 200, authUsers: 20, stripeObjects: 200,
 } };
 const projection = { attempts: 1, databaseRows: 10, authUsers: 1, stripeObjects: 10 };
-const recheckRun = { repository: 'lawxcompany-stack/billing-validation-control',
+const recheckRun = { repository: 'lawx-ai/billing-validation-control',
   ref: 'refs/heads/main', runId: '200', runAttempt: 1 };
 const cleanupProjection = Object.freeze({ cleanupClaim: 'owned_reversible_provider_fixtures_only',
   databaseBaselineDigest: 'c'.repeat(64), mutatedResourceIds: ['cs_synthetic123'],
@@ -32,7 +32,7 @@ const cleanupProjection = Object.freeze({ cleanupClaim: 'owned_reversible_provid
 
 function input(attemptId = 'attempt-a', candidateSha = shaA, fixtureKey = 'invoice-a') {
   return { attemptId, key: { ...key, fixtureKey }, candidateSha, workflow: {
-    repository: 'lawxcompany-stack/billing-validation-control', ref: 'refs/heads/main',
+    repository: 'lawx-ai/billing-validation-control', ref: 'refs/heads/main',
     runId: '100', runAttempt: 1, runnerLabel: `billing-validation-${'a'.repeat(32)}`,
   }, environment, ttlSeconds: 60, retentionPolicy, projection };
 }

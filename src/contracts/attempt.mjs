@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { CONTROL_REPOSITORY } from './control-identity.mjs';
 import { isValidExpectedEnvironment } from './evidence.mjs';
 
 export class AttemptArtifactRefusal extends Error {
@@ -26,7 +27,7 @@ const SNAPSHOT_KEYS = ['schema', 'artifactId', 'attemptId', 'key', 'candidateSha
 export function validWorkflow(workflow) {
   return keysOnly(workflow, ['repository', 'ref', 'runId', 'runAttempt', 'runnerLabel']) &&
     Object.keys(workflow).length === 5 &&
-    workflow.repository === 'lawxcompany-stack/billing-validation-control' &&
+    workflow.repository === CONTROL_REPOSITORY &&
     /^refs\/heads\/[A-Za-z0-9._/-]+$/.test(workflow.ref) &&
     /^[1-9][0-9]{0,19}$/.test(workflow.runId) &&
     Number.isSafeInteger(workflow.runAttempt) && workflow.runAttempt > 0 &&

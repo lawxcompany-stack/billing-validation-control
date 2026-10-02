@@ -153,7 +153,7 @@ test('rejects an oversized webhook response after a valid account read', async (
 
 const owner = Object.freeze({ attemptId: 'attempt-stripe-local',
   fence: '11111111-1111-4111-8111-111111111111', candidateSha: 'c'.repeat(40),
-  workflow: Object.freeze({ repository: 'lawxcompany-stack/billing-validation-control',
+  workflow: Object.freeze({ repository: 'lawx-ai/billing-validation-control',
     ref: 'refs/heads/main', runId: '123456', runAttempt: 2,
     runnerLabel: `billing-validation-${'f'.repeat(32)}` }),
   environment: Object.freeze({ database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst' }),

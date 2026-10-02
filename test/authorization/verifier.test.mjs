@@ -29,6 +29,32 @@ function fixture(mutate) {
 }
 const invalid = { code: 'authorization_attestation_invalid' };
 
+for (const repository of ['lawxcompany-stack/billing-validation-control',
+  'other/billing-validation-control', 'lawxcompany-stack/Plataforma-LawX']) {
+  test(`attestation rejects coherent foreign signer identity ${repository}`, async () => {
+    const f = fixture((out) => {
+      const cert = out[0].verificationResult.signature.certificate;
+      const repo = `https://github.com/${repository}`;
+      cert.subjectAlternativeName = cert.buildSignerURI = `${repo}/${WORKFLOW}@refs/heads/main`;
+      cert.sourceRepositoryURI = repo;
+      cert.runInvocationURI = `${repo}/actions/runs/${f.manifest.control.runId}/attempts/${f.manifest.control.runAttempt}`;
+      if (repository.endsWith('/Plataforma-LawX')) cert.sourceRepositoryIdentifier = '1234079266';
+    });
+    await assert.rejects(f.verify(), invalid);
+    assert.doesNotThrow(f.challenge.assertUsable);
+  });
+}
+
+test('attestation rejects changed signer workflow even with matching SAN and signer URI', async () => {
+  const f = fixture((out) => {
+    const cert = out[0].verificationResult.signature.certificate;
+    cert.subjectAlternativeName = cert.buildSignerURI =
+      'https://github.com/lawx-ai/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main';
+  });
+  await assert.rejects(f.verify(), invalid);
+  assert.doesNotThrow(f.challenge.assertUsable);
+});
+
 test('synthetic boundary success invokes fixed gh verification and consumes only into an authorization receipt', async () => {
   const f = fixture();
   const receipt = await f.verify();
@@ -39,6 +65,9 @@ test('synthetic boundary success invokes fixed gh verification and consumes only
   assert.equal(f.calls.length, 1);
   const [{ command, args, options }] = f.calls;
   assert.equal(command, 'gh');
+  assert.equal(args[args.indexOf('--repo') + 1], 'lawx-ai/billing-validation-control');
+  assert.equal(args[args.indexOf('--signer-workflow') + 1],
+    'lawx-ai/billing-validation-control/.github/workflows/authorize-local-collector.yml');
   assert.deepEqual(args, ['attestation', 'verify', args[2],
     '--repo', CONTROL, '--signer-workflow', `${CONTROL}/${WORKFLOW}`,
     '--signer-digest', 'd'.repeat(40),

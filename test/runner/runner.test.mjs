@@ -89,6 +89,9 @@ done
 : > "$ACTIONS_RUNNER_HOME/.credentials_rsaparams"
 `);
   await writeFile(runPath, `#!/bin/sh
+set -eu
+[ "\${RUNNER_REGISTRATION_TOKEN+x}" != x ] || exit 98
+printf '%s\\n' "$@" > "$ACTIONS_RUNNER_HOME/run-args.txt"
 if [ "\${BVC_TEST_BLOCK_RUNNER:-no}" = yes ]; then
   : > "$BVC_TEST_RUNNER_STARTED"
   trap 'exit 143' TERM
@@ -101,12 +104,12 @@ exit "$BVC_TEST_RUN_STATUS"
   ]));
   const env = { ...process.env, ACTIONS_RUNNER_HOME: runnerHome,
     GITHUB_REPOSITORY: 'forged/local-value-is-ignored',
-    CONTROL_REPOSITORY: 'lawxcompany-stack/billing-validation-control',
-    CONTROL_REPOSITORY_ID: '12345678',
+    CONTROL_REPOSITORY: 'lawx-ai/billing-validation-control',
+    CONTROL_REPOSITORY_ID: '1384018279',
     CONTROL_EVENT_NAME: 'workflow_dispatch', CONTROL_DEFAULT_BRANCH: 'main',
     CONTROL_REF: 'refs/heads/main',
     CONTROL_WORKFLOW_PATH: '.github/workflows/validate-billing.yml',
-    CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main',
+    CONTROL_WORKFLOW_REF: 'lawx-ai/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main',
     CONTROL_RUN_ID: '123456789', CONTROL_RUN_ATTEMPT: '2',
     CONTROL_WORKFLOW_SHA: 'd'.repeat(40), CONTROL_CANDIDATE_SHA: 'a'.repeat(40),
     CONTROL_ACTIVATION_COMMITMENT: 'c'.repeat(64), CONTROL_RUNNER_LABEL: runnerLabel,
@@ -128,6 +131,14 @@ test('mocked ephemeral runner success and failure scrub credentials and preserve
     assert.match(configArgs, /--disableupdate/u);
     assert.match(configArgs, /--no-default-labels/u);
     assert.match(configArgs, /--runnergroup\nbilling-validation-isolated/u);
+    const args = configArgs.trimEnd().split('\n');
+    assert.equal(args[args.indexOf('--url') + 1], 'https://github.com/lawx-ai');
+    assert.equal(args[args.indexOf('--labels') + 1], runnerLabel);
+    assert.equal(args[args.indexOf('--name') + 1], runnerLabel);
+    assert.equal(args[args.indexOf('--work') + 1], '_work');
+    assert.ok(args.includes('--unattended'));
+    assert.ok(!args.includes('--replace'));
+    assert.equal(await readFile(path.join(runnerHome, 'run-args.txt'), 'utf8'), '--once\n');
     assert.match(configArgs, /--labels/u);
     assert.match(configArgs, /\[redacted\]/u);
     assert.doesNotMatch(configArgs, /placeholder-value-not-a-credential/u);
@@ -202,12 +213,19 @@ test('runner entrypoint ignores forgeable local GitHub environment values', asyn
 
 test('runner entrypoint refuses malformed or mismatched CONTROL metadata before registration', async () => {
   const rejected = [
+    { CONTROL_REPOSITORY: 'lawxcompany-stack/billing-validation-control' },
+    { CONTROL_REPOSITORY: 'lawxcompany-stack/billing-validation-control',
+      CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main' },
+    { CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main' },
+    { CONTROL_REPOSITORY_ID: '12345678' },
+    { CONTROL_REPOSITORY_ID: '1384018280' },
+    { CONTROL_REPOSITORY_ID: '01384018279' },
     { CONTROL_REPOSITORY_ID: '0' },
     { CONTROL_EVENT_NAME: 'pull_request' },
     { CONTROL_DEFAULT_BRANCH: 'trunk' },
     { CONTROL_REF: 'refs/heads/feature' },
     { CONTROL_WORKFLOW_PATH: '.github/workflows/other.yml' },
-    { CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/other.yml@refs/heads/main' },
+    { CONTROL_WORKFLOW_REF: 'lawx-ai/billing-validation-control/.github/workflows/other.yml@refs/heads/main' },
     { CONTROL_RUN_ID: '01' },
     { CONTROL_RUN_ATTEMPT: '0' },
     { CONTROL_WORKFLOW_SHA: 'not-a-sha' },
@@ -215,6 +233,8 @@ test('runner entrypoint refuses malformed or mismatched CONTROL metadata before 
     { CONTROL_ACTIVATION_COMMITMENT: 'nonce-must-not-be-presented' },
     { CONTROL_RUNNER_LABEL: `billing-validation-${'b'.repeat(32)}` },
     { CONTROL_RUNNER_GROUP: 'shared-runner-group' },
+    { CONTROL_RUNNER_GROUP: '' },
+    { RUNNER_REGISTRATION_TOKEN: '' },
   ];
   for (const override of rejected) {
     await withFakeRunner(0, async ({ env, runnerHome, capturePath }) => {
