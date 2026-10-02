@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -109,18 +110,14 @@ function assertCanonicalWorkflowGuards(workflow, path) {
     `${path} must declare workflow_dispatch`);
   assert.ok(workflow.jobs && typeof workflow.jobs === 'object', `${path} must declare jobs`);
 
-  const guardedJobs = Object.hasOwn(workflow.jobs, 'authorize')
-    ? [['authorize', workflow.jobs.authorize]]
-    : Object.entries(workflow.jobs);
-  assert.ok(guardedJobs.length > 0, `${path} must have a protected workflow_dispatch job`);
-
-  for (const [jobName, job] of guardedJobs) {
-    assert.equal(typeof job?.if, 'string', `${path} jobs.${jobName} must have an identity guard`);
-    assert.match(job.if, /github\.repository\s*==\s*['"]lawx-ai\/billing-validation-control['"]/u,
-      `${path} jobs.${jobName} must guard the canonical control repository`);
-    assert.match(job.if, /github\.repository_id\s*==\s*['"]1384018279['"]/u,
-      `${path} jobs.${jobName} must guard the canonical control repository ID`);
-  }
+  const authorizeJob = workflow.jobs.authorize;
+  assert.ok(authorizeJob && typeof authorizeJob === 'object', `${path} must declare jobs.authorize`);
+  assert.equal(typeof authorizeJob.if, 'string', `${path} jobs.authorize must have an identity guard`);
+  assert.doesNotMatch(authorizeJob.if, /\|\|/u, `${path} jobs.authorize must not use disjunction`);
+  assert.match(authorizeJob.if, /github\.repository\s*==\s*['"]lawx-ai\/billing-validation-control['"]/u,
+    `${path} jobs.authorize must guard the canonical control repository`);
+  assert.match(authorizeJob.if, /github\.repository_id\s*==\s*['"]1384018279['"]/u,
+    `${path} jobs.authorize must guard the canonical control repository ID`);
 }
 
 assert.equal(CONTROL_REPOSITORY, 'lawx-ai/billing-validation-control');
@@ -164,6 +161,32 @@ const workflowMissingAuthorizeGuard = {
 assert.throws(() => assertCanonicalWorkflowGuards(workflowMissingAuthorizeGuard, 'synthetic-workflow.yml'),
   /jobs\.authorize must guard the canonical control repository/u,
   'a guard elsewhere in the workflow must not compensate for a missing authorize-job guard');
+
+test('requires an authorize job when another guarded job exists', () => {
+  const workflowWithoutAuthorize = {
+    on: { workflow_dispatch: {} },
+    jobs: {
+      reader: { if: "${{ github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279' }}" },
+    },
+  };
+
+  assert.throws(() => assertCanonicalWorkflowGuards(workflowWithoutAuthorize, 'synthetic-workflow.yml'),
+    /must declare jobs\.authorize/u,
+    'a guarded reader must not substitute for the authorize job');
+});
+
+test('requires repository name and ID guards to be conjunctive', () => {
+  const workflowWithDisjunctiveAuthorizeGuard = {
+    on: { workflow_dispatch: {} },
+    jobs: {
+      authorize: { if: "${{ github.repository == 'lawx-ai/billing-validation-control' || github.repository_id == '1384018279' }}" },
+    },
+  };
+
+  assert.throws(() => assertCanonicalWorkflowGuards(workflowWithDisjunctiveAuthorizeGuard, 'synthetic-workflow.yml'),
+    /jobs\.authorize must not use disjunction/u,
+    'both canonical identity predicates must be required by the authorize guard');
+});
 
 for (const encodedSlug of [
   String.raw`lawxcompany-stack\/billing-validation-control`,
