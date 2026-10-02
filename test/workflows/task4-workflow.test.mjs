@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import YAML from 'yaml';
 import { parseDispatch } from '../../src/contracts/dispatch.mjs';
 import { resolveCandidate } from '../../src/github/candidate.mjs';
+import { readCandidatePrerequisites } from '../../src/github/candidate-reader.mjs';
 
 const workflow = YAML.parse(readFileSync('.github/workflows/validate-billing.yml', 'utf8'));
 const repository = 'lawxcompany-stack/billing-validation-control';
@@ -139,6 +140,28 @@ test('candidate IDs remain validated data, including shell-injection spellings',
   for (const value of ['$(touch /tmp/task4)', '`id`', 'a\noperation=recheck', sha + ';id']) {
     assert.throws(() => parseDispatch({ ...input, candidate_sha: value }, dispatchContext));
     assert.throws(() => parseDispatch({ ...input, candidate_repository: value }, dispatchContext));
+  }
+});
+
+for (const [name, pull, code] of [
+  ['closed pull request', { state: 'closed', head: { sha } }, 'candidate_pr_not_found'],
+  ['head SHA mismatch', { state: 'open', head: { sha: 'f'.repeat(40) } }, 'candidate_head_not_current'],
+]) test(`rejected ${name} proof makes the reader fail before scheduling attestation or finance`, async () => {
+  const calls = [];
+  const api = { async get(path) {
+    calls.push(path);
+    return [{ number: 140, state: pull.state,
+      head: { ...pull.head, repo: { full_name: candidateRepository, id: 1234079266 } },
+      base: { ref: 'preview', sha: 'd'.repeat(40), repo: { full_name: candidateRepository, id: 1234079266 } } }];
+  } };
+  await assert.rejects(readCandidatePrerequisites({ api, candidateSha: sha,
+    context: { ...dispatchContext, eventName: 'workflow_dispatch' } }), { code });
+  assert.deepEqual(calls, [`/repos/${candidateRepository}/commits/${sha}/pulls?per_page=100&page=1`]);
+
+  const blocked = structuredClone(needs);
+  blocked.reader.result = 'failure';
+  for (const job of ['attest-activation', 'test', 'publisher']) {
+    assert.equal(eligible(job, github, blocked), false, `${name}: ${job}`);
   }
 });
 
