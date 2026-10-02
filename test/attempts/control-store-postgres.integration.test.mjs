@@ -330,24 +330,32 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
     // Supabase's `postgres` is a CREATEROLE/CREATEDB administrator, not a superuser.
     // Replace the disposable cluster's bootstrap superuser temporarily to exercise
     // the exact role boundary that the remote Management API uses.
+    const adminPassword = randomBytes(32).toString('base64url');
     const operatorPassword = randomBytes(32).toString('base64url');
-    let adminRoleRenamed = false;
-    let operatorRoleCreated = false;
+    let adminRoleCreated = false;
+    let operatorRoleMayBeDemoted = false;
+    let postgresRoleRestored = false;
+    let adminClient;
     let operatorClient;
     try {
-      await client.query('ALTER ROLE postgres RENAME TO billing_control_test_admin');
-      adminRoleRenamed = true;
-      await client.query(`CREATE ROLE postgres WITH LOGIN NOSUPERUSER CREATEROLE CREATEDB
+      await client.query(`CREATE ROLE billing_control_test_admin WITH LOGIN SUPERUSER
+        PASSWORD '${adminPassword}'`);
+      adminRoleCreated = true;
+      adminClient = new Client({ ...connection, user: 'billing_control_test_admin', password: adminPassword,
+        connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
+      await adminClient.connect();
+      operatorRoleMayBeDemoted = true;
+      await adminClient.query(`ALTER ROLE postgres WITH LOGIN NOSUPERUSER CREATEROLE CREATEDB
         PASSWORD '${operatorPassword}'`);
-      operatorRoleCreated = true;
       operatorClient = new Client({ ...connection, user: 'postgres', password: operatorPassword,
         connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
       await operatorClient.connect();
       const managedOperator = await operatorClient.query(`SELECT current_user, session_user,
-        role.rolsuper AS is_superuser, role.rolcreaterole AS can_create_roles
+        role.rolsuper AS is_superuser, role.rolcreaterole AS can_create_roles,
+        role.rolcreatedb AS can_create_database
         FROM pg_catalog.pg_roles AS role WHERE role.rolname = current_user`);
       assert.deepEqual(managedOperator.rows, [{ current_user: 'postgres', session_user: 'postgres',
-        is_superuser: false, can_create_roles: true }]);
+        is_superuser: false, can_create_roles: true, can_create_database: true }]);
 
       await operatorClient.query(bootstrapSql);
       const membership = await operatorClient.query(`SELECT pg_catalog.pg_has_role(
@@ -359,17 +367,30 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
         try { await operatorClient.query('ROLLBACK'); } catch { /* the migration may already have committed */ }
         await operatorClient.end();
       }
-      if (operatorRoleCreated) {
-        await client.query('ALTER ROLE postgres RENAME TO billing_control_test_operator');
+      if (adminClient) {
+        try {
+          if (operatorRoleMayBeDemoted) {
+            await adminClient.query('ALTER ROLE postgres WITH LOGIN SUPERUSER CREATEROLE CREATEDB');
+          }
+          postgresRoleRestored = true;
+        } finally {
+          await adminClient.end();
+        }
+      } else if (!operatorRoleMayBeDemoted) {
+        postgresRoleRestored = true;
       }
-      if (adminRoleRenamed) {
-        await client.query('ALTER ROLE billing_control_test_admin RENAME TO postgres');
+      if (postgresRoleRestored) {
+        await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+        await client.query(`DROP ROLE IF EXISTS billing_validation_owner, billing_validation_runtime,
+          billing_validation_verifier`);
+        if (adminRoleCreated) await client.query('DROP ROLE IF EXISTS billing_control_test_admin');
       }
-      await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-      await client.query(`DROP ROLE IF EXISTS billing_validation_owner, billing_validation_runtime,
-        billing_validation_verifier`);
-      await client.query('DROP ROLE IF EXISTS billing_control_test_operator');
     }
+
+    const restoredOperator = await client.query(`SELECT rolcanlogin, rolsuper, rolcreaterole, rolcreatedb
+      FROM pg_catalog.pg_roles WHERE rolname = 'postgres'`);
+    assert.deepEqual(restoredOperator.rows, [{ rolcanlogin: true, rolsuper: true,
+      rolcreaterole: true, rolcreatedb: true }], 'the disposable superuser must be restored before later probes');
 
     await client.query(bootstrapSql);
 
