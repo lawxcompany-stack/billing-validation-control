@@ -298,7 +298,7 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
     await clusterAdmin.query('CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN; CREATE ROLE service_role NOLOGIN;');
     const postgresPassword = randomBytes(32).toString('base64url');
     await clusterAdmin.query(`CREATE ROLE postgres WITH LOGIN SUPERUSER PASSWORD '${postgresPassword}'`);
-    await clusterAdmin.query('GRANT CONNECT ON DATABASE postgres TO postgres');
+    await clusterAdmin.query('GRANT CONNECT, CREATE ON DATABASE postgres TO postgres');
     client = new Client({ ...connection, user: 'postgres', password: postgresPassword,
       connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
     await client.connect();
@@ -471,7 +471,10 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
     await proveLeaseRace(client, connection, randomBytes(16).toString('hex'));
   } finally {
     if (client) await client.end();
-    try { await clusterAdmin.query('DROP ROLE IF EXISTS postgres'); } catch { /* the isolated cluster is removed after a failed test */ }
+    try {
+      await clusterAdmin.query('REVOKE ALL PRIVILEGES ON DATABASE postgres FROM postgres');
+      await clusterAdmin.query('DROP ROLE IF EXISTS postgres');
+    } catch { /* the isolated cluster is removed after a failed test */ }
     await clusterAdmin.end();
   }
 });
