@@ -2,12 +2,14 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { preflightRuntime, validateEnvironmentPolicy } from '../../src/runtime/preflight.mjs';
-import { createSupabaseBillingReader, createSupabaseFixturePublisher, verifySupabaseEnvironment } from '../../src/runtime/supabase.mjs';
-import { createVerifiedContext } from '../../src/billing/contracts.mjs';
+import { assertSupabaseRuntimeConfiguration, createSupabaseBillingReader, createSupabaseFixturePublisher,
+  verifySupabaseEnvironment } from '../../src/runtime/supabase.mjs';
+import { createVerifiedContext, isValidBillingEnvironment, isValidStandaloneProjectRef } from '../../src/billing/contracts.mjs';
 import { candidate, deployment, policy } from './fixture.mjs';
 import { makeAttemptParts } from '../billing/support.mjs';
 import { createSupabaseWebhookObserver } from '../../src/runtime/supabase-webhook-observer.mjs';
-import { databasePolicy, trustedConfiguration, projectDetails, migrations, generatedTypes } from './standalone-fixture.mjs';
+import { databasePolicy, trustedConfiguration, projectDetails, organizationProjects, migrations,
+  generatedTypes } from './standalone-fixture.mjs';
 
 const standalonePolicy = { ...policy, schema_version: 3, database: databasePolicy };
 const token = 'synthetic-read-token';
@@ -21,8 +23,32 @@ function fixture(details = projectDetails) {
       [`https://api.supabase.com/v1/projects/${databasePolicy.projectRef}/database/migrations`]: migrations,
       [`https://api.supabase.com/v1/projects/${databasePolicy.projectRef}/types/typescript?included_schemas=public`]: generatedTypes,
     };
+    if (new URL(url).pathname === `/v1/organizations/${databasePolicy.organizationSlug}/projects`) {
+      return new Response(JSON.stringify(organizationProjects), { headers: { 'Content-Type': 'application/json' } });
+    }
     assert.ok(Object.hasOwn(replies, url), 'only the narrow pinned project read routes are permitted');
     return new Response(JSON.stringify(replies[url]), { headers: { 'Content-Type': 'application/json' } });
+  } };
+}
+
+function paginatedInventoryFixture({ details = projectDetails, projects = organizationProjects } = {}) {
+  const calls = [];
+  return { calls, async fetchImpl(url, options) {
+    calls.push({ url, method: options.method });
+    assert.equal(options.method, 'GET');
+    const parsed = new URL(url);
+    let value;
+    if (parsed.pathname === `/v1/projects/${databasePolicy.projectRef}`) value = details;
+    else if (parsed.pathname === '/v1/organizations/synthetic-validation-org/projects') {
+      const limit = Number(parsed.searchParams.get('limit'));
+      const offset = Number(parsed.searchParams.get('offset'));
+      assert.equal(limit, 100);
+      assert.ok(Number.isSafeInteger(offset) && offset >= 0);
+      value = projects.slice(offset, offset + limit);
+    } else if (parsed.pathname.endsWith('/database/migrations')) value = migrations;
+    else if (parsed.pathname.endsWith('/types/typescript')) value = generatedTypes;
+    else assert.fail(`unexpected read route: ${parsed.pathname}`);
+    return new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
   } };
 }
 
@@ -45,6 +71,96 @@ test('legacy branch policy cannot remain a final validation target even with com
   assert.deepEqual(f.calls, []);
 });
 
+test('known historical Production refs stay blocked when policy deny fields are edited together', () => {
+  for (const blockedRef of ['kvmmnwmfgkhipuxmuxbr', 'gzemotsvxlgomamhtfie',
+    'zjvqjdntasprusoqfsgw', 'zyxwvutsrqponmlkjihg']) {
+    assert.equal(isValidStandaloneProjectRef(blockedRef), false, `${blockedRef} is immutable-denylisted`);
+    const database = { ...databasePolicy, projectRef: blockedRef,
+      productionProjectRef: 'cccccccccccccccccccc', branchProjectRefs: [],
+      connection: { ...databasePolicy.connection, host: `db.${blockedRef}.supabase.co` } };
+    assert.throws(() => assertSupabaseRuntimeConfiguration({ policy: { ...standalonePolicy, database }, token,
+      trustedConfiguration: { ...trustedConfiguration, SUPABASE_VALIDATION_PROJECT_REF: blockedRef,
+        databaseUrl: `postgresql://billing_validation_reader:synthetic-password@db.${blockedRef}.supabase.co:5432/postgres` },
+      fetchImpl: async () => { assert.fail('blocked ref must fail before any request'); } }),
+    { code: 'supabase_policy_invalid' });
+  }
+});
+
+test('project details must pin the canonical database host before migrations or types', async () => {
+  for (const host of [undefined, 'db.bbbbbbbbbbbbbbbbbbbb.supabase.co']) {
+    const details = { ...projectDetails, database: { ...projectDetails.database, ...(host === undefined ? {} : { host }) } };
+    if (host === undefined) delete details.database.host;
+    const f = fixture(details);
+    await assert.rejects(verifySupabaseEnvironment({ policy: standalonePolicy, token,
+      trustedConfiguration, fetchImpl: f.fetchImpl }), { code: 'supabase_project_mismatch' });
+    assert.equal(f.calls.length, 1);
+  }
+});
+
+test('complete organization inventory must prove unique standalone membership before schema reads', async () => {
+  const f = paginatedInventoryFixture();
+  const result = await verifySupabaseEnvironment({ policy: standalonePolicy, token,
+    trustedConfiguration, fetchImpl: f.fetchImpl });
+  assert.equal(result.projectRef, 'abcdefghijklmnopqrst');
+  assert.deepEqual(f.calls.map(({ url }) => new URL(url).pathname), [
+    '/v1/projects/abcdefghijklmnopqrst',
+    '/v1/organizations/synthetic-validation-org/projects',
+    '/v1/projects/abcdefghijklmnopqrst/database/migrations',
+    '/v1/projects/abcdefghijklmnopqrst/types/typescript',
+  ]);
+});
+
+test('branch, ambiguous, or incomplete organization inventory refuses before migrations and types', async () => {
+  const cases = [
+    { projects: organizationProjects.map((entry) => entry.ref === databasePolicy.projectRef
+      ? { ...entry, is_branch: true } : entry), code: 'supabase_project_inventory_mismatch' },
+    { projects: organizationProjects.map((entry) => entry.ref === databasePolicy.projectRef
+      ? { ...entry, is_branch: undefined } : entry), code: 'supabase_project_inventory_invalid' },
+    { projects: [...organizationProjects, organizationProjects[0]], code: 'supabase_project_inventory_invalid' },
+    { projects: [organizationProjects[1]], code: 'supabase_project_inventory_mismatch' },
+  ];
+  for (const { projects, code } of cases) {
+    const f = paginatedInventoryFixture({ projects });
+    await assert.rejects(verifySupabaseEnvironment({ policy: standalonePolicy, token,
+      trustedConfiguration, fetchImpl: f.fetchImpl }), { code });
+    assert.deepEqual(f.calls.map(({ url }) => new URL(url).pathname), [
+      '/v1/projects/abcdefghijklmnopqrst', '/v1/organizations/synthetic-validation-org/projects',
+    ]);
+  }
+});
+
+test('organization inventory paginates to completion and rejects duplicate refs across pages', async () => {
+  const projects = Array.from({ length: 99 }, (_, index) => ({ ...organizationProjects[1],
+    ref: `${String(index).padStart(2, '0')}bbbbbbbbbbbbbbbbbb`, is_branch: true }));
+  projects.push(organizationProjects[0]);
+  const paged = paginatedInventoryFixture({ projects });
+  const result = await verifySupabaseEnvironment({ policy: standalonePolicy, token,
+    trustedConfiguration, fetchImpl: paged.fetchImpl });
+  assert.equal(result.projectRef, databasePolicy.projectRef);
+  assert.deepEqual(paged.calls.slice(0, 3).map(({ url }) => new URL(url).searchParams.get('offset')),
+    [null, '0', '100']);
+
+  const repeated = paginatedInventoryFixture({ projects: [...projects.slice(0, 100), ...projects.slice(0, 100)] });
+  await assert.rejects(verifySupabaseEnvironment({ policy: standalonePolicy, token,
+    trustedConfiguration, fetchImpl: repeated.fetchImpl }), { code: 'supabase_project_inventory_invalid' });
+  assert.deepEqual(repeated.calls.slice(0, 3).map(({ url }) => new URL(url).pathname), [
+    '/v1/projects/abcdefghijklmnopqrst', '/v1/organizations/synthetic-validation-org/projects',
+    '/v1/organizations/synthetic-validation-org/projects',
+  ]);
+});
+
+test('new billing execution, reader, and publisher contracts reject historical branch envelopes', () => {
+  const h = makeAttemptParts();
+  assert.equal(isValidBillingEnvironment(h.owner.environment), false);
+  assert.throws(() => createVerifiedContext(h), { code: 'billing_environment_unverified' });
+  assert.throws(() => createSupabaseBillingReader({ expectedEnvironment: h.owner.environment, source: {
+    async readIdentity() {}, async readBillingSnapshot() {}, async listAttemptFixtures() {},
+    async readSyntheticFixture() {}, async readWebhookInbox() {}, async readWebhookReceipts() {},
+  } }), { code: 'supabase_reader_unavailable' });
+  assert.throws(() => createSupabaseFixturePublisher({ expectedEnvironment: h.owner.environment }),
+    { code: 'supabase_fixture_adapter_unavailable' });
+});
+
 test('pooler and privileged or divergent connection policy pins cannot authorize a target', async () => {
   for (const change of [{ mode: 'transaction-pooler' }, { host: 'aws-0-synthetic.pooler.supabase.com' },
     { host: 'db.bbbbbbbbbbbbbbbbbbbb.supabase.co' }, { port: 6543 }, { database: 'other' },
@@ -65,6 +181,7 @@ test('standalone identity returns the pinned project and fingerprints through na
   assert.ok(Object.isFrozen(result));
   assert.deepEqual(f.calls.map(({ url }) => url), [
     'https://api.supabase.com/v1/projects/abcdefghijklmnopqrst',
+    'https://api.supabase.com/v1/organizations/synthetic-validation-org/projects?limit=100&offset=0',
     'https://api.supabase.com/v1/projects/abcdefghijklmnopqrst/database/migrations',
     'https://api.supabase.com/v1/projects/abcdefghijklmnopqrst/types/typescript?included_schemas=public',
   ]);
@@ -74,7 +191,7 @@ test('standalone identity returns the pinned project and fingerprints through na
 
 test('missing or unapproved pins and Production/shared/known branch refs refuse before any I/O', async () => {
   for (const change of [
-    { projectRef: null }, { approved: false }, { productionProjectRef: null },
+    { projectRef: null }, { organizationSlug: null }, { approved: false }, { productionProjectRef: null },
     { projectRef: 'zjvqjdntasprusoqfsgw' }, { projectRef: 'bbbbbbbbbbbbbbbbbbbb' },
     { projectRef: 'zyxwvutsrqponmlkjihg' },
     { schemaFingerprintSha256: null }, { migrationHistorySha256: null },
@@ -122,7 +239,7 @@ test('project metadata mismatch refuses before migration/schema reads or SQL ses
     { database: { ...projectDetails.database, version: '15.synthetic' } },
     { database: { ...projectDetails.database, postgres_engine: 'another-engine' } },
     { database: { ...projectDetails.database, release_channel: 'preview' } },
-    { database: null }, { parent_project_ref: databasePolicy.productionProjectRef }, { is_branch: true },
+    { database: null }, { parent_project_ref: 'zyxwvutsrqponmlkjihg' }, { is_branch: true },
   ]) {
     const f = fixture({ ...projectDetails, ...change });
     await assert.rejects(verifySupabaseEnvironment({ policy: standalonePolicy, token,

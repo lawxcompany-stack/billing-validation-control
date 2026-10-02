@@ -13,6 +13,8 @@ const PRODUCTION_BRANCH_PART = /(?:^|[-_.])(?:main|master|prod|production|primar
 const REQUEST_TIMEOUT_MS = 10_000;
 const SQL_READER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u;
 const SQL_BARRIER_IDS = new Set(['billing-sql-barrier-a', 'billing-sql-barrier-b']);
+const PROJECT_INVENTORY_PAGE_SIZE = 100;
+const PROJECT_INVENTORY_MAX_PAGES = 100;
 
 export class SupabaseRefusal extends Error {
   constructor(code) {
@@ -90,8 +92,53 @@ export function assertSupabaseRuntimeConfiguration({ policy, token, trustedConfi
   if (typeof token !== 'string' || token.length === 0 || /[\r\n]/u.test(token) || typeof fetchImpl !== 'function') {
     refuse('supabase_credentials_invalid');
   }
-  return Object.freeze({ ...db, branchProjectRefs: Object.freeze([...db.branchProjectRefs]),
-    connection: Object.freeze({ ...c }) });
+  return Object.freeze({ ...db, connection: Object.freeze({ ...c }) });
+}
+
+function validInventoryProject(value) {
+  return object(value) && typeof value.ref === 'string' && REF.test(value.ref) &&
+    typeof value.organization_id === 'string' && value.organization_id.length > 0 &&
+    typeof value.region === 'string' && /^[a-z0-9][a-z0-9-]{2,63}$/u.test(value.region) &&
+    typeof value.status === 'string' && value.status.length > 0 && typeof value.is_branch === 'boolean' &&
+    object(value.database) && typeof value.database.version === 'string' &&
+    typeof value.database.postgres_engine === 'string' && typeof value.database.release_channel === 'string';
+}
+
+async function verifyOrganizationInventory({ db, project, token, fetchImpl }) {
+  const seenRefs = new Set();
+  const matches = [];
+  let complete = false;
+
+  for (let page = 0; page < PROJECT_INVENTORY_MAX_PAGES; page += 1) {
+    const offset = page * PROJECT_INVENTORY_PAGE_SIZE;
+    const path = `/v1/organizations/${encodeURIComponent(db.organizationSlug)}/projects?limit=${PROJECT_INVENTORY_PAGE_SIZE}&offset=${offset}`;
+    const projects = await getJson(path, token, fetchImpl, 2_000_000);
+    if (!Array.isArray(projects) || projects.length > PROJECT_INVENTORY_PAGE_SIZE) {
+      refuse('supabase_project_inventory_invalid');
+    }
+    for (const entry of projects) {
+      if (!validInventoryProject(entry)) refuse('supabase_project_inventory_invalid');
+      if (seenRefs.has(entry.ref)) refuse('supabase_project_inventory_invalid');
+      seenRefs.add(entry.ref);
+      if (entry.organization_id !== db.organizationId) refuse('supabase_project_inventory_mismatch');
+      if (entry.ref === db.projectRef) matches.push(entry);
+    }
+    if (projects.length < PROJECT_INVENTORY_PAGE_SIZE) {
+      complete = true;
+      break;
+    }
+  }
+
+  if (!complete) refuse('supabase_project_inventory_invalid');
+  if (matches.length !== 1) refuse('supabase_project_inventory_mismatch');
+  const [target] = matches;
+  if (target.is_branch !== false || target.organization_id !== project.organization_id ||
+      target.region !== project.region || target.status !== project.status ||
+      target.database.version !== project.database.version ||
+      target.database.postgres_engine !== project.database.postgres_engine ||
+      target.database.release_channel !== project.database.release_channel) {
+    refuse('supabase_project_inventory_mismatch');
+  }
 }
 
 export async function verifySupabaseEnvironment({ policy, token, trustedConfiguration,
@@ -100,10 +147,15 @@ export async function verifySupabaseEnvironment({ policy, token, trustedConfigur
   const project = await getJson(`/v1/projects/${db.projectRef}`, token, fetchImpl, 256_000);
   if (!object(project) || project.ref !== db.projectRef || project.organization_id !== db.organizationId ||
       project.region !== db.region || project.status !== 'ACTIVE_HEALTHY' || !object(project.database) ||
+      project.database.host !== `db.${db.projectRef}.supabase.co` || project.database.host !== db.connection.host ||
       project.database.version !== db.databaseVersion || project.database.postgres_engine !== db.postgresEngine ||
       project.database.release_channel !== db.releaseChannel ||
       Object.hasOwn(project, 'parent_project_ref') || Object.hasOwn(project, 'branch_id') ||
       Object.hasOwn(project, 'branch_name') || project.is_branch === true) refuse('supabase_project_mismatch');
+
+  // Project details do not prove this is a standalone project. Require the complete
+  // organization inventory and an unambiguous non-branch entry before schema reads.
+  await verifyOrganizationInventory({ db, project, token, fetchImpl });
 
   const migrations = await getJson(`/v1/projects/${db.projectRef}/database/migrations`, token, fetchImpl, 512_000);
   if (!Array.isArray(migrations) || migrations.length > 10_000) refuse('supabase_migrations_invalid');

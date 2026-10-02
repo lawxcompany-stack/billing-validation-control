@@ -1,4 +1,3 @@
-import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { providerIdempotencyKey } from '../attempts/prepare.mjs';
 import { runStripeMutation, stripeRequestDigest } from '../runtime/stripe.mjs';
 import { isVerifiedDeploymentAttestation } from '../runtime/vercel.mjs';
@@ -6,9 +5,16 @@ import { immutableVercelOrigin } from '../github/deployments.mjs';
 
 const REF = /^[a-z0-9]{20}$/u;
 const DIGEST = /^[0-9a-f]{64}$/u;
-const SHARED_BRANCH_REF = 'zjvqjdntasprusoqfsgw';
-const DATABASE_KEYS = ['kind', 'approved', 'projectRef', 'productionProjectRef', 'branchProjectRefs',
-  'organizationId', 'region', 'databaseVersion', 'postgresEngine', 'releaseChannel', 'connection',
+// These refs are known protected or historical targets. This immutable code-level
+// denylist cannot be weakened by editing the environment policy alongside projectRef.
+const BLOCKED_PROJECT_REFS = Object.freeze([
+  'kvmmnwmfgkhipuxmuxbr',
+  'gzemotsvxlgomamhtfie',
+  'zjvqjdntasprusoqfsgw',
+  'zyxwvutsrqponmlkjihg',
+]);
+const DATABASE_KEYS = ['kind', 'projectRef', 'organizationId', 'organizationSlug', 'region',
+  'databaseVersion', 'postgresEngine', 'releaseChannel', 'connection',
   'schemaFingerprintSha256', 'migrationHistorySha256'];
 
 function exactDataRecord(value, keys) {
@@ -21,19 +27,16 @@ function exactDataRecord(value, keys) {
 }
 
 export function isValidStandaloneProjectRef(value) {
-  return typeof value === 'string' && REF.test(value) && value !== SHARED_BRANCH_REF;
+  return typeof value === 'string' && REF.test(value) && !BLOCKED_PROJECT_REFS.includes(value);
 }
 
 /** Trusted policy pins; nulls describe an unconfigured target, never an approved identity. */
 export function isValidStandaloneDatabasePolicy(db, { configured = false } = {}) {
-  if (!exactDataRecord(db, DATABASE_KEYS) || db.kind !== 'standalone' || typeof db.approved !== 'boolean' ||
-      !Array.isArray(db.branchProjectRefs) || db.branchProjectRefs.some((ref) => typeof ref !== 'string' || !REF.test(ref)) ||
-      new Set(db.branchProjectRefs).size !== db.branchProjectRefs.length) return false;
   const nullable = (value, pattern) => value === null || typeof value === 'string' && pattern.test(value);
-  if (!nullable(db.projectRef, REF) || !nullable(db.productionProjectRef, REF) ||
-      db.projectRef !== null && (!isValidStandaloneProjectRef(db.projectRef) ||
-        db.projectRef === db.productionProjectRef || db.branchProjectRefs.includes(db.projectRef)) ||
+  if (!exactDataRecord(db, DATABASE_KEYS) || db.kind !== 'standalone' ||
+      !nullable(db.projectRef, REF) || db.projectRef !== null && !isValidStandaloneProjectRef(db.projectRef) ||
       !nullable(db.organizationId, /^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$/u) ||
+      !nullable(db.organizationSlug, /^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$/u) ||
       !nullable(db.region, /^[a-z0-9][a-z0-9-]{2,63}$/u) ||
       !nullable(db.databaseVersion, /^[0-9][A-Za-z0-9._-]{0,63}$/u) ||
       !nullable(db.postgresEngine, /^[a-z][a-z0-9_-]{1,63}$/u) ||
@@ -48,15 +51,14 @@ export function isValidStandaloneDatabasePolicy(db, { configured = false } = {})
         ['postgres', 'service_role', 'supabase_admin', 'supabase_auth_admin', 'authenticator', 'anon', 'authenticated']
           .includes(c.role)) return false;
   }
-  return !configured || db.approved === true && DATABASE_KEYS.every((key) => db[key] !== null);
+  return !configured || DATABASE_KEYS.every((key) => db[key] !== null);
 }
 
-/** New environments carry only project identity. Legacy attempt envelopes remain readable. */
+/** New execution, reader, and publisher paths accept only the project-only identity contract. */
 export function isValidBillingEnvironment(environment) {
-  if (!isValidStandaloneProjectRef(environment?.database?.projectRef)) return false;
-  if (isValidExpectedEnvironment(environment)) return true;
   return exactDataRecord(environment, ['database', 'deployment', 'stripe']) &&
     exactDataRecord(environment.database, ['projectRef']) &&
+    isValidStandaloneProjectRef(environment.database.projectRef) &&
     exactDataRecord(environment.deployment, ['id', 'origin']) &&
     typeof environment.deployment.id === 'string' && /^dpl_[A-Za-z0-9]+$/u.test(environment.deployment.id) &&
     typeof environment.deployment.origin === 'string' &&

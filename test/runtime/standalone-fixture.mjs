@@ -1,11 +1,9 @@
 // Synthetic identities only; these are not provisioned or approved provider resources.
 export const databasePolicy = Object.freeze({
   kind: 'standalone',
-  approved: true,
   projectRef: 'abcdefghijklmnopqrst',
-  productionProjectRef: 'zyxwvutsrqponmlkjihg',
-  branchProjectRefs: Object.freeze(['zjvqjdntasprusoqfsgw', 'bbbbbbbbbbbbbbbbbbbb']),
   organizationId: 'synthetic-validation-org',
+  organizationSlug: 'synthetic-validation-org',
   region: 'synthetic-region-1',
   databaseVersion: '17.6.1.synthetic',
   postgresEngine: 'postgres',
@@ -27,9 +25,15 @@ export const projectDetails = Object.freeze({
   organization_id: databasePolicy.organizationId,
   region: databasePolicy.region,
   status: 'ACTIVE_HEALTHY',
-  database: Object.freeze({ version: databasePolicy.databaseVersion,
+  database: Object.freeze({ host: 'db.abcdefghijklmnopqrst.supabase.co', version: databasePolicy.databaseVersion,
     postgres_engine: databasePolicy.postgresEngine, release_channel: databasePolicy.releaseChannel }),
 });
+
+export const organizationProjects = Object.freeze([
+  Object.freeze({ ...projectDetails, is_branch: false }),
+  Object.freeze({ ...projectDetails, ref: 'bbbbbbbbbbbbbbbbbbbb', is_branch: true,
+    database: Object.freeze({ ...projectDetails.database, host: 'db.bbbbbbbbbbbbbbbbbbbb.supabase.co' }) }),
+]);
 
 export const migrations = Object.freeze([
   { version: '202609230002', name: 'billing' }, { version: '202609230001', name: 'init' },

@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { preflightRuntime as runtime, validateEnvironmentPolicy } from '../../src/runtime/preflight.mjs';
 import { candidate, deployment, fetchFixture, policy as configuredPolicy, signedAttestation } from './fixture.mjs';
-import { projectDetails, trustedConfiguration } from './standalone-fixture.mjs';
+import { organizationProjects, projectDetails, trustedConfiguration } from './standalone-fixture.mjs';
 
 function preflightRuntime(options) {
   return runtime({ trustedConfiguration, supabaseToken: 'synthetic-read-token',
@@ -54,6 +54,8 @@ function verifiedRuntimeFetch(overrides = {}) {
       if (url === `${deployment.origin}/api/internal/deployment-identity`) body = signedAttestation();
       else if (url === `https://api.supabase.com/v1/projects/${configuredPolicy.database.projectRef}`)
         body = { ...projectDetails, ...overrides.project };
+      else if (new URL(url).pathname === `/v1/organizations/${configuredPolicy.database.organizationSlug}/projects`)
+        body = organizationProjects;
       else if (url.endsWith('/database/migrations')) body = [
         { version: '202609230002', name: 'billing' }, { version: '202609230001', name: 'init' },
       ];
@@ -80,13 +82,14 @@ test('default policy is closed-schema and records the reviewed non-secret identi
   assert.equal(policy.vercel.projectId, 'prj_NEAKAPvyPzh76wfoHqYF6mRSfBs0');
   assert.equal(policy.vercel.teamId, 'team_Legw262JzvhZUhIZtv5pFE4T');
   assert.equal(policy.database.kind, 'standalone');
-  assert.equal(policy.database.approved, false);
   assert.equal(policy.database.projectRef, null);
-  assert.equal(policy.database.productionProjectRef, null);
+  assert.equal(policy.database.organizationId, null);
+  assert.equal(policy.database.organizationSlug, null);
   assert.equal(policy.database.schemaFingerprintSha256, null);
   assert.equal(policy.database.migrationHistorySha256, null);
-  assert.deepEqual(policy.database.branchProjectRefs, ['zjvqjdntasprusoqfsgw']);
-  for (const field of ['parentProjectRef', 'branchId', 'branchName']) assert.equal(Object.hasOwn(policy.database, field), false);
+  for (const field of ['approved', 'productionProjectRef', 'branchProjectRefs', 'parentProjectRef', 'branchId', 'branchName']) {
+    assert.equal(Object.hasOwn(policy.database, field), false);
+  }
   assert.equal(policy.stripe.accountId, 'acct_1TWh8jF7lfHrHdNa');
   assert.equal(policy.stripe.webhookEndpointId, null);
   const publicKeyDer = createPublicKey(policy.attestation.publicKeyPem).export({ type: 'spki', format: 'der' });
@@ -133,7 +136,7 @@ test('fails before metadata or runtime requests when any authoritative identity 
   }), { code: 'environment_policy_unconfigured' });
   assert.deepEqual(api.calls, []);
   assert.equal(fetchCalls, 0);
-  for (const field of ['productionProjectRef', 'organizationId', 'region', 'databaseVersion',
+  for (const field of ['organizationId', 'organizationSlug', 'region', 'databaseVersion',
     'postgresEngine', 'releaseChannel', 'connection', 'schemaFingerprintSha256', 'migrationHistorySha256']) {
     await assert.rejects(preflightRuntime({
       api, candidate,
@@ -188,7 +191,7 @@ test('returns project-only standalone identity after immutable deployment and ru
   assert.equal(JSON.stringify(result).includes('synthetic-read-token'), false);
   assert.equal(JSON.stringify(result).includes('sk_test_synthetic123'), false);
   assert.equal(api.calls.length, 2);
-  assert.equal(fetch.calls.length, 6);
+  assert.equal(fetch.calls.length, 7);
   assert.equal(fetch.calls.some(({ url }) => url.includes('candidate.invalid') || url.includes('zjvqjdntasprusoqfsgw')), false);
 });
 

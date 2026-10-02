@@ -7,11 +7,9 @@
   },
   "database": {
     "kind": "standalone",
-    "approved": false,
     "projectRef": null,
-    "productionProjectRef": null,
-    "branchProjectRefs": ["zjvqjdntasprusoqfsgw"],
     "organizationId": null,
+    "organizationSlug": null,
     "region": null,
     "databaseVersion": null,
     "postgresEngine": null,
