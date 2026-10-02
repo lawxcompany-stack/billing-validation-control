@@ -113,10 +113,14 @@ function assertCanonicalWorkflowGuards(workflow, path) {
   const authorizeJob = workflow.jobs.authorize;
   assert.ok(authorizeJob && typeof authorizeJob === 'object', `${path} must declare jobs.authorize`);
   assert.equal(typeof authorizeJob.if, 'string', `${path} jobs.authorize must have an identity guard`);
-  assert.doesNotMatch(authorizeJob.if, /\|\|/u, `${path} jobs.authorize must not use disjunction`);
-  assert.match(authorizeJob.if, /github\.repository\s*==\s*['"]lawx-ai\/billing-validation-control['"]/u,
+  const expression = authorizeJob.if
+    .replace(/^\s*\$\{\{\s*/u, '')
+    .replace(/\s*\}\}\s*$/u, '');
+  assert.doesNotMatch(expression, /\|\|/u, `${path} jobs.authorize must not use disjunction`);
+  const conjunctionTerms = expression.split(/&&/u).map((term) => term.trim());
+  assert.ok(conjunctionTerms.some((term) => /^github\.repository\s*==\s*(['"])lawx-ai\/billing-validation-control\1$/u.test(term)),
     `${path} jobs.authorize must guard the canonical control repository`);
-  assert.match(authorizeJob.if, /github\.repository_id\s*==\s*['"]1384018279['"]/u,
+  assert.ok(conjunctionTerms.some((term) => /^github\.repository_id\s*==\s*(['"])1384018279\1$/u.test(term)),
     `${path} jobs.authorize must guard the canonical control repository ID`);
 }
 
@@ -186,6 +190,19 @@ test('requires repository name and ID guards to be conjunctive', () => {
   assert.throws(() => assertCanonicalWorkflowGuards(workflowWithDisjunctiveAuthorizeGuard, 'synthetic-workflow.yml'),
     /jobs\.authorize must not use disjunction/u,
     'both canonical identity predicates must be required by the authorize guard');
+});
+
+test('requires positive canonical identity predicates as top-level conjunction terms', () => {
+  const workflowWithNegatedAuthorizeGuard = {
+    on: { workflow_dispatch: {} },
+    jobs: {
+      authorize: { if: "${{ ! (github.repository == 'lawx-ai/billing-validation-control' && github.repository_id == '1384018279') }}" },
+    },
+  };
+
+  assert.throws(() => assertCanonicalWorkflowGuards(workflowWithNegatedAuthorizeGuard, 'synthetic-workflow.yml'),
+    /jobs\.authorize must guard the canonical control repository/u,
+    'negating both canonical identity predicates must not satisfy the authorize guard');
 });
 
 for (const encodedSlug of [
