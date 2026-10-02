@@ -371,16 +371,174 @@ jobs:
         run: |
           echo 'Billing and browser execution is not enabled by Task 1.' >&2
           exit 1
+      # Until Task 8 supplies all canonical 45 passing records, downstream
+      # result-manifest signing and verification remain deliberately unexercised.
+      # Task 8 replaces the fail-closed step and writes only canonical case
+      # results. Deployment and provider identities are resolved independently
+      # by trusted control jobs and are never accepted from this artifact.
+      - name: Upload financial result input only after a passing test
+        if: ${{ success() && needs.authorize.outputs.operation == 'collect' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: billing-45-result-input
+          path: ${{ runner.temp }}/billing-45-result-input.json
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: false
+          include-hidden-files: false
 
+  validate-result-input:
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.authorize.outputs.operation == 'collect' }}
+    needs: [authorize, reader, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact triggering workflow SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Download financial result records
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: billing-45-result-input
+          path: ${{ runner.temp }}
+      - name: Validate exact sanitized 45-case result schema before credentials
+        env:
+          BILLING_RESULT_INPUT_PATH: ${{ runner.temp }}/billing-45-result-input.json
+        run: node runner/validate-billing-result-input.mjs
+
+  attest-result:
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.validate-result-input.result == 'success' && needs.authorize.outputs.operation == 'collect' }}
+    needs: [authorize, reader, test, validate-result-input]
+    runs-on: ubuntu-latest
+    environment: billing-validation-attestation
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout exact triggering workflow SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Download sanitized financial result input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: billing-45-result-input
+          path: ${{ runner.temp }}
+      - name: Compose canonical financial result subject
+        env:
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          CONTROL_REPOSITORY_ID: ${{ github.repository_id }}
+          CONTROL_REF: ${{ github.ref }}
+          CONTROL_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CONTROL_REF_PROTECTED: ${{ github.ref_protected }}
+          CONTROL_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CONTROL_RUN_ID: ${{ github.run_id }}
+          CONTROL_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CONTROL_WORKFLOW_SHA: ${{ github.sha }}
+          CONTROL_EVENT_NAME: ${{ github.event_name }}
+          CANDIDATE_SHA: ${{ needs.authorize.outputs.candidate_sha }}
+          READER_CANDIDATE_SHA: ${{ needs.reader.outputs.candidate_sha }}
+          READER_CANDIDATE_TREE_SHA: ${{ needs.reader.outputs.candidate_tree_sha }}
+          CANDIDATE_PULL_NUMBER: ${{ needs.reader.outputs.candidate_pull_number }}
+          VERCEL_READ_ONLY_TOKEN: ${{ secrets.BILLING_VALIDATION_VERCEL_READ_ONLY_TOKEN }}
+          BILLING_RESULT_INPUT_PATH: ${{ runner.temp }}/billing-45-result-input.json
+          BILLING_RESULT_MANIFEST_PATH: ${{ runner.temp }}/billing-result-manifest.json
+        run: node runner/write-billing-result-manifest.mjs
+      - name: Attest only the canonical financial result subject
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # reviewed immutable pin
+        with:
+          subject-path: ${{ runner.temp }}/billing-result-manifest.json
+      - name: Upload only the financial result subject
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: billing-result-manifest
+          path: ${{ runner.temp }}/billing-result-manifest.json
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: false
+          include-hidden-files: false
+
+  verify-result:
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.attest-result.result == 'success' && needs.authorize.outputs.operation == 'collect' }}
+    needs: [authorize, reader, test, attest-result]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - name: Checkout exact triggering workflow SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Download canonical financial result subject
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: billing-result-manifest
+          path: ${{ runner.temp }}
+      - name: Verify financial result attestation before publisher Environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          CONTROL_REPOSITORY_ID: ${{ github.repository_id }}
+          CONTROL_REF: ${{ github.ref }}
+          CONTROL_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CONTROL_REF_PROTECTED: ${{ github.ref_protected }}
+          CONTROL_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CONTROL_RUN_ID: ${{ github.run_id }}
+          CONTROL_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CONTROL_WORKFLOW_SHA: ${{ github.sha }}
+          CONTROL_EVENT_NAME: ${{ github.event_name }}
+          CANDIDATE_SHA: ${{ needs.authorize.outputs.candidate_sha }}
+          READER_CANDIDATE_SHA: ${{ needs.reader.outputs.candidate_sha }}
+          READER_CANDIDATE_TREE_SHA: ${{ needs.reader.outputs.candidate_tree_sha }}
+          CANDIDATE_PULL_NUMBER: ${{ needs.reader.outputs.candidate_pull_number }}
+          BILLING_RESULT_MANIFEST_PATH: ${{ runner.temp }}/billing-result-manifest.json
+        run: node runner/verify-billing-result.mjs
+
+  # Recheck deliberately remains fail-closed until the original run/attempt result attestation can be retrieved and identity-verified; activation attestation never proves financial quality.
   publisher:
-    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && ((needs.authorize.outputs.operation == 'collect' && needs.attest-activation.result == 'success') || (needs.authorize.outputs.operation == 'recheck' && needs.attest-activation.result == 'skipped')) }}
-    needs: [authorize, reader, attest-activation, test]
+    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.authorize.outputs.operation == 'collect' && needs.attest-activation.result == 'success' && needs.attest-result.result == 'success' && needs.verify-result.result == 'success' }}
+    needs: [authorize, reader, attest-activation, test, attest-result, verify-result]
     runs-on: ubuntu-latest
     environment: billing-validation-publisher
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
+      - name: Checkout exact triggering workflow SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
       - name: Fail closed until canonical check publication is implemented
         run: |
           echo 'Readiness check publication is not enabled by Task 1.' >&2

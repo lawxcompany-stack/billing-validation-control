@@ -64,6 +64,122 @@ function assertReaderBoundary(job) {
     'the reader token may only be consumed by the fixed reader step');
 }
 
+function assertResultAttestationBoundary(job) {
+  const expression = value => '${{ ' + value + ' }}';
+  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.validate-result-input.result == 'success' && needs.authorize.outputs.operation == 'collect'";
+  assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'environment', 'timeout-minutes', 'permissions', 'steps'].sort());
+  assert.equal(job.if, expression(guard));
+  assert.deepEqual(job.needs, ['authorize', 'reader', 'test', 'validate-result-input']);
+  assert.equal(job['runs-on'], 'ubuntu-latest');
+  assert.equal(job.environment, 'billing-validation-attestation');
+  assert.equal(job['timeout-minutes'], 10);
+  assert.deepEqual(job.permissions, { contents: 'read', 'id-token': 'write', attestations: 'write' });
+  assert.deepEqual(job.steps, [
+    { name: 'Checkout exact triggering workflow SHA',
+      uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      with: { ref: expression('github.sha'), 'persist-credentials': false } },
+    { name: 'Set up Node.js 22', uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      with: { 'node-version': '22', 'package-manager-cache': false } },
+    { name: 'Download sanitized financial result input',
+      uses: 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+      with: { name: 'billing-45-result-input', path: expression('runner.temp') } },
+    { name: 'Compose canonical financial result subject',
+      env: {
+        CONTROL_REPOSITORY: expression('github.repository'),
+        CONTROL_REPOSITORY_ID: expression('github.repository_id'),
+        CONTROL_REF: expression('github.ref'),
+        CONTROL_DEFAULT_BRANCH: expression('github.event.repository.default_branch'),
+        CONTROL_REF_PROTECTED: expression('github.ref_protected'),
+        CONTROL_WORKFLOW_REF: expression('github.workflow_ref'),
+        CONTROL_RUN_ID: expression('github.run_id'),
+        CONTROL_RUN_ATTEMPT: expression('github.run_attempt'),
+        CONTROL_WORKFLOW_SHA: expression('github.sha'),
+        CONTROL_EVENT_NAME: expression('github.event_name'),
+        CANDIDATE_SHA: expression('needs.authorize.outputs.candidate_sha'),
+        READER_CANDIDATE_SHA: expression('needs.reader.outputs.candidate_sha'),
+        READER_CANDIDATE_TREE_SHA: expression('needs.reader.outputs.candidate_tree_sha'),
+        CANDIDATE_PULL_NUMBER: expression('needs.reader.outputs.candidate_pull_number'),
+        VERCEL_READ_ONLY_TOKEN: expression('secrets.BILLING_VALIDATION_VERCEL_READ_ONLY_TOKEN'),
+        BILLING_RESULT_INPUT_PATH: expression('runner.temp') + '/billing-45-result-input.json',
+        BILLING_RESULT_MANIFEST_PATH: expression('runner.temp') + '/billing-result-manifest.json',
+      },
+      run: 'node runner/write-billing-result-manifest.mjs' },
+    { name: 'Attest only the canonical financial result subject',
+      uses: 'actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d',
+      with: { 'subject-path': expression('runner.temp') + '/billing-result-manifest.json' } },
+    { name: 'Upload only the financial result subject',
+      uses: 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+      with: { name: 'billing-result-manifest', path: expression('runner.temp') + '/billing-result-manifest.json',
+        'if-no-files-found': 'error', 'retention-days': 1, overwrite: false, 'include-hidden-files': false } },
+  ]);
+}
+
+function assertResultInputValidationBoundary(job) {
+  const expression = value => '${{ ' + value + ' }}';
+  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.authorize.outputs.operation == 'collect'";
+  assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'timeout-minutes', 'permissions', 'steps'].sort());
+  assert.equal(job.if, expression(guard));
+  assert.deepEqual(job.needs, ['authorize', 'reader', 'test']);
+  assert.equal(job['runs-on'], 'ubuntu-latest');
+  assert.equal(job.environment, undefined);
+  assert.equal(job['timeout-minutes'], 10);
+  assert.deepEqual(job.permissions, { contents: 'read' });
+  assert.deepEqual(job.steps, [
+    { name: 'Checkout exact triggering workflow SHA',
+      uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      with: { ref: expression('github.sha'), 'persist-credentials': false } },
+    { name: 'Set up Node.js 22', uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      with: { 'node-version': '22', 'package-manager-cache': false } },
+    { name: 'Download financial result records',
+      uses: 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+      with: { name: 'billing-45-result-input', path: expression('runner.temp') } },
+    { name: 'Validate exact sanitized 45-case result schema before credentials',
+      env: { BILLING_RESULT_INPUT_PATH: expression('runner.temp') + '/billing-45-result-input.json' },
+      run: 'node runner/validate-billing-result-input.mjs' },
+  ]);
+}
+
+function assertResultVerificationBoundary(job) {
+  const expression = value => '${{ ' + value + ' }}';
+  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.attest-result.result == 'success' && needs.authorize.outputs.operation == 'collect'";
+  assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'timeout-minutes', 'permissions', 'steps'].sort());
+  assert.equal(job.if, expression(guard));
+  assert.deepEqual(job.needs, ['authorize', 'reader', 'test', 'attest-result']);
+  assert.equal(job['runs-on'], 'ubuntu-latest');
+  assert.equal(job['timeout-minutes'], 10);
+  assert.deepEqual(job.permissions, { contents: 'read', attestations: 'read' });
+  assert.deepEqual(job.steps, [
+    { name: 'Checkout exact triggering workflow SHA',
+      uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      with: { ref: expression('github.sha'), 'persist-credentials': false } },
+    { name: 'Set up Node.js 22', uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      with: { 'node-version': '22', 'package-manager-cache': false } },
+    { name: 'Download canonical financial result subject',
+      uses: 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+      with: { name: 'billing-result-manifest', path: expression('runner.temp') } },
+    { name: 'Verify financial result attestation before publisher Environment',
+      env: {
+        GH_TOKEN: expression('github.token'),
+        CONTROL_REPOSITORY: expression('github.repository'),
+        CONTROL_REPOSITORY_ID: expression('github.repository_id'),
+        CONTROL_REF: expression('github.ref'),
+        CONTROL_DEFAULT_BRANCH: expression('github.event.repository.default_branch'),
+        CONTROL_REF_PROTECTED: expression('github.ref_protected'),
+        CONTROL_WORKFLOW_REF: expression('github.workflow_ref'),
+        CONTROL_RUN_ID: expression('github.run_id'),
+        CONTROL_RUN_ATTEMPT: expression('github.run_attempt'),
+        CONTROL_WORKFLOW_SHA: expression('github.sha'),
+        CONTROL_EVENT_NAME: expression('github.event_name'),
+        CANDIDATE_SHA: expression('needs.authorize.outputs.candidate_sha'),
+        READER_CANDIDATE_SHA: expression('needs.reader.outputs.candidate_sha'),
+        READER_CANDIDATE_TREE_SHA: expression('needs.reader.outputs.candidate_tree_sha'),
+        CANDIDATE_PULL_NUMBER: expression('needs.reader.outputs.candidate_pull_number'),
+        BILLING_RESULT_MANIFEST_PATH: expression('runner.temp') + '/billing-result-manifest.json',
+      },
+      run: 'node runner/verify-billing-result.mjs' },
+  ]);
+}
+
 // Closed structural contract independent of the YAML being checked. Exact keys,
 // commands and expressions also cover bracket/toJSON credential exfiltration and
 // job/step defaults, containers, paths, shell or conditional execution bypasses.
@@ -143,7 +259,11 @@ export function assertWorkflowSecretBoundary(workflow, path) {
   for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
     const serializedJob = JSON.stringify(job);
     if (path === workflowPaths[0] && jobId === 'reader') assertReaderBoundary(job);
-    else assert.ok(!/\$\{\{[^}]*\bsecrets\b/i.test(serializedJob),
+    else if (path === workflowPaths[0] && jobId === 'attest-result') {
+      assert.deepEqual(serializedJob.match(/\$\{\{[^}]*\bsecrets\b[^}]*\}\}/gu),
+        ['${{ secrets.BILLING_VALIDATION_VERCEL_READ_ONLY_TOKEN }}'],
+        `${path}:${jobId} may consume only the scoped Vercel read-only token`);
+    } else assert.ok(!/\$\{\{[^}]*\bsecrets\b/i.test(serializedJob),
       `${path}:${jobId} must not consume reader or financial secrets`);
     assert.ok(!/\$\{\{\s*needs\.[^}]+\.outputs\.(?:private_key|token|secret)/i.test(serializedJob),
       `${path}:${jobId} must not propagate credential-like outputs`);
@@ -153,6 +273,20 @@ export function assertWorkflowSecretBoundary(workflow, path) {
         'id-token': 'write',
         attestations: 'write',
       }, `${path}:${jobId} must scope signing permissions to the hosted activation attestation`);
+    } else if (path === workflowPaths[0] && jobId === 'attest-result') {
+      assertResultAttestationBoundary(job);
+    } else if (path === workflowPaths[0] && jobId === 'validate-result-input') {
+      assertResultInputValidationBoundary(job);
+    } else if (path === workflowPaths[0] && jobId === 'verify-result') {
+      assertResultVerificationBoundary(job);
+    } else if (path === workflowPaths[0] && jobId === 'publisher') {
+      assert.deepEqual(job.permissions, { contents: 'read' },
+        'publisher must not retain verification permissions or credentials');
+      assert.match(job.if, /needs\.verify-result\.result\s*==\s*'success'/);
+      assert.match(job.if, /needs\.attest-result\.result\s*==\s*'success'/);
+      assert.match(job.if, /needs\.authorize\.outputs\.operation\s*==\s*'collect'/);
+      assert.equal(job.environment, 'billing-validation-publisher');
+      assert.equal((serializedJob.match(/\$\{\{\s*github\.token\s*\}\}/gu) ?? []).length, 0);
     } else if (path === workflowPaths[0] && jobId === 'authorize') {
       assert.deepEqual(job.permissions, { contents: 'read', actions: 'read' },
         'only the hosted, secret-free authorization job may read Environment configuration');

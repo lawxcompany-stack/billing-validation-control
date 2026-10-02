@@ -15,11 +15,16 @@ const environments = ['billing-validation-reader', 'billing-validation-attestati
 const github = { event_name: 'workflow_dispatch', repository, repository_id: '1384018279',
   ref: 'refs/heads/main', ref_protected: true, event: { repository: { default_branch: 'main' } } };
 const needs = { authorize: { result: 'success', outputs: { operation: 'collect', environments_verified: 'true' } },
-  reader: { result: 'success' }, 'attest-activation': { result: 'success' }, test: { result: 'success' } };
+  reader: { result: 'success' }, 'attest-activation': { result: 'success' }, test: { result: 'success' },
+  'validate-result-input': { result: 'success' }, 'attest-result': { result: 'success' },
+  'verify-result': { result: 'success' } };
 
 function eligible(jobId, context = github, dependencies = needs, cancelled = false) {
   const expression = workflow.jobs[jobId].if.slice(3, -2)
-    .replaceAll('needs.attest-activation', 'needs["attest-activation"]');
+    .replaceAll('needs.attest-activation', 'needs["attest-activation"]')
+    .replaceAll('needs.validate-result-input', 'needs["validate-result-input"]')
+    .replaceAll('needs.attest-result', 'needs["attest-result"]')
+    .replaceAll('needs.verify-result', 'needs["verify-result"]');
   return vm.runInNewContext(expression, { github: context, needs: dependencies,
     always: () => true, cancelled: () => cancelled });
 }
@@ -31,7 +36,7 @@ test('PR policy is hosted, has no Environment/secrets and keeps a read-only toke
   assert.equal(workflow.jobs.policy['runs-on'], 'ubuntu-latest');
   assert.deepEqual(workflow.jobs.policy.permissions ?? workflow.permissions, { contents: 'read' });
   assert.doesNotMatch(JSON.stringify(workflow.jobs.policy), /\bsecrets\b|id-token|attestations|STRIPE|SUPABASE/);
-  for (const id of ['authorize', 'reader', 'attest-activation', 'test', 'publisher']) {
+  for (const id of ['authorize', 'reader', 'attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
     assert.equal(eligible(id, { ...github, event_name: 'pull_request' }), false, id);
   }
 });
@@ -44,7 +49,7 @@ for (const [name, change] of [
   ['unprotected ref', { ref_protected: false }],
   ['another default branch', { event: { repository: { default_branch: 'preview' } } }],
 ]) test(`all dispatch/protected jobs refuse ${name} before scheduling`, () => {
-  for (const id of ['authorize', 'reader', 'attest-activation', 'test', 'publisher']) {
+  for (const id of ['authorize', 'reader', 'attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
     assert.equal(eligible(id, { ...github, ...change }), false, id);
   }
 });
@@ -64,55 +69,80 @@ for (const result of ['failure', 'cancelled', 'skipped']) {
   test(`authorization ${result} blocks every Environment job`, () => {
     const dependencies = structuredClone(needs);
     dependencies.authorize.result = result;
-    for (const id of ['reader', 'attest-activation', 'test', 'publisher']) {
+    for (const id of ['reader', 'attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
       assert.equal(eligible(id, github, dependencies), false, id);
     }
   });
   test(`reader ${result} blocks signing, financial execution and publication`, () => {
     const dependencies = structuredClone(needs);
     dependencies.reader.result = result;
-    for (const id of ['attest-activation', 'test', 'publisher']) {
+    for (const id of ['attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
       assert.equal(eligible(id, github, dependencies), false, id);
     }
   });
   test(`collect attestation ${result} blocks financial execution and publication`, () => {
     const dependencies = structuredClone(needs);
     dependencies['attest-activation'].result = result;
-    for (const id of ['test', 'publisher']) assert.equal(eligible(id, github, dependencies), false, id);
+    dependencies.test.result = 'skipped';
+    for (const id of ['test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) assert.equal(eligible(id, github, dependencies), false, id);
   });
   test(`financial ${result} blocks publication`, () => {
     const dependencies = structuredClone(needs);
     dependencies.test.result = result;
+    assert.equal(eligible('attest-result', github, dependencies), false);
+    assert.equal(eligible('validate-result-input', github, dependencies), false);
+    assert.equal(eligible('verify-result', github, dependencies), false);
     assert.equal(eligible('publisher', github, dependencies), false);
   });
 }
+
+test('a result-schema failure blocks the credentialed emitter and publisher before their environments', () => {
+  const dependencies = structuredClone(needs);
+  dependencies['validate-result-input'].result = 'failure';
+  dependencies['attest-result'].result = 'skipped';
+  dependencies['verify-result'].result = 'skipped';
+  assert.equal(eligible('attest-result', github, dependencies), false);
+  assert.equal(eligible('verify-result', github, dependencies), false);
+  assert.equal(eligible('publisher', github, dependencies), false);
+  assert.equal(workflow.jobs['validate-result-input'].environment, undefined);
+  assert.equal(workflow.jobs['validate-result-input'].permissions['id-token'], undefined);
+});
 
 test('Environment readback must explicitly succeed before any Environment job', () => {
   assert.equal(workflow.jobs.authorize.outputs.environments_verified, '${{ steps.environments.outputs.verified }}');
   for (const value of ['', 'false', undefined]) {
     const dependencies = structuredClone(needs);
     dependencies.authorize.outputs.environments_verified = value;
-    for (const id of ['reader', 'attest-activation', 'test', 'publisher']) {
+    for (const id of ['reader', 'attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
       assert.equal(eligible(id, github, dependencies), false, id);
     }
   }
-  for (const id of ['reader', 'attest-activation', 'test', 'publisher']) assert.equal(eligible(id), true, id);
-  assert.deepEqual(workflow.jobs.publisher.needs, ['authorize', 'reader', 'attest-activation', 'test']);
+  for (const id of ['reader', 'attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) assert.equal(eligible(id), true, id);
+  assert.deepEqual(workflow.jobs.publisher.needs, ['authorize', 'reader', 'attest-activation', 'test', 'attest-result', 'verify-result']);
 });
 
-test('recheck tolerates only intentionally skipped activation signing, never failed signing', () => {
+test('recheck may run its test gate but cannot reach publisher without result attestation', () => {
   const dependencies = structuredClone(needs);
   dependencies.authorize.outputs.operation = 'recheck';
   dependencies['attest-activation'].result = 'skipped';
+  dependencies['validate-result-input'].result = 'skipped';
+  dependencies['attest-result'].result = 'skipped';
+  dependencies['verify-result'].result = 'skipped';
   assert.equal(eligible('attest-activation', github, dependencies), false);
-  for (const id of ['test', 'publisher']) {
-    assert.equal(eligible(id, github, dependencies), true, id);
-    assert.equal(eligible(id, github, { ...dependencies, 'attest-activation': { result: 'failure' } }), false, id);
-  }
+  assert.equal(eligible('attest-result', github, dependencies), false);
+  assert.equal(eligible('validate-result-input', github, dependencies), false);
+  assert.equal(eligible('verify-result', github, dependencies), false);
+  assert.equal(eligible('test', github, dependencies), true);
+  assert.equal(eligible('test', github, { ...dependencies, 'attest-activation': { result: 'failure' } }), false);
+  assert.equal(eligible('publisher', github, dependencies), false);
+  assert.equal(eligible('publisher', github, { ...dependencies, 'attest-result': { result: 'failure' } }), false);
+  assert.equal(eligible('publisher', github, { ...dependencies, 'verify-result': { result: 'failure' } }), false);
+  assert.match(readFileSync('.github/workflows/validate-billing.yml', 'utf8'),
+    /Recheck deliberately remains fail-closed until the original run\/attempt result attestation can be retrieved and identity-verified; activation attestation never proves financial quality\./u);
 });
 
 test('workflow cancellation blocks financial execution and publication even after successful predecessors', () => {
-  for (const id of ['test', 'publisher']) assert.equal(eligible(id, github, needs, true), false, id);
+  for (const id of ['test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) assert.equal(eligible(id, github, needs, true), false, id);
 });
 
 test('trusted jobs never checkout or execute candidate inputs and keep shell expressions out of run blocks', () => {
@@ -160,7 +190,7 @@ for (const [name, pull, code] of [
 
   const blocked = structuredClone(needs);
   blocked.reader.result = 'failure';
-  for (const job of ['attest-activation', 'test', 'publisher']) {
+  for (const job of ['attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
     assert.equal(eligible(job, github, blocked), false, `${name}: ${job}`);
   }
 });
