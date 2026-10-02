@@ -382,8 +382,8 @@ test('forward migration adds monotonic project-scoped fencing and immutable leas
 
 test('schema stores append-only retention reservations and terminal receipts with update/delete denial', () => {
   const sql = readFileSync(new URL('../../src/attempts/schema.sql', import.meta.url), 'utf8');
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS billing_validation_control\.retention_reservations/);
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS billing_validation_control\.retention_receipts/);
+  assert.match(sql, /CREATE TABLE billing_validation_control\.retention_reservations/);
+  assert.match(sql, /CREATE TABLE billing_validation_control\.retention_receipts/);
   assert.match(sql, /reservation_id text NOT NULL UNIQUE\s+REFERENCES billing_validation_control\.retention_reservations/);
   assert.match(sql, /projection jsonb NOT NULL/);
   assert.match(sql, /retained_usage jsonb NOT NULL/);
@@ -396,14 +396,14 @@ test('schema stores append-only retention reservations and terminal receipts wit
   assert.match(sql, /retained_usage ->> quota_key/);
   assert.match(sql, /REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control\.retention_reservations/);
   assert.match(sql, /REVOKE UPDATE, DELETE, TRUNCATE ON billing_validation_control\.retention_receipts/);
-  const reservationDefinition = sql.match(/CREATE TABLE IF NOT EXISTS billing_validation_control\.retention_reservations\s*\(([\s\S]*?)\n\);/u);
+  const reservationDefinition = sql.match(/CREATE TABLE billing_validation_control\.retention_reservations\s*\(([\s\S]*?)\n\);/u);
   assert.ok(reservationDefinition);
   assert.doesNotMatch(reservationDefinition[1], /expires_at/u);
 });
 
 test('schema persistently accounts fixture rows without mutating append-only reservations', () => {
   const sql = readFileSync(new URL('../../src/attempts/schema.sql', import.meta.url), 'utf8');
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS billing_validation_control\.fixture_reservation_claims/);
+  assert.match(sql, /CREATE TABLE billing_validation_control\.fixture_reservation_claims/);
   assert.match(sql, /database_rows_used bigint NOT NULL CHECK \(database_rows_used >= 0\)/);
   assert.match(sql, /NEW\.database_rows_used > \(reservation\.projection ->> 'databaseRows'\)::bigint/);
   assert.match(sql, /NEW\.database_rows_used < OLD\.database_rows_used/);
@@ -413,7 +413,7 @@ test('schema persistently accounts fixture rows without mutating append-only res
 
 test('schema persists closed, attempt-bound append-only cleanup receipts', () => {
   const sql = readFileSync(new URL('../../src/attempts/schema.sql', import.meta.url), 'utf8');
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS billing_validation_control\.cleanup_receipts/);
+  assert.match(sql, /CREATE TABLE billing_validation_control\.cleanup_receipts/);
   assert.match(sql, /reservation_id text NOT NULL UNIQUE/);
   assert.match(sql, /owner_fence uuid NOT NULL/);
   assert.match(sql, /cleanup_digest char\(64\) NOT NULL/);
@@ -434,12 +434,12 @@ test('schema persists global resource ownership and append-only Stripe intents a
     'workflow_run_attempt', 'environment_identity', 'expires_at']) {
     assert.match(migration, new RegExp(`\\b${field}\\b`));
   }
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS billing_validation_control\.stripe_intents/);
+  assert.match(sql, /CREATE TABLE billing_validation_control\.stripe_intents/);
   assert.match(sql, /UNIQUE \(attempt_id, operation\)/);
   assert.match(sql, /request_digest char\(64\) NOT NULL/);
   assert.match(sql, /idempotency_key text NOT NULL/);
   assert.match(sql, /state text NOT NULL CHECK \(state = 'in_flight'\)/);
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS billing_validation_control\.stripe_receipts/);
+  assert.match(sql, /CREATE TABLE billing_validation_control\.stripe_receipts/);
   assert.match(sql, /UNIQUE \(account_id, idempotency_key\)/);
   assert.match(sql, /intent_id text NOT NULL UNIQUE REFERENCES billing_validation_control\.stripe_intents/);
   for (const table of ['stripe_intents', 'stripe_receipts']) {
@@ -452,7 +452,7 @@ test('schema persists global resource ownership and append-only Stripe intents a
 
 test('SQL retention validation rejects decimal-formatted integers before counting them', () => {
   const sql = readFileSync(new URL('../../src/attempts/schema.sql', import.meta.url), 'utf8');
-  const validator = sql.match(/CREATE OR REPLACE FUNCTION billing_validation_control\.valid_retention_usage[\s\S]*?\$\$([\s\S]*?)\$\$;/)?.[1];
+  const validator = sql.match(/CREATE FUNCTION billing_validation_control\.valid_retention_usage[\s\S]*?\$\$([\s\S]*?)\$\$;/)?.[1];
   assert.ok(validator);
   const canonicalIntegerPattern = validator.match(/item\.value::text !~ '([^']+)'/)?.[1];
   assert.equal(canonicalIntegerPattern, '^(0|[1-9][0-9]*)$');

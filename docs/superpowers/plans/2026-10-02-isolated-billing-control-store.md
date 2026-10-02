@@ -64,7 +64,7 @@
 - Produces `parseControlStoreDatabaseUrl(value, policy)`, returning only `{ projectRef, host, port, database, username, sslMode }`; it never returns the password, original URL, query string, or a driver config containing credentials.
 - Refuses invalid values with `ControlStoreRefusal` and fixed codes `control_store_policy_invalid` or `control_store_target_invalid`; refusal text never embeds input values.
 
-- [ ] **Step 1: Add failing identity-separation tests**
+- [x] **Step 1: Add failing identity-separation tests**
 
 ```js
 test('control store cannot substitute for the blocked, unconfigured financial target', async () => {
@@ -79,13 +79,13 @@ test('control store cannot substitute for the blocked, unconfigured financial ta
 });
 ```
 
-- [ ] **Step 2: Run the focused test and confirm RED**
+- [x] **Step 2: Run the focused test and confirm RED**
 
 Run: `node --test test/attempts/control-store-policy.test.mjs`
 
 Expected: FAIL because the policy loader and control policy do not exist yet; the existing financial policy remains unchanged.
 
-- [ ] **Step 3: Add the closed policy and URL validator**
+- [x] **Step 3: Add the closed policy and URL validator**
 
 Set the control identity to the approved project, region, PostgreSQL version, schema `billing_validation_control`, owner role `billing_validation_owner`, runtime role `billing_validation_runtime`, and `BILLING_CONTROL_DATABASE_URL`. Bind the URL to the approved project's exact endpoint and runtime username; require TLS and PostgreSQL database `postgres`. Reject the financial project ref, the Preview connection, malformed/duplicate URL parameters, wrong username, wrong port/database, non-TLS, unexpected host, and empty credentials. Keep secrets out of the returned descriptor and refusal messages.
 
@@ -97,17 +97,17 @@ export function parseControlStoreDatabaseUrl(value, policy = CONTROL_STORE_POLIC
 }
 ```
 
-- [ ] **Step 4: Prove rejection and secret redaction**
+- [x] **Step 4: Prove rejection and secret redaction**
 
 Add tests for a valid synthetic URL, wrong control ref, forbidden historical `zjvq…` URL, wrong host/user/database/port, missing TLS, hostile URL options, malformed encoding, and a sentinel password. Assert the sentinel appears neither in returned objects nor in thrown `message`, `code`, or serialized error. Assert policy unknown keys and changed project ref fail closed.
 
-- [ ] **Step 5: Run tests and inspect only Task 1 paths**
+- [x] **Step 5: Run tests and inspect only Task 1 paths**
 
 Run: `node --test test/attempts/control-store-policy.test.mjs`
 
 Expected: all Task 1 tests pass; the financial policy remains fail-closed with null project/connection identity, the historical `zjvq…` ref remains rejected by code, and the control URL cannot be substituted for `SUPABASE_VALIDATION_DATABASE_URL`.
 
-- [ ] **Step 6: Commit only reviewed Task 1 hunks**
+- [x] **Step 6: Commit only reviewed Task 1 hunks**
 
 Stage only the new policy/module/test. Confirm `git diff --cached --stat` and `git diff --cached` contain no pre-existing worktree changes, then commit as `feat: bind billing control store identity`.
 
@@ -119,18 +119,21 @@ Stage only the new policy/module/test. Confirm `git diff --cached --stat` and `g
 - Create: `src/attempts/control-store-bootstrap-pins.mjs`
 - Test: `test/attempts/control-store-bootstrap.test.mjs`
 - Modify: `test/attempts/postgres-retention-local.test.mjs`
+- Modify: `test/attempts/postgres.test.mjs`
 
 **Interfaces:**
 - Produces `loadControlStoreBootstrapPlan({ policy?, baselinePath?, migrationDirectory? })`, returning a frozen `{ projectRef, baselineSha256, baselineSql, migrations, runtimeLogin: false }` after verifying every committed digest and migration order.
 - Produces `renderControlStoreBootstrap(plan)`, returning UTF-8 SQL only; it has no database client, network access, environment reads, or apply function.
 - The SQL bundle begins a transaction, refuses any non-fresh/partial schema or pre-existing custom role, creates both roles as `NOLOGIN`, creates the private schema owned by `billing_validation_owner`, runs the exact baseline, inserts the project/baseline receipt into `control_store_install_receipts`, applies allowlisted forward migrations, records migration hashes in the `schema_migrations` table created by migration `0001`, and commits once.
 
-- [ ] **Step 1: Add failing baseline and renderer contract tests**
+- [x] **Step 1: Add failing baseline and renderer contract tests**
 
 ```js
 test('bootstrap refuses repeatable or destructive baseline constructs', async () => {
   const plan = await loadControlStoreBootstrapPlan();
-  assert.doesNotMatch(plan.baselineSql, /\b(?:IF\s+NOT\s+EXISTS|OR\s+REPLACE|DROP\s+TRIGGER|DROP\s+SCHEMA|TRUNCATE)\b/iu);
+  assert.doesNotMatch(plan.baselineSql, /\b(?:IF\s+NOT\s+EXISTS|OR\s+REPLACE|DROP\s+TRIGGER|DROP\s+SCHEMA)\b/iu);
+  assert.doesNotMatch(plan.baselineSql, /^\s*TRUNCATE\b/imu);
+  assert.match(plan.baselineSql, /BEFORE TRUNCATE ON billing_validation_control\.retention_reservations/u);
   const sql = renderControlStoreBootstrap(plan);
   assert.match(sql, /^BEGIN;/u);
   assert.match(sql, /CREATE ROLE billing_validation_owner NOLOGIN/u);
@@ -141,17 +144,17 @@ test('bootstrap refuses repeatable or destructive baseline constructs', async ()
 });
 ```
 
-- [ ] **Step 2: Run focused test and confirm RED**
+- [x] **Step 2: Run focused test and confirm RED**
 
 Run: `node --test test/attempts/control-store-bootstrap.test.mjs`
 
-Expected: FAIL on the existing conditional schema/table creation and trigger replacement statements, and because the renderer does not exist.
+Expected: FAIL on the existing conditional schema/table creation and trigger replacement statements, and because the renderer does not exist; keep append-only truncate guards in the updated contract.
 
-- [ ] **Step 3: Convert the baseline to strict first-install DDL**
+- [x] **Step 3: Convert the baseline to strict first-install DDL**
 
-Remove schema creation from `schema.sql` because the renderer creates it with `AUTHORIZATION billing_validation_owner`; replace every remaining `CREATE ... IF NOT EXISTS` with plain `CREATE`, every `CREATE OR REPLACE` with `CREATE`, and every trigger drop/recreate or dynamic trigger replacement loop with a single explicit `CREATE TRIGGER`. Keep the baseline limited to deterministic objects inside that schema and ensure the local SQL harness creates its temporary namespace before applying the baseline. Do not add cleanup, reset, or data deletion.
+Remove schema creation from `schema.sql` because the renderer creates it with `AUTHORIZATION billing_validation_owner`; replace every remaining `CREATE ... IF NOT EXISTS` with plain `CREATE`, every `CREATE OR REPLACE` with `CREATE`, and every trigger drop/recreate or dynamic trigger replacement loop with explicit one-shot `CREATE TRIGGER` statements. Preserve all existing `BEFORE TRUNCATE` append-only guards and matching privilege revocations; they prevent truncation and do not execute it. Keep the baseline limited to deterministic objects inside that schema and ensure the local SQL harness creates its temporary namespace before applying the baseline. Do not add cleanup, reset, or data deletion.
 
-- [ ] **Step 4: Add the renderer and committed source pins**
+- [x] **Step 4: Add the renderer and committed source pins**
 
 Render SQL in this order: `BEGIN`; a preflight `DO` block requiring database `postgres`, operator identity `postgres`, expected PostgreSQL major, absent schema, absent owner/runtime roles, and no partial baseline marker; create `NOLOGIN` roles; create schema authorized to owner; `SET LOCAL ROLE billing_validation_owner`; execute baseline; insert the project identity and exact baseline digest into `control_store_install_receipts`; execute migrations in ascending allowlisted version order (migration `0001` creates `schema_migrations`); append each migration receipt there; commit. Compute each SHA-256 from final bytes and put the reviewed literals in `control-store-bootstrap-pins.mjs`; the renderer refuses any mismatch. Do not include a password in SQL or enable runtime login.
 
@@ -161,17 +164,17 @@ const sql = renderControlStoreBootstrap(plan);
 process.stdout.write(sql);
 ```
 
-- [ ] **Step 5: Test fail-closed rendering**
+- [x] **Step 5: Test fail-closed rendering**
 
-Test changed baseline bytes, migration file, migration order, unknown SQL, repeat rendering determinism, existing schema/role guard text, no secrets, and absence of any `DROP`, `DELETE`, `TRUNCATE`, `CREATE ... IF NOT EXISTS`, or implicit retry. Assert importing the module does not read credentials, spawn processes, or access the network.
+Test changed baseline bytes, migration file, migration order, unknown SQL, repeat rendering determinism, existing schema/role guard text, no secrets, and absence of destructive `DROP`, `DELETE`, or `TRUNCATE` statements, `CREATE ... IF NOT EXISTS`, or implicit retry. Assert the baseline retains append-only `BEFORE TRUNCATE` guards and matching revocations. Assert importing the module does not read credentials, spawn processes, or access the network.
 
-- [ ] **Step 6: Run unit and existing local SQL contract tests**
+- [x] **Step 6: Run unit and existing local SQL contract tests**
 
-Run: `node --test test/attempts/control-store-bootstrap.test.mjs test/attempts/postgres-retention-local.test.mjs`
+Run: `node --test test/attempts/control-store-bootstrap.test.mjs test/attempts/postgres-retention-local.test.mjs test/attempts/postgres.test.mjs`
 
-Expected: all pass; the local SQL validator still validates the exact checked-in baseline, and the renderer produces identical bytes on repeated runs.
+Expected: all pass; existing store tests agree with the one-shot DDL, append-only truncate protections remain present, the local SQL validator still validates the exact checked-in baseline, and the renderer produces identical bytes on repeated runs.
 
-- [ ] **Step 7: Commit only Task 2 hunks**
+- [x] **Step 7: Commit only Task 2 hunks**
 
 Review the staged diff and commit as `feat: make billing control bootstrap one-shot`.
 

@@ -1,8 +1,7 @@
-CREATE SCHEMA IF NOT EXISTS billing_validation_control;
 REVOKE ALL ON SCHEMA billing_validation_control FROM PUBLIC;
 REVOKE ALL ON SCHEMA billing_validation_control FROM anon, authenticated;
 
-CREATE OR REPLACE FUNCTION billing_validation_control.valid_retention_usage(document jsonb, minimum_units integer,
+CREATE FUNCTION billing_validation_control.valid_retention_usage(document jsonb, minimum_units integer,
   require_one_attempt boolean)
 RETURNS boolean
 LANGUAGE plpgsql
@@ -32,7 +31,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION billing_validation_control.valid_cleanup_projection(document jsonb)
+CREATE FUNCTION billing_validation_control.valid_cleanup_projection(document jsonb)
 RETURNS boolean
 LANGUAGE plpgsql
 IMMUTABLE
@@ -106,7 +105,7 @@ BEGIN
 END;
 $$;
 
-CREATE TABLE IF NOT EXISTS billing_validation_control.attempts (
+CREATE TABLE billing_validation_control.attempts (
   attempt_id text PRIMARY KEY,
   branch_id text NOT NULL,
   suite text NOT NULL,
@@ -132,7 +131,7 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.attempts (
   UNIQUE (attempt_id, branch_id, suite, fixture_key)
 );
 
-CREATE TABLE IF NOT EXISTS billing_validation_control.resource_locks (
+CREATE TABLE billing_validation_control.resource_locks (
   resource_type text NOT NULL CHECK (resource_type IN ('supabase_branch', 'stripe_account')),
   resource_id text NOT NULL,
   owner_attempt_id text NOT NULL REFERENCES billing_validation_control.attempts(attempt_id),
@@ -148,10 +147,10 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.resource_locks (
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   PRIMARY KEY (resource_type, resource_id)
 );
-CREATE INDEX IF NOT EXISTS billing_validation_resource_owner
+CREATE INDEX billing_validation_resource_owner
   ON billing_validation_control.resource_locks (owner_attempt_id, fence);
 
-CREATE TABLE IF NOT EXISTS billing_validation_control.stripe_intents (
+CREATE TABLE billing_validation_control.stripe_intents (
   intent_id text PRIMARY KEY,
   attempt_id text NOT NULL REFERENCES billing_validation_control.attempts(attempt_id),
   owner_fence uuid NOT NULL,
@@ -172,10 +171,10 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.stripe_intents (
   UNIQUE (attempt_id, operation),
   UNIQUE (account_id, idempotency_key)
 );
-CREATE INDEX IF NOT EXISTS billing_validation_stripe_intent_attempt
+CREATE INDEX billing_validation_stripe_intent_attempt
   ON billing_validation_control.stripe_intents (attempt_id, created_at);
 
-CREATE TABLE IF NOT EXISTS billing_validation_control.stripe_receipts (
+CREATE TABLE billing_validation_control.stripe_receipts (
   receipt_id text PRIMARY KEY,
   intent_id text NOT NULL UNIQUE REFERENCES billing_validation_control.stripe_intents(intent_id),
   attempt_id text NOT NULL REFERENCES billing_validation_control.attempts(attempt_id),
@@ -189,7 +188,7 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.stripe_receipts (
   observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
-CREATE TABLE IF NOT EXISTS billing_validation_control.retention_reservations (
+CREATE TABLE billing_validation_control.retention_reservations (
   reservation_id text PRIMARY KEY,
   attempt_id text NOT NULL UNIQUE
     REFERENCES billing_validation_control.attempts(attempt_id),
@@ -206,10 +205,10 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.retention_reservations (
   capacity_snapshot jsonb NOT NULL CHECK (jsonb_typeof(capacity_snapshot) = 'object'),
   created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
-CREATE INDEX IF NOT EXISTS billing_validation_retention_scope
+CREATE INDEX billing_validation_retention_scope
   ON billing_validation_control.retention_reservations (project_ref, branch_id, stripe_account_id);
 
-CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_reservation_claims (
+CREATE TABLE billing_validation_control.fixture_reservation_claims (
   reservation_id text PRIMARY KEY
     REFERENCES billing_validation_control.retention_reservations(reservation_id),
   attempt_id text NOT NULL UNIQUE
@@ -218,7 +217,7 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_reservation_claims
   created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
-CREATE OR REPLACE FUNCTION billing_validation_control.validate_fixture_reservation_claim()
+CREATE FUNCTION billing_validation_control.validate_fixture_reservation_claim()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog
@@ -238,12 +237,10 @@ BEGIN
   RETURN NEW;
 END;
 $$;
-DROP TRIGGER IF EXISTS billing_validation_fixture_reservation_claim_valid
-  ON billing_validation_control.fixture_reservation_claims;
 CREATE TRIGGER billing_validation_fixture_reservation_claim_valid
   BEFORE INSERT OR UPDATE ON billing_validation_control.fixture_reservation_claims
   FOR EACH ROW EXECUTE FUNCTION billing_validation_control.validate_fixture_reservation_claim();
-CREATE OR REPLACE FUNCTION billing_validation_control.reject_fixture_reservation_claim_delete()
+CREATE FUNCTION billing_validation_control.reject_fixture_reservation_claim_delete()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog
@@ -252,18 +249,14 @@ BEGIN
   RAISE EXCEPTION 'billing_fixture_reservation_claims_append_only' USING ERRCODE = '55000';
 END;
 $$;
-DROP TRIGGER IF EXISTS billing_validation_fixture_reservation_claim_immutable_delete
-  ON billing_validation_control.fixture_reservation_claims;
 CREATE TRIGGER billing_validation_fixture_reservation_claim_immutable_delete
   BEFORE DELETE ON billing_validation_control.fixture_reservation_claims
   FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_fixture_reservation_claim_delete();
-DROP TRIGGER IF EXISTS billing_validation_fixture_reservation_claim_no_truncate
-  ON billing_validation_control.fixture_reservation_claims;
 CREATE TRIGGER billing_validation_fixture_reservation_claim_no_truncate
   BEFORE TRUNCATE ON billing_validation_control.fixture_reservation_claims
   FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_fixture_reservation_claim_delete();
 
-CREATE TABLE IF NOT EXISTS billing_validation_control.retention_receipts (
+CREATE TABLE billing_validation_control.retention_receipts (
   receipt_id text PRIMARY KEY,
   reservation_id text NOT NULL UNIQUE
     REFERENCES billing_validation_control.retention_reservations(reservation_id),
@@ -278,10 +271,10 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.retention_receipts (
   ),
   created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
-CREATE INDEX IF NOT EXISTS billing_validation_retention_receipt_scope
+CREATE INDEX billing_validation_retention_receipt_scope
   ON billing_validation_control.retention_receipts (project_ref, branch_id, stripe_account_id);
 
-CREATE OR REPLACE FUNCTION billing_validation_control.validate_retention_receipt_projection()
+CREATE FUNCTION billing_validation_control.validate_retention_receipt_projection()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog
@@ -307,13 +300,11 @@ BEGIN
   RETURN NEW;
 END;
 $$;
-DROP TRIGGER IF EXISTS billing_validation_receipt_within_reservation
-  ON billing_validation_control.retention_receipts;
 CREATE TRIGGER billing_validation_receipt_within_reservation
   BEFORE INSERT ON billing_validation_control.retention_receipts
   FOR EACH ROW EXECUTE FUNCTION billing_validation_control.validate_retention_receipt_projection();
 
-CREATE OR REPLACE FUNCTION billing_validation_control.reject_retention_ledger_mutation()
+CREATE FUNCTION billing_validation_control.reject_retention_ledger_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog
@@ -323,51 +314,34 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS billing_validation_reservation_immutable
-  ON billing_validation_control.retention_reservations;
 CREATE TRIGGER billing_validation_reservation_immutable
   BEFORE UPDATE OR DELETE ON billing_validation_control.retention_reservations
   FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
 
-DROP TRIGGER IF EXISTS billing_validation_receipt_immutable
-  ON billing_validation_control.retention_receipts;
 CREATE TRIGGER billing_validation_receipt_immutable
   BEFORE UPDATE OR DELETE ON billing_validation_control.retention_receipts
   FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
-
-DROP TRIGGER IF EXISTS billing_validation_reservation_no_truncate
-  ON billing_validation_control.retention_reservations;
 CREATE TRIGGER billing_validation_reservation_no_truncate
   BEFORE TRUNCATE ON billing_validation_control.retention_reservations
   FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
-DROP TRIGGER IF EXISTS billing_validation_receipt_no_truncate
-  ON billing_validation_control.retention_receipts;
 CREATE TRIGGER billing_validation_receipt_no_truncate
   BEFORE TRUNCATE ON billing_validation_control.retention_receipts
   FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
 
-DROP TRIGGER IF EXISTS billing_validation_stripe_intent_immutable
-  ON billing_validation_control.stripe_intents;
 CREATE TRIGGER billing_validation_stripe_intent_immutable
   BEFORE UPDATE OR DELETE ON billing_validation_control.stripe_intents
   FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
-DROP TRIGGER IF EXISTS billing_validation_stripe_intent_no_truncate
-  ON billing_validation_control.stripe_intents;
-CREATE TRIGGER billing_validation_stripe_intent_no_truncate
-  BEFORE TRUNCATE ON billing_validation_control.stripe_intents
-  FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
-DROP TRIGGER IF EXISTS billing_validation_stripe_receipt_immutable
-  ON billing_validation_control.stripe_receipts;
 CREATE TRIGGER billing_validation_stripe_receipt_immutable
   BEFORE UPDATE OR DELETE ON billing_validation_control.stripe_receipts
   FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
-DROP TRIGGER IF EXISTS billing_validation_stripe_receipt_no_truncate
-  ON billing_validation_control.stripe_receipts;
+CREATE TRIGGER billing_validation_stripe_intent_no_truncate
+  BEFORE TRUNCATE ON billing_validation_control.stripe_intents
+  FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
 CREATE TRIGGER billing_validation_stripe_receipt_no_truncate
   BEFORE TRUNCATE ON billing_validation_control.stripe_receipts
   FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
 
-CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_leases (
+CREATE TABLE billing_validation_control.fixture_leases (
   branch_id text NOT NULL,
   suite text NOT NULL,
   fixture_key text NOT NULL,
@@ -384,12 +358,10 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_leases (
   FOREIGN KEY (attempt_id, branch_id, suite, fixture_key)
     REFERENCES billing_validation_control.attempts(attempt_id, branch_id, suite, fixture_key)
 );
-ALTER TABLE billing_validation_control.fixture_leases
-  ADD COLUMN IF NOT EXISTS recovery_only boolean NOT NULL DEFAULT false;
-CREATE INDEX IF NOT EXISTS billing_validation_lease_expiry
+CREATE INDEX billing_validation_lease_expiry
   ON billing_validation_control.fixture_leases (expires_at);
 
-CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_case_claims (
+CREATE TABLE billing_validation_control.fixture_case_claims (
   attempt_id text NOT NULL REFERENCES billing_validation_control.attempts(attempt_id),
   case_id text NOT NULL,
   reservation_id text NOT NULL REFERENCES billing_validation_control.retention_reservations(reservation_id),
@@ -405,7 +377,7 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_case_claims (
   PRIMARY KEY (attempt_id, case_id)
 );
 
-CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_resource_claims (
+CREATE TABLE billing_validation_control.fixture_resource_claims (
   attempt_id text NOT NULL,
   case_id text NOT NULL,
   kind text NOT NULL CHECK (kind IN ('catalog', 'billing_identity')),
@@ -416,7 +388,7 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.fixture_resource_claims (
     REFERENCES billing_validation_control.fixture_case_claims(attempt_id, case_id)
 );
 
-CREATE OR REPLACE FUNCTION billing_validation_control.validate_fixture_case_claim()
+CREATE FUNCTION billing_validation_control.validate_fixture_case_claim()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog
@@ -452,13 +424,11 @@ BEGIN
   RETURN NEW;
 END;
 $$;
-DROP TRIGGER IF EXISTS billing_validation_fixture_case_claim_valid
-  ON billing_validation_control.fixture_case_claims;
 CREATE TRIGGER billing_validation_fixture_case_claim_valid
   BEFORE INSERT ON billing_validation_control.fixture_case_claims
   FOR EACH ROW EXECUTE FUNCTION billing_validation_control.validate_fixture_case_claim();
 
-CREATE OR REPLACE FUNCTION billing_validation_control.reject_fixture_case_claim_mutation()
+CREATE FUNCTION billing_validation_control.reject_fixture_case_claim_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog
@@ -467,26 +437,20 @@ BEGIN
   RAISE EXCEPTION 'billing_fixture_case_claims_append_only' USING ERRCODE = '55000';
 END;
 $$;
-DO $$
-DECLARE
-  relation_name text;
-BEGIN
-  FOREACH relation_name IN ARRAY ARRAY['fixture_case_claims', 'fixture_resource_claims'] LOOP
-    EXECUTE format('DROP TRIGGER IF EXISTS %I ON billing_validation_control.%I',
-      'billing_validation_' || relation_name || '_immutable', relation_name);
-    EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE OR DELETE ON billing_validation_control.%I '
-      'FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_fixture_case_claim_mutation()',
-      'billing_validation_' || relation_name || '_immutable', relation_name);
-    EXECUTE format('DROP TRIGGER IF EXISTS %I ON billing_validation_control.%I',
-      'billing_validation_' || relation_name || '_no_truncate', relation_name);
-    EXECUTE format('CREATE TRIGGER %I BEFORE TRUNCATE ON billing_validation_control.%I '
-      'FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_fixture_case_claim_mutation()',
-      'billing_validation_' || relation_name || '_no_truncate', relation_name);
-  END LOOP;
-END;
-$$;
+CREATE TRIGGER billing_validation_fixture_case_claims_immutable
+  BEFORE UPDATE OR DELETE ON billing_validation_control.fixture_case_claims
+  FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_fixture_case_claim_mutation();
+CREATE TRIGGER billing_validation_fixture_resource_claims_immutable
+  BEFORE UPDATE OR DELETE ON billing_validation_control.fixture_resource_claims
+  FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_fixture_case_claim_mutation();
+CREATE TRIGGER billing_validation_fixture_case_claims_no_truncate
+  BEFORE TRUNCATE ON billing_validation_control.fixture_case_claims
+  FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_fixture_case_claim_mutation();
+CREATE TRIGGER billing_validation_fixture_resource_claims_no_truncate
+  BEFORE TRUNCATE ON billing_validation_control.fixture_resource_claims
+  FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_fixture_case_claim_mutation();
 
-CREATE TABLE IF NOT EXISTS billing_validation_control.cleanup_receipts (
+CREATE TABLE billing_validation_control.cleanup_receipts (
   receipt_id text PRIMARY KEY,
   reservation_id text NOT NULL UNIQUE
     REFERENCES billing_validation_control.retention_reservations(reservation_id),
@@ -504,7 +468,7 @@ CREATE TABLE IF NOT EXISTS billing_validation_control.cleanup_receipts (
   created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
-CREATE OR REPLACE FUNCTION billing_validation_control.validate_cleanup_receipt_identity()
+CREATE FUNCTION billing_validation_control.validate_cleanup_receipt_identity()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog
@@ -534,8 +498,9 @@ BEGIN
      attempt.cleanup_status <> 'pending' THEN
     RAISE EXCEPTION 'billing_cleanup_receipt_identity_mismatch' USING ERRCODE = '23514';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM billing_validation_control.fixture_leases
-      WHERE attempt_id = NEW.attempt_id AND fence = NEW.owner_fence AND expires_at > clock_timestamp()) THEN
+  PERFORM 1 FROM billing_validation_control.fixture_leases
+    WHERE attempt_id = NEW.attempt_id AND fence = NEW.owner_fence AND expires_at > clock_timestamp();
+  IF NOT FOUND THEN
     RAISE EXCEPTION 'billing_cleanup_receipt_fence_mismatch' USING ERRCODE = '23514';
   END IF;
   SELECT count(*) INTO resource_count FROM billing_validation_control.resource_locks
@@ -546,19 +511,13 @@ BEGIN
   RETURN NEW;
 END;
 $$;
-DROP TRIGGER IF EXISTS billing_validation_cleanup_receipt_identity
-  ON billing_validation_control.cleanup_receipts;
 CREATE TRIGGER billing_validation_cleanup_receipt_identity
   BEFORE INSERT ON billing_validation_control.cleanup_receipts
   FOR EACH ROW EXECUTE FUNCTION billing_validation_control.validate_cleanup_receipt_identity();
 
-DROP TRIGGER IF EXISTS billing_validation_cleanup_receipt_immutable
-  ON billing_validation_control.cleanup_receipts;
 CREATE TRIGGER billing_validation_cleanup_receipt_immutable
   BEFORE UPDATE OR DELETE ON billing_validation_control.cleanup_receipts
   FOR EACH ROW EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
-DROP TRIGGER IF EXISTS billing_validation_cleanup_receipt_no_truncate
-  ON billing_validation_control.cleanup_receipts;
 CREATE TRIGGER billing_validation_cleanup_receipt_no_truncate
   BEFORE TRUNCATE ON billing_validation_control.cleanup_receipts
   FOR EACH STATEMENT EXECUTE FUNCTION billing_validation_control.reject_retention_ledger_mutation();
