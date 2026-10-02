@@ -261,6 +261,7 @@ export function renderControlStoreBootstrap(plan) {
       'END',
       '$control_store_preflight$;',
       `CREATE ROLE ${policy.roles.owner} NOLOGIN;`,
+      `GRANT ${policy.roles.owner} TO postgres WITH INHERIT FALSE, SET TRUE;`,
       `CREATE ROLE ${policy.roles.runtime} NOLOGIN;`,
       `CREATE ROLE ${policy.roles.verifier} NOLOGIN;`,
       `CREATE SCHEMA ${policy.schema} AUTHORIZATION ${policy.roles.owner};`,
@@ -274,6 +275,8 @@ export function renderControlStoreBootstrap(plan) {
       `INSERT INTO ${policy.schema}.control_store_install_receipts (project_ref, baseline_sha256)`,
       `VALUES (${sqlLiteral(plan.projectRef)}, ${sqlLiteral(plan.baselineSha256)});`,
       migrationBlocks.trimEnd(),
+      'RESET ROLE;',
+      `REVOKE ${policy.roles.owner} FROM postgres;`,
       'COMMIT;',
       '',
     ].join('\n');

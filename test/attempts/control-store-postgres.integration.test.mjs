@@ -326,6 +326,51 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
     } finally {
       await client.query('ROLLBACK');
     }
+
+    // Supabase's `postgres` is a CREATEROLE/CREATEDB administrator, not a superuser.
+    // Replace the disposable cluster's bootstrap superuser temporarily to exercise
+    // the exact role boundary that the remote Management API uses.
+    const operatorPassword = randomBytes(32).toString('base64url');
+    let adminRoleRenamed = false;
+    let operatorRoleCreated = false;
+    let operatorClient;
+    try {
+      await client.query('ALTER ROLE postgres RENAME TO billing_control_test_admin');
+      adminRoleRenamed = true;
+      await client.query(`CREATE ROLE postgres WITH LOGIN NOSUPERUSER CREATEROLE CREATEDB
+        PASSWORD '${operatorPassword}'`);
+      operatorRoleCreated = true;
+      operatorClient = new Client({ ...connection, user: 'postgres', password: operatorPassword,
+        connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
+      await operatorClient.connect();
+      const managedOperator = await operatorClient.query(`SELECT current_user, session_user,
+        role.rolsuper AS is_superuser, role.rolcreaterole AS can_create_roles
+        FROM pg_catalog.pg_roles AS role WHERE role.rolname = current_user`);
+      assert.deepEqual(managedOperator.rows, [{ current_user: 'postgres', session_user: 'postgres',
+        is_superuser: false, can_create_roles: true }]);
+
+      await operatorClient.query(bootstrapSql);
+      const membership = await operatorClient.query(`SELECT pg_catalog.pg_has_role(
+        'postgres', 'billing_validation_owner', 'MEMBER') AS operator_is_owner_member`);
+      assert.deepEqual(membership.rows, [{ operator_is_owner_member: false }],
+        'temporary bootstrap owner membership must not persist after commit');
+    } finally {
+      if (operatorClient) {
+        try { await operatorClient.query('ROLLBACK'); } catch { /* the migration may already have committed */ }
+        await operatorClient.end();
+      }
+      if (operatorRoleCreated) {
+        await client.query('ALTER ROLE postgres RENAME TO billing_control_test_operator');
+      }
+      if (adminRoleRenamed) {
+        await client.query('ALTER ROLE billing_control_test_admin RENAME TO postgres');
+      }
+      await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      await client.query(`DROP ROLE IF EXISTS billing_validation_owner, billing_validation_runtime,
+        billing_validation_verifier`);
+      await client.query('DROP ROLE IF EXISTS billing_control_test_operator');
+    }
+
     await client.query(bootstrapSql);
 
     const roleState = await client.query(`SELECT rolname, rolcanlogin, rolsuper, rolcreaterole,
