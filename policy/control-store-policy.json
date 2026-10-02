@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "projectRef": "ceindkuafycqdcplfrgs",
+  "region": "sa-east-1",
+  "databaseVersion": "17.11.0.002",
+  "schema": "billing_validation_control",
+  "roles": {
+    "owner": "billing_validation_owner",
+    "runtime": "billing_validation_runtime"
+  },
+  "connection": {
+    "protocol": "postgresql",
+    "host": "db.ceindkuafycqdcplfrgs.supabase.co",
+    "port": 5432,
+    "database": "postgres",
+    "sslMode": "require"
+  },
+  "urlEnvironment": "BILLING_CONTROL_DATABASE_URL"
+}
