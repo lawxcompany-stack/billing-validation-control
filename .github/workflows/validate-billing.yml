@@ -54,11 +54,12 @@ jobs:
         image: postgres:17.11
         env:
           POSTGRES_DB: postgres
+          POSTGRES_USER: billing_control_test_admin
           POSTGRES_PASSWORD: disposable-ci-only
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-cmd "pg_isready -U billing_control_test_admin -d postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 6
@@ -78,12 +79,12 @@ jobs:
         run: npx --yes pnpm@11.5.1 --ignore-workspace test
       - name: Prove bootstrap against PostgreSQL 17
         env:
-          BILLING_CONTROL_STORE_LOCAL_TEST_URL: ${{ format('{0}:{1}{1}{2}:{3}@{4}:{5}/{6}', 'postgresql', '/', 'postgres', 'disposable-ci-only', '127.0.0.1', '5432', 'postgres') }}
+          BILLING_CONTROL_STORE_LOCAL_TEST_URL: ${{ format('{0}:{1}{1}{2}:{3}@{4}:{5}/{6}', 'postgresql', '/', 'billing_control_test_admin', 'disposable-ci-only', '127.0.0.1', '5432', 'postgres') }}
         run: node --test test/attempts/control-store-postgres.integration.test.mjs
       - name: Prove control-store ACLs against PostgreSQL 17
         env:
           BILLING_CONTROL_RUNTIME_PG_TEST: '1'
-          BILLING_CONTROL_RUNTIME_PG_TEST_URL: ${{ format('{0}:{1}{1}{2}:{3}@{4}:{5}/{6}', 'postgresql', '/', 'postgres', 'disposable-ci-only', '127.0.0.1', '5432', 'postgres') }}
+          BILLING_CONTROL_RUNTIME_PG_TEST_URL: ${{ format('{0}:{1}{1}{2}:{3}@{4}:{5}/{6}', 'postgresql', '/', 'billing_control_test_admin', 'disposable-ci-only', '127.0.0.1', '5432', 'postgres') }}
         run: node --test test/attempts/control-store-privileges.test.mjs
       - name: Lint workflow policy
         run: npx --yes pnpm@11.5.1 --ignore-workspace lint:workflows

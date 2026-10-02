@@ -73,10 +73,14 @@ test('pull-request policy proves control-store bootstrap and ACLs on disposable 
   const service = job.services?.postgres;
   const bootstrap = job.steps.find((step) => step.name === 'Prove bootstrap against PostgreSQL 17');
   const privileges = job.steps.find((step) => step.name === 'Prove control-store ACLs against PostgreSQL 17');
-  const disposableUrl = "${{ format('{0}:{1}{1}{2}:{3}@{4}:{5}/{6}', 'postgresql', '/', 'postgres', 'disposable-ci-only', '127.0.0.1', '5432', 'postgres') }}";
+  const disposableUrl = "${{ format('{0}:{1}{1}{2}:{3}@{4}:{5}/{6}', 'postgresql', '/', 'billing_control_test_admin', 'disposable-ci-only', '127.0.0.1', '5432', 'postgres') }}";
 
   assert.equal(service?.image, 'postgres:17.11');
-  assert.deepEqual(service?.env, { POSTGRES_DB: 'postgres', POSTGRES_PASSWORD: 'disposable-ci-only' });
+  assert.deepEqual(service?.env, {
+    POSTGRES_DB: 'postgres',
+    POSTGRES_USER: 'billing_control_test_admin',
+    POSTGRES_PASSWORD: 'disposable-ci-only',
+  });
   assert.deepEqual(service?.ports, ['5432:5432']);
   assert.match(service?.options ?? '', /pg_isready/u);
   assert.equal(job.env, undefined, 'database test access must not become job-wide configuration');

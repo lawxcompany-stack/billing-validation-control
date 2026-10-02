@@ -343,11 +343,17 @@ test('local PostgreSQL privilege catalog probe refuses to accept a non-loopback 
     'postgresql://postgres:secret@db.example.invalid:5432/postgres',
     'postgresql://postgres:secret@127.0.0.1:5432/other_database',
     'postgresql://postgres:secret@127.0.0.1/postgres?hostaddr=203.0.113.2',
+    'postgresql://unapproved_admin:secret@127.0.0.1:55432/postgres',
   ]) {
     assert.throws(() => parseControlStoreLocalTestUrl(url), { code: 'control_store_test_target_invalid' });
   }
   assert.deepEqual(parseControlStoreLocalTestUrl('postgresql://postgres:secret@127.0.0.1:55432/postgres'), {
     host: '127.0.0.1', port: 55432, database: 'postgres', user: 'postgres', password: 'secret',
+  });
+  assert.deepEqual(parseControlStoreLocalTestUrl(
+    'postgresql://billing_control_test_admin:secret@127.0.0.1:55432/postgres'), {
+    host: '127.0.0.1', port: 55432, database: 'postgres',
+    user: 'billing_control_test_admin', password: 'secret',
   });
 });
 

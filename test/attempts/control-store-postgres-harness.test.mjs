@@ -82,6 +82,8 @@ test('Docker commands are pinned to the isolated context and carry no password a
   assert.equal(full.at(-1), 'postgres:17.11');
   assert.ok(args.includes('127.0.0.1::5432/tcp'));
   assert.ok(args.includes('POSTGRES_PASSWORD'));
+  assert.ok(args.includes('POSTGRES_USER=billing_control_test_admin'));
+  assert.ok(args.includes('--health-cmd') && args.includes('pg_isready -U billing_control_test_admin -d postgres'));
   assert.ok(args.every((value) => !value.includes('not-a-test-password')));
   assert.equal(args.some((value) => value.startsWith('POSTGRES_PASSWORD=')), false);
   assert.equal(args.some((value) => value.includes('DOCKER_HOST=')), false);
@@ -198,7 +200,7 @@ function fakeDocker({ health = 'healthy', context = validDockerIdentity().contex
 test('harness removes only its exact owned container after an integration-test failure and redacts credentials', async () => {
   const fake = fakeDocker();
   const password = 'synthetic-test-password-1234567890';
-  const expectedUrl = `postgresql://postgres:${password}@127.0.0.1:49152/postgres`;
+  const expectedUrl = `postgresql://billing_control_test_admin:${password}@127.0.0.1:49152/postgres`;
 
   await assert.rejects(runControlStorePostgresHarness({
     account: serviceAccount,

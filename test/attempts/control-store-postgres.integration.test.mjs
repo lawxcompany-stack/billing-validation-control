@@ -271,28 +271,44 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
 }, async () => {
   const { Client } = await import('pg');
   const connection = parseControlStoreLocalTestUrl(connectionUrl);
-  const client = new Client({ ...connection, connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
-  await client.connect();
+  assert.equal(connection.user, 'billing_control_test_admin',
+    'isolated PostgreSQL must use a non-bootstrap administrator to create the synthetic postgres operator');
+  const clusterAdmin = new Client({ ...connection, connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
+  await clusterAdmin.connect();
+  let client;
   try {
-    const identity = await client.query(`SELECT current_database() AS database_name,
+    const clusterIdentity = await clusterAdmin.query(`SELECT current_database() AS database_name,
       session_user AS session_role, current_user AS current_role,
       current_setting('server_version_num') AS version_num,
       role.rolsuper AS is_superuser
       FROM pg_catalog.pg_roles AS role WHERE role.rolname = current_user`);
-    assert.deepEqual(identity.rows, [{ database_name: 'postgres', session_role: 'postgres',
-      current_role: 'postgres', version_num: '170011', is_superuser: true }]);
+    assert.deepEqual(clusterIdentity.rows, [{ database_name: 'postgres', session_role: 'billing_control_test_admin',
+      current_role: 'billing_control_test_admin', version_num: '170011', is_superuser: true }]);
 
-    const preexisting = await client.query(`SELECT nspname FROM pg_catalog.pg_namespace
+    const preexisting = await clusterAdmin.query(`SELECT nspname FROM pg_catalog.pg_namespace
       WHERE nspname = $1`, [schema]);
     assert.deepEqual(preexisting.rows, [], 'the disposable database must start without a control schema');
-    const applicationRoles = await client.query(`SELECT rolname FROM pg_catalog.pg_roles
+    const applicationRoles = await clusterAdmin.query(`SELECT rolname FROM pg_catalog.pg_roles
       WHERE rolname IN ('anon', 'authenticated', 'service_role',
-        'billing_validation_owner', 'billing_validation_runtime', 'billing_validation_verifier')
+        'postgres', 'billing_validation_owner', 'billing_validation_runtime', 'billing_validation_verifier')
       ORDER BY rolname`);
-    assert.deepEqual(applicationRoles.rows, [], 'the disposable image must start with no Supabase/control roles');
+    assert.deepEqual(applicationRoles.rows, [], 'the disposable image must start without managed/control roles');
 
     // These no-login placeholders model only the three managed Supabase roles referenced by REVOKE/ACL SQL.
-    await client.query('CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN; CREATE ROLE service_role NOLOGIN;');
+    await clusterAdmin.query('CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN; CREATE ROLE service_role NOLOGIN;');
+    const postgresPassword = randomBytes(32).toString('base64url');
+    await clusterAdmin.query(`CREATE ROLE postgres WITH LOGIN SUPERUSER PASSWORD '${postgresPassword}'`);
+    client = new Client({ ...connection, user: 'postgres', password: postgresPassword,
+      connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
+    await client.connect();
+    const postgresIdentity = await client.query(`SELECT current_database() AS database_name,
+      session_user AS session_role, current_user AS current_role,
+      current_setting('server_version_num') AS version_num,
+      role.rolsuper AS is_superuser
+      FROM pg_catalog.pg_roles AS role WHERE role.rolname = current_user`);
+    assert.deepEqual(postgresIdentity.rows, [{ database_name: 'postgres', session_role: 'postgres',
+      current_role: 'postgres', version_num: '170011', is_superuser: true }]);
+
     const plan = await loadControlStoreBootstrapPlan();
     const bootstrapSql = renderControlStoreBootstrap(plan);
 
@@ -328,24 +344,14 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
     }
 
     // Supabase's `postgres` is a CREATEROLE/CREATEDB administrator, not a superuser.
-    // Replace the disposable cluster's bootstrap superuser temporarily to exercise
-    // the exact role boundary that the remote Management API uses.
-    const adminPassword = randomBytes(32).toString('base64url');
+    // This is a synthetic role, separate from the cluster bootstrap administrator.
     const operatorPassword = randomBytes(32).toString('base64url');
-    let adminRoleCreated = false;
     let operatorRoleMayBeDemoted = false;
     let postgresRoleRestored = false;
-    let adminClient;
     let operatorClient;
     try {
-      await client.query(`CREATE ROLE billing_control_test_admin WITH LOGIN SUPERUSER
-        PASSWORD '${adminPassword}'`);
-      adminRoleCreated = true;
-      adminClient = new Client({ ...connection, user: 'billing_control_test_admin', password: adminPassword,
-        connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
-      await adminClient.connect();
       operatorRoleMayBeDemoted = true;
-      await adminClient.query(`ALTER ROLE postgres WITH LOGIN NOSUPERUSER CREATEROLE CREATEDB
+      await clusterAdmin.query(`ALTER ROLE postgres WITH LOGIN NOSUPERUSER CREATEROLE CREATEDB
         PASSWORD '${operatorPassword}'`);
       operatorClient = new Client({ ...connection, user: 'postgres', password: operatorPassword,
         connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
@@ -367,23 +373,14 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
         try { await operatorClient.query('ROLLBACK'); } catch { /* the migration may already have committed */ }
         await operatorClient.end();
       }
-      if (adminClient) {
-        try {
-          if (operatorRoleMayBeDemoted) {
-            await adminClient.query('ALTER ROLE postgres WITH LOGIN SUPERUSER CREATEROLE CREATEDB');
-          }
-          postgresRoleRestored = true;
-        } finally {
-          await adminClient.end();
-        }
-      } else if (!operatorRoleMayBeDemoted) {
-        postgresRoleRestored = true;
+      if (operatorRoleMayBeDemoted) {
+        await clusterAdmin.query('ALTER ROLE postgres WITH LOGIN SUPERUSER CREATEROLE CREATEDB');
       }
+      postgresRoleRestored = true;
       if (postgresRoleRestored) {
         await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
         await client.query(`DROP ROLE IF EXISTS billing_validation_owner, billing_validation_runtime,
           billing_validation_verifier`);
-        if (adminRoleCreated) await client.query('DROP ROLE IF EXISTS billing_control_test_admin');
       }
     }
 
@@ -472,7 +469,9 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
 
     await proveLeaseRace(client, connection, randomBytes(16).toString('hex'));
   } finally {
-    await client.end();
+    if (client) await client.end();
+    try { await clusterAdmin.query('DROP ROLE IF EXISTS postgres'); } catch { /* the isolated cluster is removed after a failed test */ }
+    await clusterAdmin.end();
   }
 });
 

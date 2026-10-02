@@ -137,14 +137,15 @@ export function parseControlStoreLocalTestUrl(value) {
     const hostname = url.hostname.replace(/^\[|\]$/gu, '');
     const loopback = hostname === '127.0.0.1' || hostname === '::1';
     const port = Number(url.port);
+    const user = decodeURIComponent(url.username);
     if (!['postgres:', 'postgresql:'].includes(url.protocol) || !loopback || !Number.isInteger(port) ||
-        port < 1 || port > 65535 || decodeURIComponent(url.username) !== 'postgres' ||
+        port < 1 || port > 65535 || !['postgres', 'billing_control_test_admin'].includes(user) ||
         url.pathname !== '/postgres' || url.search !== '' || url.hash !== '') refuseTarget();
     return {
       host: hostname,
       port,
       database: 'postgres',
-      user: 'postgres',
+      user,
       password: decodeURIComponent(url.password),
     };
   } catch {
