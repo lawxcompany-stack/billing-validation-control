@@ -523,9 +523,10 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
   } finally {
     if (client) await client.end();
     try {
-      await clusterAdmin.query('REVOKE ALL PRIVILEGES ON DATABASE postgres FROM postgres');
-      await clusterAdmin.query('DROP ROLE IF EXISTS postgres');
-    } catch { /* the isolated cluster is removed after a failed test */ }
+      // The following ACL suite uses the same disposable database and verifies
+      // the CREATEROLE membership row; the harness removes this whole database.
+      await clusterAdmin.query('ALTER ROLE postgres WITH LOGIN NOSUPERUSER CREATEROLE CREATEDB');
+    } catch { /* a failed setup may not have created postgres; the harness removes the database */ }
     await clusterAdmin.end();
   }
 });
