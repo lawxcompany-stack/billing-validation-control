@@ -173,7 +173,11 @@ test('rejects absent or malformed expected environment identities before any Git
     null,
     {},
     { ...expectedEnvironment, extra: 'not-allowed' },
-    { ...expectedEnvironment, database: { projectRef: 'bad', branchId: 'billing-validation-2026' } },
+    { ...expectedEnvironment, database: { projectRef: 'bad' } },
+    { ...expectedEnvironment, database: { projectRef: expectedEnvironment.database.projectRef,
+      branchId: 'synthetic-branch' } },
+    { ...expectedEnvironment, database: { projectRef: expectedEnvironment.database.projectRef,
+      parentProjectRef: 'zyxwvutsrqponmlkjihg' } },
     { ...expectedEnvironment, deployment: { id: 'dpl_candidate123', origin: 'http://billing-candidate.vercel.app' } },
     { ...expectedEnvironment, stripe: { accountId: 'acct_test-lawx' } },
   ];
@@ -193,7 +197,10 @@ test('rejects CI manifests bound to another expected test environment', async ()
       document.database.projectRef = 'zyxwvutsrqponmlkjihg';
       document.database.bootstrap.projectRef = 'zyxwvutsrqponmlkjihg';
     },
-    (document) => { document.database.branchId = 'other-validation-branch'; },
+    (document) => {
+      document.database.projectRef = 'uvwxyzabcdefghijklmn';
+      document.database.bootstrap.projectRef = 'uvwxyzabcdefghijklmn';
+    },
     (document) => { document.deployment.id = 'dpl_othercandidate123'; },
     (document) => {
       document.deployment.origin = 'https://other-billing-candidate.vercel.app';

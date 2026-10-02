@@ -27,7 +27,6 @@ const SIMPLE_ARTIFACT_REPORTS = Object.freeze({
   lint: 'quality', typecheck: 'quality', coverage: 'regression', build: 'build', sql: 'billing-remote',
 });
 const DATABASE_PROJECT_REF = /^[a-z0-9]{20}$/u;
-const DATABASE_BRANCH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const DEPLOYMENT_ID = /^dpl_[A-Za-z0-9]+$/u;
 const DEPLOYMENT_HOSTNAME = /^[a-z0-9-]+\.vercel\.app$/u;
 const STRIPE_ACCOUNT_ID = /^acct_[A-Za-z0-9_]+$/u;
@@ -49,6 +48,10 @@ function isObject(value) {
 
 function hasExactKeys(value, keys) {
   return isObject(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function hasOnlyKeys(value, keys) {
+  return isObject(value) && Object.keys(value).every((key) => keys.includes(key));
 }
 
 function isNonemptyString(value) {
@@ -81,7 +84,8 @@ function validMigrationArtifacts(artifacts) {
 }
 
 function validBootstrap(bootstrap) {
-  return hasStrings(bootstrap, [
+  return hasOnlyKeys(bootstrap, ['binding', 'receiptSha256', 'projectRef', 'schemaDigest',
+    'schemaFingerprintVersion', 'completedAt', 'appliedVersionCount', 'jobReportSha256']) && hasStrings(bootstrap, [
     'binding', 'receiptSha256', 'projectRef', 'schemaDigest', 'completedAt', 'jobReportSha256',
   ]) && ['receiptSha256', 'schemaDigest', 'jobReportSha256'].every((key) => SHA256.test(bootstrap[key])) &&
     isCount(bootstrap.appliedVersionCount) &&
@@ -100,9 +104,8 @@ function validDeploymentOrigin(value) {
 
 export function isValidExpectedEnvironment(environment) {
   return hasExactKeys(environment, ['database', 'deployment', 'stripe']) &&
-    hasExactKeys(environment.database, ['projectRef', 'branchId']) &&
+    hasExactKeys(environment.database, ['projectRef']) &&
     typeof environment.database.projectRef === 'string' && DATABASE_PROJECT_REF.test(environment.database.projectRef) &&
-    typeof environment.database.branchId === 'string' && DATABASE_BRANCH_ID.test(environment.database.branchId) &&
     hasExactKeys(environment.deployment, ['id', 'origin']) &&
     typeof environment.deployment.id === 'string' && DEPLOYMENT_ID.test(environment.deployment.id) &&
     validDeploymentOrigin(environment.deployment.origin) &&
@@ -125,12 +128,14 @@ function validArtifactEvidence(kind, evidence) {
 
 function validFinalProducerShape(document) {
   const { candidate, database, deployment, stripe, webhook, artifacts, replayRuns } = document;
-  if (!isObject(database) || !hasStrings(database, ['projectRef', 'branchId', 'migrationDigest', 'migrationDigestScope']) ||
-      !DATABASE_PROJECT_REF.test(database.projectRef) || !DATABASE_BRANCH_ID.test(database.branchId) ||
+  if (!hasOnlyKeys(database, ['projectRef', 'migrationDigest', 'migrationDigestScope', 'bootstrap',
+    'migrationArtifacts', 'schemaFingerprintVersion', 'observedSchemaDigest']) ||
+      !hasStrings(database, ['projectRef', 'migrationDigest', 'migrationDigestScope']) ||
+      !DATABASE_PROJECT_REF.test(database.projectRef) || Object.hasOwn(database, 'branchId') ||
+      Object.hasOwn(database, 'parentProjectRef') || Object.hasOwn(database, 'branchName') ||
       !SHA256.test(database.migrationDigest) || database.migrationDigestScope !== 'reviewed-assets' ||
       !validBootstrap(database.bootstrap) || database.bootstrap.projectRef !== database.projectRef ||
       !validMigrationArtifacts(database.migrationArtifacts) ||
-      (database.branchName !== undefined && !isNonemptyString(database.branchName)) ||
       (database.observedSchemaDigest !== undefined && !SHA256.test(database.observedSchemaDigest)) ||
       (database.schemaFingerprintVersion !== undefined && database.schemaFingerprintVersion !== 1)) return false;
 
@@ -399,7 +404,6 @@ function parseDocument(contents, expected) {
     refuse('evidence_identity_mismatch');
   }
   if (document.database.projectRef !== expected.environment.database.projectRef ||
-      document.database.branchId !== expected.environment.database.branchId ||
       document.deployment.id !== expected.environment.deployment.id ||
       document.deployment.origin !== expected.environment.deployment.origin ||
       document.stripe.accountId !== expected.environment.stripe.accountId ||

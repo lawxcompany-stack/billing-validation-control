@@ -24,7 +24,7 @@ function assertReaderBoundary(job) {
   assert.equal(job.needs, 'authorize');
   assert.equal(job['continue-on-error'], undefined);
   assert.equal(job.env, undefined);
-  assert.equal(job.if, "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && needs.authorize.result == 'success' }}");
+  assert.equal(job.if, "${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' }}");
   assert.equal(job.steps.length, 4, 'credentialed reader runs only the reviewed fixed steps');
   const [checkout, setup, token, consumer] = job.steps;
   for (const [step, allowed] of [
@@ -62,6 +62,174 @@ function assertReaderBoundary(job) {
   assert.deepEqual(serialized.match(/\$\{\{[^}]*\bsecrets\b[^}]*\}\}/gu), ['${{ secrets.BILLING_READER_APP_PRIVATE_KEY }}']);
   assert.equal((serialized.match(/steps\.reader_token\.outputs\.token/gu) ?? []).length, 1,
     'the reader token may only be consumed by the fixed reader step');
+}
+
+function assertResultAttestationBoundary(job) {
+  const expression = value => '${{ ' + value + ' }}';
+  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.validate-result-input.result == 'success' && needs.authorize.outputs.operation == 'collect'";
+  assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'environment', 'timeout-minutes', 'permissions', 'steps'].sort());
+  assert.equal(job.if, expression(guard));
+  assert.deepEqual(job.needs, ['authorize', 'reader', 'test', 'validate-result-input']);
+  assert.equal(job['runs-on'], 'ubuntu-latest');
+  assert.equal(job.environment, 'billing-validation-attestation');
+  assert.equal(job['timeout-minutes'], 10);
+  assert.deepEqual(job.permissions, { contents: 'read', 'id-token': 'write', attestations: 'write' });
+  assert.deepEqual(job.steps, [
+    { name: 'Checkout exact triggering workflow SHA',
+      uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      with: { ref: expression('github.sha'), 'persist-credentials': false } },
+    { name: 'Set up Node.js 22', uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      with: { 'node-version': '22', 'package-manager-cache': false } },
+    { name: 'Download sanitized financial result input',
+      uses: 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+      with: { name: 'billing-45-result-input', path: expression('runner.temp') } },
+    { name: 'Compose canonical financial result subject',
+      env: {
+        CONTROL_REPOSITORY: expression('github.repository'),
+        CONTROL_REPOSITORY_ID: expression('github.repository_id'),
+        CONTROL_REF: expression('github.ref'),
+        CONTROL_DEFAULT_BRANCH: expression('github.event.repository.default_branch'),
+        CONTROL_REF_PROTECTED: expression('github.ref_protected'),
+        CONTROL_WORKFLOW_REF: expression('github.workflow_ref'),
+        CONTROL_RUN_ID: expression('github.run_id'),
+        CONTROL_RUN_ATTEMPT: expression('github.run_attempt'),
+        CONTROL_WORKFLOW_SHA: expression('github.sha'),
+        CONTROL_EVENT_NAME: expression('github.event_name'),
+        CANDIDATE_SHA: expression('needs.authorize.outputs.candidate_sha'),
+        READER_CANDIDATE_SHA: expression('needs.reader.outputs.candidate_sha'),
+        READER_CANDIDATE_TREE_SHA: expression('needs.reader.outputs.candidate_tree_sha'),
+        CANDIDATE_PULL_NUMBER: expression('needs.reader.outputs.candidate_pull_number'),
+        VERCEL_READ_ONLY_TOKEN: expression('secrets.BILLING_VALIDATION_VERCEL_READ_ONLY_TOKEN'),
+        BILLING_RESULT_INPUT_PATH: expression('runner.temp') + '/billing-45-result-input.json',
+        BILLING_RESULT_MANIFEST_PATH: expression('runner.temp') + '/billing-result-manifest.json',
+      },
+      run: 'node runner/write-billing-result-manifest.mjs' },
+    { name: 'Attest only the canonical financial result subject',
+      uses: 'actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d',
+      with: { 'subject-path': expression('runner.temp') + '/billing-result-manifest.json' } },
+    { name: 'Upload only the financial result subject',
+      uses: 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+      with: { name: 'billing-result-manifest', path: expression('runner.temp') + '/billing-result-manifest.json',
+        'if-no-files-found': 'error', 'retention-days': 1, overwrite: false, 'include-hidden-files': false } },
+  ]);
+}
+
+function assertResultInputValidationBoundary(job) {
+  const expression = value => '${{ ' + value + ' }}';
+  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.authorize.outputs.operation == 'collect'";
+  assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'timeout-minutes', 'permissions', 'steps'].sort());
+  assert.equal(job.if, expression(guard));
+  assert.deepEqual(job.needs, ['authorize', 'reader', 'test']);
+  assert.equal(job['runs-on'], 'ubuntu-latest');
+  assert.equal(job.environment, undefined);
+  assert.equal(job['timeout-minutes'], 10);
+  assert.deepEqual(job.permissions, { contents: 'read' });
+  assert.deepEqual(job.steps, [
+    { name: 'Checkout exact triggering workflow SHA',
+      uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      with: { ref: expression('github.sha'), 'persist-credentials': false } },
+    { name: 'Set up Node.js 22', uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      with: { 'node-version': '22', 'package-manager-cache': false } },
+    { name: 'Download financial result records',
+      uses: 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+      with: { name: 'billing-45-result-input', path: expression('runner.temp') } },
+    { name: 'Validate exact sanitized 45-case result schema before credentials',
+      env: { BILLING_RESULT_INPUT_PATH: expression('runner.temp') + '/billing-45-result-input.json' },
+      run: 'node runner/validate-billing-result-input.mjs' },
+  ]);
+}
+
+function assertResultVerificationBoundary(job) {
+  const expression = value => '${{ ' + value + ' }}';
+  const guard = "!cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.test.result == 'success' && needs.attest-result.result == 'success' && needs.authorize.outputs.operation == 'collect'";
+  assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'timeout-minutes', 'permissions', 'steps'].sort());
+  assert.equal(job.if, expression(guard));
+  assert.deepEqual(job.needs, ['authorize', 'reader', 'test', 'attest-result']);
+  assert.equal(job['runs-on'], 'ubuntu-latest');
+  assert.equal(job['timeout-minutes'], 10);
+  assert.deepEqual(job.permissions, { contents: 'read', attestations: 'read' });
+  assert.deepEqual(job.steps, [
+    { name: 'Checkout exact triggering workflow SHA',
+      uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      with: { ref: expression('github.sha'), 'persist-credentials': false } },
+    { name: 'Set up Node.js 22', uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      with: { 'node-version': '22', 'package-manager-cache': false } },
+    { name: 'Download canonical financial result subject',
+      uses: 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+      with: { name: 'billing-result-manifest', path: expression('runner.temp') } },
+    { name: 'Verify financial result attestation before publisher Environment',
+      env: {
+        GH_TOKEN: expression('github.token'),
+        CONTROL_REPOSITORY: expression('github.repository'),
+        CONTROL_REPOSITORY_ID: expression('github.repository_id'),
+        CONTROL_REF: expression('github.ref'),
+        CONTROL_DEFAULT_BRANCH: expression('github.event.repository.default_branch'),
+        CONTROL_REF_PROTECTED: expression('github.ref_protected'),
+        CONTROL_WORKFLOW_REF: expression('github.workflow_ref'),
+        CONTROL_RUN_ID: expression('github.run_id'),
+        CONTROL_RUN_ATTEMPT: expression('github.run_attempt'),
+        CONTROL_WORKFLOW_SHA: expression('github.sha'),
+        CONTROL_EVENT_NAME: expression('github.event_name'),
+        CANDIDATE_SHA: expression('needs.authorize.outputs.candidate_sha'),
+        READER_CANDIDATE_SHA: expression('needs.reader.outputs.candidate_sha'),
+        READER_CANDIDATE_TREE_SHA: expression('needs.reader.outputs.candidate_tree_sha'),
+        CANDIDATE_PULL_NUMBER: expression('needs.reader.outputs.candidate_pull_number'),
+        BILLING_RESULT_MANIFEST_PATH: expression('runner.temp') + '/billing-result-manifest.json',
+      },
+      run: 'node runner/verify-billing-result.mjs' },
+  ]);
+}
+
+function assertControlStoreRuntimeBoundary(workflow) {
+  const expression = (value) => '${{ ' + value + ' }}';
+  const guard = "github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.authorize.outputs.operation == 'collect'";
+  const job = workflow.jobs['control-store'];
+
+  assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'environment', 'timeout-minutes', 'permissions', 'steps'].sort());
+  assert.equal(job.if, expression(guard));
+  assert.equal(job.needs, 'authorize');
+  assert.equal(job['runs-on'], 'ubuntu-latest');
+  assert.equal(job.environment, 'billing-validation-control');
+  assert.equal(job['timeout-minutes'], 10);
+  assert.deepEqual(job.permissions, { contents: 'read' });
+  assert.equal(job.outputs, undefined);
+  assert.equal(job.env, undefined);
+  assert.equal(JSON.stringify(workflow).includes('BILLING_CONTROL_DATABASE_URL'), false,
+    'the former shared control/runtime URL must not appear in the protected workflow');
+  assert.deepEqual(job.steps, [
+    { name: 'Checkout exact triggering workflow SHA', uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      with: { ref: expression('github.sha'), 'persist-credentials': false } },
+    { name: 'Set up Node.js 22', uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      with: { 'node-version': '22', 'package-manager-cache': false } },
+    { name: 'Install locked dependencies without lifecycle scripts',
+      run: 'npx --yes pnpm@11.5.1 --ignore-workspace install --frozen-lockfile --ignore-scripts' },
+    { name: 'Verify the billing control store read-only',
+      env: { BILLING_CONTROL_VERIFIER_DATABASE_URL: expression('secrets.BILLING_CONTROL_VERIFIER_DATABASE_URL') },
+      run: 'node runner/verify-control-store.mjs' },
+  ]);
+
+  const preflight = workflow.jobs.authorize.steps.find((step) => step.id === 'environments');
+  assert.equal(preflight.env.CONTROL_DISPATCH_OPERATION, expression('steps.authorize.outputs.operation'));
+  assert.match(preflight.run, /process\.env\.CONTROL_DISPATCH_OPERATION\s*===\s*'collect'/u);
+  assert.match(preflight.run, /process\.env\.CONTROL_DISPATCH_OPERATION\s*===\s*'recheck'/u);
+  assert.match(preflight.run, /requiredEnvironments\.push\('billing-validation-control'\)/u);
+  assert.match(preflight.run, /approval\.reviewers\.length\s*>\s*0/u);
+
+  const testJob = workflow.jobs.test;
+  assert.ok(testJob.needs.includes('control-store'));
+  assert.match(testJob.if, /needs\.control-store\.result\s*==\s*'success'/u);
+  assert.match(testJob.if, /needs\.control-store\.result\s*==\s*'skipped'/u);
+
+  for (const [jobId, otherJob] of Object.entries(workflow.jobs)) {
+    const serialized = JSON.stringify(otherJob);
+    const references = serialized.match(/\$\{\{\s*secrets\.BILLING_CONTROL_VERIFIER_DATABASE_URL\s*\}\}/gu) ?? [];
+    assert.equal(references.length, jobId === 'control-store' ? 1 : 0,
+      `${jobId} must not receive or forward the control database URL`);
+    if (jobId !== 'control-store') {
+      assert.equal(serialized.includes('BILLING_CONTROL_VERIFIER_DATABASE_URL'), false,
+        `${jobId} must not name the verifier database URL`);
+    }
+  }
 }
 
 // Closed structural contract independent of the YAML being checked. Exact keys,
@@ -136,14 +304,184 @@ function assertLocalAuthorizationBoundary(workflow) {
   });
 }
 
+function workflowConfigurationStrings(workflow) {
+  const configuration = structuredClone(workflow);
+  delete configuration.name;
+  delete configuration['run-name'];
+  for (const job of Object.values(configuration.jobs ?? {})) {
+    delete job.name;
+    for (const step of job.steps ?? []) delete step.name;
+  }
+  for (const event of Object.values(configuration.on ?? {})) {
+    for (const input of Object.values(event.inputs ?? {})) delete input.description;
+  }
+
+  const strings = [];
+  function visit(value) {
+    if (typeof value === 'string') strings.push(value);
+    else if (Array.isArray(value)) value.forEach(visit);
+    else if (value !== null && typeof value === 'object') Object.values(value).forEach(visit);
+  }
+  visit(configuration);
+  return strings;
+}
+
+const allowedProviderContextReferences = new Set([
+  ['.github/workflows/authorize-local-collector.yml', 'jobs.reader.steps[2].with.app-id', 'vars', 'BILLING_READER_APP_ID'],
+  ['.github/workflows/authorize-local-collector.yml', 'jobs.reader.steps[2].with.private-key', 'secrets', 'BILLING_READER_APP_PRIVATE_KEY'],
+  ['.github/workflows/validate-billing.yml', 'jobs.reader.steps[2].with.app-id', 'vars', 'BILLING_READER_APP_ID'],
+  ['.github/workflows/validate-billing.yml', 'jobs.reader.steps[2].with.private-key', 'secrets', 'BILLING_READER_APP_PRIVATE_KEY'],
+  ['.github/workflows/validate-billing.yml', 'jobs.control-store.steps[3].env.BILLING_CONTROL_VERIFIER_DATABASE_URL', 'secrets', 'BILLING_CONTROL_VERIFIER_DATABASE_URL'],
+  ['.github/workflows/validate-billing.yml', 'jobs.attest-result.steps[3].env.VERCEL_READ_ONLY_TOKEN', 'secrets', 'BILLING_VALIDATION_VERCEL_READ_ONLY_TOKEN'],
+].map((tuple) => JSON.stringify(tuple)));
+
+function workflowExpressionBlocks(value, sourcePath) {
+  const expressions = [];
+  let searchFrom = 0;
+  while (true) {
+    const start = value.indexOf('${{', searchFrom);
+    if (start === -1) break;
+    let quote;
+    let end = -1;
+    for (let index = start + 3; index < value.length - 1; index += 1) {
+      const character = value[index];
+      if (quote) {
+        if (character === quote) {
+          if (value[index + 1] === quote) index += 1;
+          else quote = undefined;
+        }
+      } else if (character === "'" || character === '"') quote = character;
+      else if (character === '}' && value[index + 1] === '}') {
+        end = index;
+        break;
+      }
+    }
+    assert.ok(end !== -1, `${sourcePath} contains an unterminated workflow expression`);
+    expressions.push(value.slice(start + 3, end).trim());
+    searchFrom = end + 2;
+  }
+  return expressions;
+}
+
+function providerContextReferences(expression) {
+  let quote;
+  for (let index = 0; index < expression.length;) {
+    const character = expression[index];
+    if (quote) {
+      if (character === quote) {
+        if (expression[index + 1] === quote) index += 2;
+        else {
+          quote = undefined;
+          index += 1;
+        }
+      } else index += 1;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      index += 1;
+      continue;
+    }
+    if (!/[A-Za-z_]/u.test(character)) {
+      index += 1;
+      continue;
+    }
+
+    let identifierEnd = index + 1;
+    while (/[A-Za-z0-9_]/u.test(expression[identifierEnd] ?? '')) identifierEnd += 1;
+    const source = expression.slice(index, identifierEnd).toLowerCase();
+    let previous = index - 1;
+    while (previous >= 0 && /\s/u.test(expression[previous])) previous -= 1;
+    if ((source === 'vars' || source === 'secrets') && expression[previous] !== '.') return true;
+    index = identifierEnd;
+  }
+  return false;
+}
+
+function assertAllowedProviderContextReferences(workflow, workflowPath) {
+  function visit(value, path = '') {
+    if (typeof value === 'string') {
+      if (path === 'name' || /^on\.[^.]+\.inputs\.[^.]+\.description$/u.test(path)) return;
+      for (const expression of workflowExpressionBlocks(value, `${workflowPath}:${path}`)) {
+        if (!providerContextReferences(expression)) continue;
+        const reference = /^(vars|secrets)\.([A-Za-z_][A-Za-z0-9_]*)$/u.exec(expression);
+        const tuple = JSON.stringify([workflowPath, path, reference?.[1], reference?.[2]]);
+        assert.ok(allowedProviderContextReferences.has(tuple),
+          `${workflowPath}:${path} must use an explicitly allowlisted vars/secrets reference`);
+      }
+    } else if (Array.isArray(value)) {
+      value.forEach((child, index) => visit(child, `${path}[${index}]`));
+    } else if (value !== null && typeof value === 'object') {
+      for (const [key, child] of Object.entries(value)) {
+        visit(child, path ? `${path}.${key}` : key);
+      }
+    }
+  }
+  visit(workflow);
+}
+
+function assertNoProviderRuntimeEnvironment(workflow, path) {
+  assertAllowedProviderContextReferences(workflow, path);
+  const blocked = /^(?:DATABASE_URL|POSTGRES(?:_|$)|SUPABASE(?:_|$)|STRIPE(?:_|$)|VERCEL_(?:ACCESS_TOKEN|API_TOKEN|TOKEN)(?:_|$))/iu;
+  const providerReferences = /\$\{\{\s*(?:vars|secrets)\.([A-Za-z_][A-Za-z0-9_]*)/giu;
+  const environments = [['workflow', workflow.env]];
+  for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
+    environments.push([jobId, job.env], ...(job.steps ?? []).map((step) => [jobId, step.env]));
+  }
+  for (const [scope, environment] of environments) {
+    for (const [key, value] of Object.entries(environment ?? {})) {
+      assert.ok(!blocked.test(key), `${path}:${scope} must not import provider runtime configuration`);
+      if (typeof value === 'string') {
+        for (const [, name] of value.matchAll(providerReferences)) {
+          assert.ok(!blocked.test(name), `${path}:${scope} must not import provider runtime configuration`);
+        }
+      }
+      if (scope === 'workflow' && typeof value === 'string') {
+        assert.ok(!/\$\{\{[^}]*\bsecrets\b[^}]*\}\}/iu.test(value),
+          `${path}:workflow env must not import secrets`);
+      }
+    }
+  }
+}
+
 export function assertWorkflowSecretBoundary(workflow, path) {
+  // A workflow may not import local credentials or select a Production/Live
+  // source through executable/configuration values. Presentation labels do not
+  // choose a credential source or destination.
+  const configurationStrings = workflowConfigurationStrings(workflow);
+  assert.ok(!configurationStrings.some((value) => /\.env\.local\b/iu.test(value)),
+    `${path} must not load local credentials`);
+  assert.ok(!configurationStrings.some((value) => /(?:^|[^a-z0-9])(?:production|prod|live)(?:$|[^a-z0-9])/iu.test(value)),
+    `${path} must not select Production or Live credentials or destinations`);
+  assert.ok(!configurationStrings.some((value) => /\b(?:https?|postgres(?:ql)?):\/\/[^\s"'<>]*\.supabase\.co\b/iu.test(value)),
+    `${path} must not import a Supabase destination`);
+  assert.ok(!configurationStrings.some((value) => /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|sqlserver|mssql)(?:\+[a-z0-9_-]+)?:\/\/[^\s"'<>]+/iu.test(value)),
+    `${path} must not import a database URL`);
+  assert.ok(!configurationStrings.some((value) => /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/u.test(value)),
+    `${path} must not import a JWT credential`);
+  assert.ok(!configurationStrings.some((value) => /\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{8,}\b/iu.test(value)),
+    `${path} must not import a Supabase API key`);
+  assert.ok(!configurationStrings.some((value) => /\b[rs]k_(?:test|live)_[A-Za-z0-9_-]{8,}\b/iu.test(value)),
+    `${path} must not import a Stripe secret or restricted API key`);
+  assert.ok(!configurationStrings.some((value) => /\bwhsec_[A-Za-z0-9_]{8,}\b/u.test(value)),
+    `${path} must not import a Stripe webhook secret`);
+  assertNoProviderRuntimeEnvironment(workflow, path);
   if (path === workflowPaths[2]) return assertLocalAuthorizationBoundary(workflow);
   assert.deepEqual(workflow.permissions, { contents: 'read' }, `${path} must keep token permissions read-only`);
+  if (path === workflowPaths[0]) assertControlStoreRuntimeBoundary(workflow);
 
   for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
     const serializedJob = JSON.stringify(job);
-    if (path === workflowPaths[0] && jobId === 'reader') assertReaderBoundary(job);
-    else assert.ok(!/\$\{\{[^}]*\bsecrets\b/i.test(serializedJob),
+    if (path === workflowPaths[0] && jobId === 'control-store') {
+      assert.deepEqual(serializedJob.match(/\$\{\{[^}]*\bsecrets\b[^}]*\}\}/gu),
+        ['${{ secrets.BILLING_CONTROL_VERIFIER_DATABASE_URL }}'],
+        `${path}:${jobId} may consume only the protected read-only control URL`);
+    } else if (path === workflowPaths[0] && jobId === 'reader') assertReaderBoundary(job);
+    else if (path === workflowPaths[0] && jobId === 'attest-result') {
+      assert.deepEqual(serializedJob.match(/\$\{\{[^}]*\bsecrets\b[^}]*\}\}/gu),
+        ['${{ secrets.BILLING_VALIDATION_VERCEL_READ_ONLY_TOKEN }}'],
+        `${path}:${jobId} may consume only the scoped Vercel read-only token`);
+    } else assert.ok(!/\$\{\{[^}]*\bsecrets\b/i.test(serializedJob),
       `${path}:${jobId} must not consume reader or financial secrets`);
     assert.ok(!/\$\{\{\s*needs\.[^}]+\.outputs\.(?:private_key|token|secret)/i.test(serializedJob),
       `${path}:${jobId} must not propagate credential-like outputs`);
@@ -153,6 +491,25 @@ export function assertWorkflowSecretBoundary(workflow, path) {
         'id-token': 'write',
         attestations: 'write',
       }, `${path}:${jobId} must scope signing permissions to the hosted activation attestation`);
+    } else if (path === workflowPaths[0] && jobId === 'attest-result') {
+      assertResultAttestationBoundary(job);
+    } else if (path === workflowPaths[0] && jobId === 'validate-result-input') {
+      assertResultInputValidationBoundary(job);
+    } else if (path === workflowPaths[0] && jobId === 'verify-result') {
+      assertResultVerificationBoundary(job);
+    } else if (path === workflowPaths[0] && jobId === 'publisher') {
+      assert.deepEqual(job.permissions, { contents: 'read' },
+        'publisher must not retain verification permissions or credentials');
+      assert.match(job.if, /needs\.verify-result\.result\s*==\s*'success'/);
+      assert.match(job.if, /needs\.attest-result\.result\s*==\s*'success'/);
+      assert.match(job.if, /needs\.authorize\.outputs\.operation\s*==\s*'collect'/);
+      assert.equal(job.environment, 'billing-validation-publisher');
+      assert.equal((serializedJob.match(/\$\{\{\s*github\.token\s*\}\}/gu) ?? []).length, 0);
+    } else if (path === workflowPaths[0] && jobId === 'authorize') {
+      assert.deepEqual(job.permissions, { contents: 'read', actions: 'read' },
+        'only the hosted, secret-free authorization job may read Environment configuration');
+      assert.equal(job.environment, undefined);
+      assert.equal(job['runs-on'], 'ubuntu-latest');
     } else {
       assert.ok(!job.permissions || JSON.stringify(job.permissions) === JSON.stringify({ contents: 'read' }),
         `${path}:${jobId} must not widen token permissions`);

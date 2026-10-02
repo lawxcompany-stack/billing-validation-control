@@ -11,11 +11,11 @@ import { providerIdempotencyKey } from '../../src/attempts/prepare.mjs';
 import { runStripeMutation } from '../../src/runtime/stripe.mjs';
 
 const environment = {
-  database: { projectRef: 'abcdefghijklmnopqrst', branchId: 'validation-child-1' },
+  database: { projectRef: 'abcdefghijklmnopqrst' },
   deployment: { id: 'dpl_candidate123', origin: 'https://candidate.vercel.app' },
   stripe: { accountId: 'acct_synthetic123' },
 };
-const key = { branchId: 'validation-child-1', suite: 'billing', fixtureKey: 'invoice-a' };
+const key = { projectRef: 'abcdefghijklmnopqrst', suite: 'billing', fixtureKey: 'invoice-a' };
 const shaA = 'a'.repeat(40);
 const shaB = 'b'.repeat(40);
 const retentionPolicy = { version: 1, quotas: {
@@ -60,9 +60,11 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
   let recovery = { runTerminal: true, runnerRemoved: true, cleanupComplete: true };
   let cleanupVerified = true;
   let retentionReconcilerVerified = trustedRetentionReconciler;
+  const retentionVerificationInputs = [];
   let providerReconcilerVerified = trustedProviderReconciler;
   let cleanupReceiptFailure = false;
   let cleanupResourceLockFailure = false;
+  let fenceSequence = 0;
   const recoveryInputs = [];
   const cleanupSteps = [];
   let tail = Promise.resolve();
@@ -75,7 +77,7 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
     fixtureResourceClaims: structuredClone(fixtureResourceClaims) });
   const sameScope = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const resourceKeys = (value) => [
-    { resourceType: 'supabase_branch', resourceId: `${value.database.projectRef}:${value.database.branchId}` },
+    { resourceType: 'supabase_project', resourceId: value.database.projectRef },
     { resourceType: 'stripe_account', resourceId: value.stripe.accountId },
   ].sort((a, b) => `${a.resourceType}:${a.resourceId}`.localeCompare(`${b.resourceType}:${b.resourceId}`));
   const resourceMapKey = (resource) => `${resource.resourceType}:${resource.resourceId}`;
@@ -86,7 +88,7 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
   };
   return {
     attempts, leases, reservations, receipts, resourceLocks, stripeIntents, stripeReceipts,
-    cleanupReceipts, fixtureCaseClaims, fixtureResourceClaims, cleanupSteps,
+    cleanupReceipts, fixtureCaseClaims, fixtureResourceClaims, cleanupSteps, retentionVerificationInputs,
     recoveryInputs,
     advance: (seconds) => { clock += seconds; },
     transactionCount: () => transactionCount,
@@ -101,7 +103,10 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
       recoveryInputs.push(structuredClone(input));
       return recovery;
     } } : {}),
-    verifyRetentionReceipt: async () => retentionReconcilerVerified,
+    verifyRetentionReceipt: async (input) => {
+      retentionVerificationInputs.push(structuredClone(input));
+      return retentionReconcilerVerified;
+    },
     verifyProviderObservation: async () => providerReconcilerVerified,
     async transaction(fn) {
       transactionCount++;
@@ -115,6 +120,10 @@ function fakeAdapter({ trustedRecovery = true, trustedRetentionReconciler = true
         lockRetention: async () => {},
         lockResourceLocks: async () => {},
         now: () => clock,
+        nextFence: async () => {
+          fenceSequence += 1;
+          return `00000000-0000-4000-8000-${String(fenceSequence).padStart(12, '0')}`;
+        },
         getAttempt: async (id) => structuredClone(attempts.get(id) ?? null),
         putAttempt: async (row) => {
           if (row.cleanupStatus === 'complete') cleanupSteps.push('attempt');
@@ -326,7 +335,7 @@ test('fixture reservation validation refuses missing, settled, divergent, insuff
     { name: 'reservation scope diverges', prepare(adapter, owner) {
       const reservation = adapter.reservations.get(owner.reservationId);
       adapter.reservations.set(owner.reservationId, { ...reservation,
-        scope: { ...reservation.scope, branchId: 'other-validation-branch' } });
+        scope: { ...reservation.scope, projectRef: 'bbbbbbbbbbbbbbbbbbbb' } });
     }, code: 'fixture_reservation_invalid' },
     { name: 'requested rows exceed reserved projection', rows: { databaseRows: 2 },
       code: 'fixture_reservation_insufficient' },
@@ -382,7 +391,7 @@ test('different candidate SHAs cannot concurrently own one branch/suite/fixture 
   assert.equal(results.find((r) => r.status === 'rejected').reason.code, 'lease_held');
 });
 
-test('different suite and fixture keys sharing one validation branch conflict on global resource locks', async () => {
+test('different suite and fixture keys sharing one standalone project conflict on global resource locks', async () => {
   const store = createAttemptStore(fakeAdapter());
   await prepareAttempt(store, input('attempt-a', shaA, 'invoice-a'));
   await assert.rejects(prepareAttempt(store, { ...input('attempt-b', shaB, 'invoice-b'),
@@ -390,24 +399,23 @@ test('different suite and fixture keys sharing one validation branch conflict on
   { code: 'resource_lock_held' });
 });
 
-test('attempts sharing only a Stripe account conflict while fully disjoint resources proceed independently', async () => {
+test('attempts sharing only a Stripe account conflict while disjoint projects proceed independently', async () => {
   const adapter = fakeAdapter();
   const store = createAttemptStore(adapter);
   await prepareAttempt(store, input());
   await assert.rejects(prepareAttempt(store, { ...input('attempt-b', shaB, 'invoice-b'),
-    key: { branchId: 'validation-child-2', suite: 'another-suite', fixtureKey: 'invoice-b' },
-    environment: { ...environment, database: { ...environment.database,
-      branchId: 'validation-child-2' } } }), { code: 'resource_lock_held' });
+    key: { projectRef: 'mnopqrstabcdefghijkl', suite: 'another-suite', fixtureKey: 'invoice-b' },
+    environment: { ...environment, database: { projectRef: 'mnopqrstabcdefghijkl' } } }), { code: 'resource_lock_held' });
 
   const disjoint = { ...input('attempt-c', shaB, 'invoice-c'),
-    key: { branchId: 'validation-child-3', suite: 'another-suite', fixtureKey: 'invoice-c' },
-    environment: { database: { ...environment.database, branchId: 'validation-child-3' },
+    key: { projectRef: 'opqrstabcdefghijklmn', suite: 'another-suite', fixtureKey: 'invoice-c' },
+    environment: { database: { projectRef: 'opqrstabcdefghijklmn' },
       deployment: { id: 'dpl_othercandidate123', origin: 'https://other-candidate.vercel.app' },
       stripe: { accountId: 'acct_other_synthetic123' } } };
   assert.equal((await prepareAttempt(store, disjoint)).attemptId, 'attempt-c');
 });
 
-test('attempts sharing only a Supabase branch conflict across otherwise distinct fixtures', async () => {
+test('attempts sharing only a standalone project conflict across otherwise distinct fixtures', async () => {
   const store = createAttemptStore(fakeAdapter());
   await prepareAttempt(store, input());
   await assert.rejects(prepareAttempt(store, { ...input('attempt-b', shaB, 'invoice-b'),
@@ -571,6 +579,22 @@ test('takeover after expiry requires terminal run, removed runner and completed 
   }
   adapter.setRecovery(recovery);
   assert.equal((await prepareAttempt(store, input('attempt-b', shaB))).attemptId, 'attempt-b');
+});
+
+test('retention receipts bind the current owner fence and reject a stolen lease', async () => {
+  const adapter = fakeAdapter();
+  const store = createAttemptStore(adapter);
+  const owner = await prepareAttempt(store, input());
+  const receipt = await store.reconcileReservation({ reservationId: owner.reservationId,
+    outcome: 'cancelled', retained: projection });
+  assert.equal(receipt.ownerFence, owner.fence);
+  assert.equal(adapter.retentionVerificationInputs[0].ownerFence, owner.fence);
+  assert.equal(adapter.retentionVerificationInputs[0].receipt.ownerFence, owner.fence);
+
+  adapter.leases.set(JSON.stringify(key), { ...adapter.leases.get(JSON.stringify(key)),
+    attemptId: 'attempt-successor', fence: '00000000-0000-4000-8000-000000000999' });
+  await assert.rejects(store.reconcileReservation({ reservationId: owner.reservationId,
+    outcome: 'cancelled', retained: projection }), { code: 'retention_owner_fence_lost' });
 });
 
 test('expired resource locks cannot be taken over while a Stripe intent is unresolved', async () => {
@@ -1149,7 +1173,6 @@ test('prepare uses one detached environment snapshot for target validation, atte
   assert.deepEqual(row.environment, environment);
   assert.deepEqual(reservation.scope, {
     projectRef: environment.database.projectRef,
-    branchId: environment.database.branchId,
     stripeAccountId: environment.stripe.accountId,
   });
 });

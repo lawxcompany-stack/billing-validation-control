@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { readCandidatePrerequisites } from '../../src/github/candidate-reader.mjs';
 import { main } from '../../scripts/read-candidate.mjs';
 
@@ -104,4 +107,32 @@ test('reader CLI logs only a minimal prerequisite summary, never paths, reposito
   assert.deepEqual(JSON.parse(lines[0]), { scope: 'candidate-prerequisites', candidateSha: sha,
     runId: '10', attempt: 1, checks: ['quality', 'regression', 'build'] });
   assert.doesNotMatch(lines[0], /Plataforma-LawX|private-path-sentinel|workflowPath|token-sentinel/);
+});
+
+test('candidate workflow output contains only prerequisite identifiers when upstream metadata has a privileged field', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'bvc-task6-reader-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const output = join(directory, 'github-output');
+  await writeFile(output, '');
+  const f = fixture();
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    const value = await f.api.get(url.pathname + url.search);
+    if (url.pathname.includes('/jobs') && !Array.isArray(value)) {
+      value.jobs[0].privateCredential = 'synthetic-privileged-key-sentinel';
+    }
+    return Response.json(value);
+  });
+  const logs = [];
+  t.mock.method(console, 'log', (line) => logs.push(line));
+  assert.equal(await main({ CONTROL_REPOSITORY: context.repository, CONTROL_REF: context.ref,
+    CONTROL_DEFAULT_BRANCH: context.defaultBranch, CONTROL_REF_PROTECTED: 'true',
+    CONTROL_EVENT_NAME: context.eventName, CANDIDATE_SHA: sha,
+    CANDIDATE_READ_TOKEN: 'synthetic-reader-token-sentinel', GITHUB_OUTPUT: output }), 0);
+  assert.equal(await readFile(output, 'utf8'), [
+    `candidate_sha=${sha}`, `candidate_tree_sha=${tree}`, `candidate_base_sha=${'3'.repeat(40)}`,
+    'candidate_pull_number=139', 'ci_run_id=10', 'ci_run_attempt=1', '',
+  ].join('\n'));
+  assert.equal(logs.length, 1);
+  assert.doesNotMatch(logs[0], /synthetic-privileged-key-sentinel|synthetic-reader-token-sentinel/u);
 });

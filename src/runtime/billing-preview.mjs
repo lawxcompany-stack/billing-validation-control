@@ -1,5 +1,6 @@
 import { immutableVercelOrigin } from '../github/deployments.mjs';
 import { isVerifiedDeploymentAttestation } from './vercel.mjs';
+import { isValidStandaloneProjectRef } from '../billing/contracts.mjs';
 
 const ROUTES = Object.freeze({ home: '/' });
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -168,6 +169,8 @@ export async function createBillingPreviewBrowser(input = {}) {
   const { deployment, candidate, deploymentAttestation, attempts, owner, chromium } = input;
   const assertDeploymentCurrent = () => {
     if (candidate?.candidateSha !== owner.candidateSha ||
+        !isValidStandaloneProjectRef(owner.environment?.database?.projectRef) ||
+        deploymentAttestation?.projectRef !== owner.environment.database.projectRef ||
         !isVerifiedDeploymentAttestation(deploymentAttestation, { deployment, candidate })) {
       refuse('preview_deployment_unverified');
     }
@@ -178,6 +181,7 @@ export async function createBillingPreviewBrowser(input = {}) {
   catch { refuse('preview_deployment_unverified'); }
   if (admitted?.attemptId !== owner.attemptId || admitted?.fence !== owner.fence ||
       admitted?.candidateSha !== owner.candidateSha ||
+      admitted?.environment?.database?.projectRef !== owner.environment.database.projectRef ||
       admitted?.environment?.deployment?.id !== deployment.id ||
       admitted?.environment?.deployment?.origin !== deployment.origin ||
       owner.environment?.deployment?.id !== deployment.id ||

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { verifyDeploymentAttestation } from '../../src/runtime/vercel.mjs';
+import { databasePolicy } from '../runtime/standalone-fixture.mjs';
 
 export const environment = Object.freeze({
-  database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst', branchId: 'validation-child-123' }),
+  database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst' }),
   deployment: Object.freeze({ id: 'dpl_task6preview123', origin: 'https://lawx-abc123def-team.vercel.app' }),
   stripe: Object.freeze({ accountId: 'acct_task6test123' }),
 });
@@ -37,10 +38,7 @@ export const preflight = Object.freeze({
   candidate,
   deploymentAttestation,
   providerVerification: Object.freeze({
-    supabase: Object.freeze({ projectRef: environment.database.projectRef,
-      parentProjectRef: 'zyxwvutsrqponmlkjihg', branchId: environment.database.branchId,
-      branchName: 'billing-validation-task6', schemaFingerprintSha256: 'a'.repeat(64),
-      migrationHistorySha256: 'b'.repeat(64) }),
+    supabase: databasePolicy,
     stripe: Object.freeze({ accountId: environment.stripe.accountId,
       webhookEndpointId: 'we_task6endpoint', webhookUrl: `${environment.deployment.origin}/api/stripe/webhook`,
       livemode: false }),

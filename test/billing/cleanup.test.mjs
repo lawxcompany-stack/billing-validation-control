@@ -144,7 +144,8 @@ test('cleanup expires and cancels owned resources in reverse order, retains char
   assert.deepEqual(result.mutatedResourceIds, ['sub_task6', 'cs_task6']);
   assert.equal(Object.hasOwn(result, 'deletedResourceIds'), false);
   assert.equal(fixture.actions.every((request) => request.attemptId === fixture.context.owner.attemptId &&
-    request.fence === fixture.context.owner.fence && request.environment.database.branchId === 'validation-child-123'), true);
+    request.fence === fixture.context.owner.fence &&
+    request.environment.database.projectRef === environment.database.projectRef), true);
   assert.equal(result.completed, true);
   assert.equal(fixture.parts.calls.cleanup.length, 1);
   assert.equal(result.cleanupDigest, 'f'.repeat(64));

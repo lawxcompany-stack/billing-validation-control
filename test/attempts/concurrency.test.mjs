@@ -10,7 +10,13 @@ function concurrentAdapter() {
   const receipts = new Map();
   const resourceLocks = new Map();
   const stripeIntents = new Map();
+  const fixtureClaimEvents = [];
+  const fixtureCaseClaims = new Map();
+  const fixtureResourceClaims = new Set();
   const locks = new Map();
+  const reservationLockEvents = [];
+  let nextFence = 0;
+  let nextTransactionId = 0;
   let delayLease = false;
   async function acquire(name, held) {
     const previous = locks.get(name) ?? Promise.resolve();
@@ -21,23 +27,34 @@ function concurrentAdapter() {
     held.push(release);
   }
   const resourceKeys = (environment) => [
-    { resourceType: 'supabase_branch', resourceId:
-      `${environment.database.projectRef}:${environment.database.branchId}` },
+    { resourceType: 'supabase_project', resourceId: environment.database.projectRef },
     { resourceType: 'stripe_account', resourceId: environment.stripe.accountId },
   ].sort((a, b) => `${a.resourceType}:${a.resourceId}`.localeCompare(`${b.resourceType}:${b.resourceId}`));
   const resourceMapKey = (resource) => `${resource.resourceType}:${resource.resourceId}`;
   return {
-    leases, reservations, receipts,
+    leases, reservations, receipts, fixtureClaimEvents, reservationLockEvents,
     delayNextLease: () => { delayLease = true; },
     async transaction(fn) {
       const held = [];
+      const heldNames = new Set();
+      const transactionId = ++nextTransactionId;
+      const acquireOnce = async (name) => {
+        if (heldNames.has(name)) return;
+        await acquire(name, held);
+        heldNames.add(name);
+      };
       const tx = {
         now: async () => 1000,
-        lockAttempt: async (id) => acquire(`attempt:${id}`, held),
-        lockRetention: async (scope) => acquire(`retention:${JSON.stringify(scope)}`, held),
+        nextFence: async () => {
+          nextFence += 1;
+          return `00000000-0000-4000-8000-${String(nextFence).padStart(12, '0')}`;
+        },
+        lockAttempt: async (id) => acquireOnce(`attempt:${id}`),
+        lockBusinessKey: async (key) => acquireOnce(`business:${key}`),
+        lockRetention: async (scope) => acquireOnce(`retention:${JSON.stringify(scope)}`),
         async lockResourceLocks(environment) {
           for (const resource of resourceKeys(environment)) {
-            await acquire(`resource:${resourceMapKey(resource)}`, held);
+            await acquireOnce(`resource:${resourceMapKey(resource)}`);
           }
         },
         getAttempt: async (id) => structuredClone(attempts.get(id) ?? null),
@@ -97,10 +114,53 @@ function concurrentAdapter() {
         async getRetentionReservationByAttempt(id) {
           return structuredClone([...reservations.values()].find((row) => row.attemptId === id) ?? null);
         },
-        async getRetentionReservation(id) { return structuredClone(reservations.get(id) ?? null); },
+        async getRetentionReservation(id) {
+          const reference = structuredClone(reservations.get(id) ?? null);
+          reservationLockEvents.push({ transactionId, phase: 'reference_read', reservationId: id });
+          if (!reference) return null;
+          await tx.lockAttempt(reference.attemptId);
+          reservationLockEvents.push({ transactionId, phase: 'attempt_locked', reservationId: id });
+          await tx.lockBusinessKey(JSON.stringify(['retention-reservation', id]));
+          reservationLockEvents.push({ transactionId, phase: 'reservation_locked', reservationId: id });
+          const reread = structuredClone(reservations.get(id) ?? null);
+          reservationLockEvents.push({ transactionId, phase: 'reservation_reread', reservationId: id });
+          return reread;
+        },
         async getRetentionReceipt(id) { return structuredClone(receipts.get(id) ?? null); },
-        async putRetentionReservation(row) { reservations.set(row.reservationId, structuredClone(row)); },
+        async putRetentionReservation(row) {
+          reservations.set(row.reservationId, structuredClone({ ...row, fixtureRowsUsed: 0 }));
+        },
         async putRetentionReceipt(row) { receipts.set(row.reservationId, structuredClone(row)); },
+        async setRetentionFixtureRowsUsed({ reservationId, attemptId, expectedRows, usedRows }) {
+          await tx.lockBusinessKey(`fixture-reservation-claim:${reservationId}`);
+          const reservation = reservations.get(reservationId);
+          if (!reservation || reservation.attemptId !== attemptId ||
+              reservation.fixtureRowsUsed !== expectedRows || usedRows <= expectedRows) {
+            throw Object.assign(new Error('fixture_reservation_insufficient'), {
+              code: 'fixture_reservation_insufficient',
+            });
+          }
+          const eventId = `usage:${reservationId}:${usedRows}`;
+          if (fixtureClaimEvents.some((event) => event.eventId === eventId)) {
+            throw Object.assign(new Error('fixture_reservation_insufficient'), {
+              code: 'fixture_reservation_insufficient',
+            });
+          }
+          fixtureClaimEvents.push({ eventId, reservationId, attemptId,
+            previousRows: expectedRows, currentRows: usedRows });
+          reservations.set(reservationId, { ...reservation, fixtureRowsUsed: usedRows });
+        },
+        async claimFixtureCase(claim) {
+          await tx.lockBusinessKey(JSON.stringify(['fixture-case-claim', claim.attemptId, claim.caseId]));
+          await tx.lockBusinessKey(JSON.stringify(['fixture-resource-claim', claim.fixtureId]));
+          const caseKey = `${claim.attemptId}:${claim.caseId}`;
+          const resourceKey = `${claim.attemptId}:${claim.caseId}:${claim.kind}`;
+          if (fixtureCaseClaims.has(caseKey) || fixtureResourceClaims.has(resourceKey)) {
+            throw Object.assign(new Error('fixture_case_duplicate'), { code: 'fixture_case_duplicate' });
+          }
+          fixtureCaseClaims.set(caseKey, structuredClone(claim));
+          fixtureResourceClaims.add(resourceKey);
+        },
         fixtureMutation: async (fn) => fn(),
       };
       try { return await fn(tx); }
@@ -109,12 +169,12 @@ function concurrentAdapter() {
   };
 }
 
-const key = { branchId: 'validation-child-1', suite: 'billing', fixtureKey: 'invoice-a' };
+const key = { projectRef: 'abcdefghijklmnopqrst', suite: 'billing', fixtureKey: 'invoice-a' };
 const candidateSha = 'a'.repeat(40);
 const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
   ref: 'refs/heads/main', runId: '100', runAttempt: 1,
   runnerLabel: 'billing-validation-' + 'a'.repeat(32) };
-const environment = { database: { projectRef: 'abcdefghijklmnopqrst', branchId: key.branchId },
+const environment = { database: { projectRef: key.projectRef },
   deployment: { id: 'dpl_candidate123', origin: 'https://candidate.vercel.app' },
   stripe: { accountId: 'acct_synthetic123' } };
 const input = { attemptId: 'attempt-a', key, candidateSha, workflow, environment, ttlSeconds: 60 };
@@ -128,6 +188,7 @@ test('concurrent duplicate prepares serialize before reading attempt state', asy
   const store = createAttemptStore(adapter);
   adapter.delayNextLease();
   const [first, replay] = await Promise.all([store.prepare(input), store.prepare(input)]);
+  assert.equal(first.fence, '00000000-0000-4000-8000-000000000001');
   assert.equal(first.fence, replay.fence);
 });
 
@@ -177,6 +238,66 @@ test('concurrent admissions serialize retained-capacity reads and cannot overboo
   assert.equal(outcomes.find((outcome) => outcome.status === 'rejected').reason.code,
     'retention_capacity_exceeded');
   assert.equal(adapter.reservations.size, 1);
+});
+
+test('concurrent fixture-row usage appends one event and rejects a stale duplicate transition', async () => {
+  const adapter = concurrentAdapter();
+  const store = createAttemptStore(adapter);
+  await store.prepare(input);
+  const reservation = [...adapter.reservations.values()][0];
+  const update = () => adapter.transaction((tx) => tx.setRetentionFixtureRowsUsed({
+    reservationId: reservation.reservationId,
+    attemptId: reservation.attemptId,
+    expectedRows: 0,
+    usedRows: 1,
+  }));
+
+  const results = await Promise.allSettled([update(), update()]);
+  assert.equal(results.filter(({ status }) => status === 'fulfilled').length, 1);
+  assert.equal(results.filter(({ status }) => status === 'rejected').length, 1);
+  assert.equal(results.find(({ status }) => status === 'rejected').reason.code,
+    'fixture_reservation_insufficient');
+  assert.deepEqual(adapter.fixtureClaimEvents, [{ eventId: `usage:${reservation.reservationId}:1`,
+    reservationId: reservation.reservationId, attemptId: reservation.attemptId,
+    previousRows: 0, currentRows: 1 }]);
+  assert.equal(adapter.reservations.get(reservation.reservationId).fixtureRowsUsed, 1);
+});
+
+test('concurrent fixture mutation and reconciliation use attempt-before-reservation fencing', async () => {
+  const adapter = concurrentAdapter();
+  adapter.verifyRetentionReceipt = async () => true;
+  const store = createAttemptStore(adapter);
+  const owner = await store.prepare(input);
+  const reservation = [...adapter.reservations.values()][0];
+  const fixture = store.fixtureMutationWithReservation({
+    attemptId: owner.attemptId, fence: owner.fence, reservationId: reservation.reservationId,
+    rows: { databaseRows: 1 }, caseId: 'payment.approved',
+    namespaceId: '00000000-0000-4000-8000-000000000001',
+    fixtureId: '00000000-0000-4000-8000-000000000101', kind: 'catalog',
+  }, async () => 'fixture-written');
+  const reconciliation = store.reconcileReservation({ reservationId: reservation.reservationId,
+    outcome: 'completed', retained: { attempts: 1, databaseRows: 0, authUsers: 0, stripeObjects: 0 } });
+  let timeout;
+  const results = await Promise.race([
+    Promise.allSettled([fixture, reconciliation]),
+    new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('reservation lock-order deadlock')), 250); }),
+  ]);
+  clearTimeout(timeout);
+
+  assert.equal(results[1].status, 'fulfilled');
+  assert.ok(results[0].status === 'fulfilled' ||
+    (results[0].status === 'rejected' && results[0].reason.code === 'retention_attempt_settled'));
+  const events = adapter.reservationLockEvents;
+  assert.ok(events.length >= 4);
+  for (const transactionId of new Set(events.map((event) => event.transactionId))) {
+    const phases = events.filter((event) => event.transactionId === transactionId).map((event) => event.phase);
+    const reference = phases.indexOf('reference_read');
+    const attempt = phases.indexOf('attempt_locked', reference + 1);
+    const reservationLock = phases.indexOf('reservation_locked', attempt + 1);
+    const reread = phases.indexOf('reservation_reread', reservationLock + 1);
+    assert.ok(reference >= 0 && attempt > reference && reservationLock > attempt && reread > reservationLock,
+      `invalid reservation lock sequence: ${phases.join(' -> ')}`);
+  }
 });
 
 test('durable Stripe intent is committed before the injected provider adapter runs and remains unresolved on failure', async () => {

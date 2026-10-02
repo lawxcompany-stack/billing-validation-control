@@ -26,12 +26,11 @@ export function isActiveFixtureMutationTransaction(value) {
 
 function equal(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
 function safeId(value) { return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/.test(value); }
-function validKey(key) { return key && ['branchId', 'suite', 'fixtureKey'].every((name) => safeId(key[name])) && Object.keys(key).length === 3; }
+function validKey(key) { return key && ['projectRef', 'suite', 'fixtureKey'].every((name) => safeId(key[name])) && Object.keys(key).length === 3; }
 function validTtl(value) { return Number.isInteger(value) && value >= 1 && value <= 3600; }
 
 function retentionScope(environment) {
-  return { projectRef: environment.database.projectRef, branchId: environment.database.branchId,
-    stripeAccountId: environment.stripe.accountId };
+  return { projectRef: environment.database.projectRef, stripeAccountId: environment.stripe.accountId };
 }
 
 function ownDataValue(value, key) {
@@ -66,12 +65,12 @@ function exactDataRecord(value, expectedKeys) {
 function snapshotEnvironment(value) {
   const fields = exactDataRecord(value, ['database', 'deployment', 'stripe']);
   if (!fields) return null;
-  const database = exactDataRecord(fields.database, ['projectRef', 'branchId']);
+  const database = exactDataRecord(fields.database, ['projectRef']);
   const deployment = exactDataRecord(fields.deployment, ['id', 'origin']);
   const stripe = exactDataRecord(fields.stripe, ['accountId']);
   if (!database || !deployment || !stripe) return null;
   const snapshot = Object.freeze({
-    database: Object.freeze({ projectRef: database.projectRef, branchId: database.branchId }),
+    database: Object.freeze({ projectRef: database.projectRef }),
     deployment: Object.freeze({ id: deployment.id, origin: deployment.origin }),
     stripe: Object.freeze({ accountId: stripe.accountId }),
   });
@@ -238,8 +237,7 @@ function assertOwner(lease, attemptId, fence, now) {
 
 function resourceKeys(environment) {
   return [
-    { resourceType: 'supabase_branch', resourceId:
-      `${environment.database.projectRef}:${environment.database.branchId}` },
+    { resourceType: 'supabase_project', resourceId: environment.database.projectRef },
     { resourceType: 'stripe_account', resourceId: environment.stripe.accountId },
   ].sort((a, b) => `${a.resourceType}:${a.resourceId}`.localeCompare(`${b.resourceType}:${b.resourceId}`));
 }
@@ -364,7 +362,7 @@ export function createAttemptStore(adapter) {
       const ttlSeconds = ownDataValue(input, 'ttlSeconds');
       if (!safeId(attemptId) || !validKey(key) || !/^[a-f0-9]{40}$/.test(candidateSha ?? '') ||
           !validTtl(ttlSeconds) || !validWorkflow(workflow) || !isValidExpectedEnvironment(environment) ||
-          key.branchId !== environment.database.branchId ||
+          key.projectRef !== environment.database.projectRef ||
           (expectedEnvironment && !equal(environment, expectedEnvironment))) {
         refuse('attempt_input_invalid');
       }
@@ -452,7 +450,9 @@ export function createAttemptStore(adapter) {
           }
           await tx.putAttempt({ ...prior, cleanupStatus: 'complete', updatedAt: now });
         }
-        const fence = randomUUID();
+        if (typeof tx.nextFence !== 'function') refuse('lease_fence_store_unavailable');
+        const fence = await tx.nextFence();
+        if (typeof fence !== 'string' || !UUID_V4.test(fence)) refuse('lease_fence_store_unavailable');
         const row = { attemptId, key, candidateSha, workflow, environment, state: 'collecting',
           cleanupStatus: 'pending', artifact: null, resourceIds: [], createdAt: now, updatedAt: now };
         await tx.putAttempt(row);
@@ -465,7 +465,8 @@ export function createAttemptStore(adapter) {
         await tx.putRetentionReservation(reservation);
         await tx.putLease({ key, attemptId, fence, expiresAt: now + ttlSeconds,
           candidateSha, ownerRepository: workflow.repository, ownerRef: workflow.ref,
-          ownerRunId: workflow.runId, ownerRunAttempt: workflow.runAttempt, recoveryOnly: false },
+          ownerRunId: workflow.runId, ownerRunAttempt: workflow.runAttempt, recoveryOnly: false,
+          eventType: lease ? 'takeover' : 'acquired' },
         lease?.fence ?? null);
         return admissionResult(row, fence, reservation);
       });
@@ -475,15 +476,27 @@ export function createAttemptStore(adapter) {
       if (typeof adapter.verifyRetentionReceipt !== 'function') refuse('retention_reconciliation_unverified');
       return adapter.transaction(async (tx) => {
         if (typeof tx.getRetentionReservation !== 'function' || typeof tx.getRetentionReceipt !== 'function' ||
-            typeof tx.lockRetention !== 'function' || typeof tx.putRetentionReceipt !== 'function') {
+            typeof tx.lockRetention !== 'function' || typeof tx.putRetentionReceipt !== 'function' ||
+            typeof tx.getAttempt !== 'function' || typeof tx.getLease !== 'function' ||
+            typeof tx.lockAttempt !== 'function' || typeof tx.lockResourceLocks !== 'function') {
           refuse('retention_store_unavailable');
         }
         const reservation = await tx.getRetentionReservation(request.reservationId);
         if (!reservation) refuse('retention_reservation_missing');
+        await tx.lockAttempt(reservation.attemptId);
+        const attempt = await tx.getAttempt(reservation.attemptId);
+        if (!attempt || !equal(reservation.scope, retentionScope(attempt.environment))) {
+          refuse('retention_ledger_invalid');
+        }
+        await tx.lockResourceLocks(attempt.environment);
+        const lease = await tx.getLease(attempt.key);
+        if (!lease || lease.attemptId !== reservation.attemptId || typeof lease.fence !== 'string' ||
+            !UUID_V4.test(lease.fence)) refuse('retention_owner_fence_lost');
         await tx.lockRetention(reservation.scope);
         const existing = await tx.getRetentionReceipt(reservation.reservationId);
         if (existing) {
-          if (existing.outcome !== request.outcome || !equal(existing.retained, request.retained)) {
+          if (existing.outcome !== request.outcome || !equal(existing.retained, request.retained) ||
+              existing.ownerFence !== lease.fence) {
             refuse('retention_already_settled');
           }
           return existing;
@@ -493,12 +506,14 @@ export function createAttemptStore(adapter) {
         for (const key of RETENTION_QUOTA_KEYS) {
           if (request.retained[key] > projection[key]) refuse('retention_receipt_exceeds_reservation');
         }
-        const verification = await adapter.verifyRetentionReceipt({ reservation,
+        const now = await tx.now();
+        const verification = await adapter.verifyRetentionReceipt({ reservation, lease,
+          ownerFence: lease.fence, leaseExpired: lease.expiresAt <= now,
           receipt: { reservationId: request.reservationId, attemptId: reservation.attemptId,
-            outcome: request.outcome, retained: request.retained } });
+            ownerFence: lease.fence, outcome: request.outcome, retained: request.retained } });
         if (verification !== true) refuse('retention_reconciliation_unverified');
         const receipt = { receiptId: randomUUID(), reservationId: reservation.reservationId,
-          attemptId: reservation.attemptId, scope: reservation.scope, outcome: request.outcome,
+          attemptId: reservation.attemptId, ownerFence: lease.fence, scope: reservation.scope, outcome: request.outcome,
           retained: request.retained, createdAt: await tx.now() };
         await tx.putRetentionReceipt(receipt);
         return receipt;
@@ -620,11 +635,14 @@ export function createAttemptStore(adapter) {
           refuse('recovery_unverified');
         }
         const now = await tx.now();
-        const nextFence = randomUUID();
+        if (typeof tx.nextFence !== 'function') refuse('lease_fence_store_unavailable');
+        const nextFence = await tx.nextFence();
+        if (typeof nextFence !== 'string' || !UUID_V4.test(nextFence)) refuse('lease_fence_store_unavailable');
         const renewed = { ...lease, fence: nextFence, recoveryOnly: true,
           expiresAt: now + ttlSeconds,
           ownerRepository: currentRun.repository, ownerRef: currentRun.ref,
-          ownerRunId: currentRun.runId, ownerRunAttempt: currentRun.runAttempt };
+          ownerRunId: currentRun.runId, ownerRunAttempt: currentRun.runAttempt,
+          eventType: 'recovery_handoff' };
         await tx.putLease(renewed, lease.fence);
         await tx.putResourceLocks({ attemptId, fence: nextFence, candidateSha: row.candidateSha,
           workflow: currentRun, environment: row.environment, expiresAt: renewed.expiresAt }, locks);
@@ -759,7 +777,7 @@ export function createAttemptStore(adapter) {
         const lease = await tx.getLease(row.key);
         const now = await tx.now();
         await assertFencedOwner(tx, row, lease, attemptId, fence, now);
-        const renewed = { ...lease, expiresAt: now + ttlSeconds };
+        const renewed = { ...lease, expiresAt: now + ttlSeconds, eventType: 'renewed' };
         await tx.putLease(renewed, fence);
         const resourceLocks = await tx.getResourceLocks(row.environment);
         await tx.putResourceLocks({ attemptId, fence, candidateSha: row.candidateSha,
@@ -812,10 +830,13 @@ export function createAttemptStore(adapter) {
             row.candidateSha !== candidateSha || currentHeadSha !== candidateSha ||
             !equal(row.artifact, artifact)) refuse('recheck_identity_mismatch');
         if (!validTtl(ttlSeconds)) refuse('attempt_input_invalid');
-        const fence = randomUUID();
+        if (typeof tx.nextFence !== 'function') refuse('lease_fence_store_unavailable');
+        const fence = await tx.nextFence();
+        if (typeof fence !== 'string' || !UUID_V4.test(fence)) refuse('lease_fence_store_unavailable');
         const renewed = { ...lease, fence, expiresAt: now + ttlSeconds,
           candidateSha, ownerRepository: recheckRun.repository, ownerRef: recheckRun.ref,
-          ownerRunId: recheckRun.runId, ownerRunAttempt: recheckRun.runAttempt };
+          ownerRunId: recheckRun.runId, ownerRunAttempt: recheckRun.runAttempt,
+          eventType: 'recheck_handoff' };
         await tx.putLease(renewed, lease.fence);
         await tx.putResourceLocks({ attemptId, fence, candidateSha: row.candidateSha,
           workflow: { ...row.workflow, runId: recheckRun.runId, runAttempt: recheckRun.runAttempt },

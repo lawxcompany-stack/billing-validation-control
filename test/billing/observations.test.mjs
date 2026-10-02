@@ -35,25 +35,24 @@ test('delayed webhook initial evidence must be the exact trusted observation obj
   assert.equal(isTrusted(structuredClone(evidence)), false);
 });
 
-test('independent readers pin the validation branch, Stripe TEST account and webhook endpoint before dispatch; webhook evidence is read only after effect', async () => {
+test('independent readers pin the standalone project, Stripe TEST account and webhook endpoint before dispatch; webhook evidence is read only after effect', async () => {
   const createReaders = needExport(observations, 'createIndependentBillingReaders');
   const createSupabaseReader = needExport(supabaseRuntime, 'createSupabaseBillingReader');
   const createStripeReader = needExport(stripeRuntime, 'createStripeBillingReader');
   const calls = [];
   let effectApplied = false;
   let webhookInbox = { attemptId: 'attempt-task4', caseId: 'payment.approved',
-    branchId: environment.database.branchId, eventId: 'evt_task4', eventType: 'invoice.paid',
+    projectRef: environment.database.projectRef, eventId: 'evt_task4', eventType: 'invoice.paid',
     objectId: 'in_task4', accountId: environment.stripe.accountId, livemode: false, status: 'processed',
     attempts: 1, receivedAt: new Date(Date.parse(startedAt) + 2_000).toISOString(),
     processedAt: new Date(Date.parse(startedAt) + 3_000).toISOString(),
     secret: 'do-not-return', cookie: 'do-not-return' };
   let eventCreated = Math.floor(Date.parse(startedAt) / 1000) + 1;
   let webhookReceipts = [{ id: 'receipt_task4', attemptId: 'attempt-task4', caseId: 'payment.approved',
-    branchId: environment.database.branchId, eventId: 'evt_task4', eventType: 'invoice.paid',
+    projectRef: environment.database.projectRef, eventId: 'evt_task4', eventType: 'invoice.paid',
     objectId: 'in_task4', accountId: environment.stripe.accountId, livemode: false, status: 'processed',
     receivedAt: new Date(Date.parse(startedAt) + 2_500).toISOString(), rawBody: 'private' }];
-  const supabaseIdentity = { projectRef: environment.database.projectRef,
-    branchId: environment.database.branchId, readOnly: true };
+  const supabaseIdentity = { projectRef: environment.database.projectRef, readOnly: true };
   const stripeIdentity = { accountId: environment.stripe.accountId, webhookEndpointId: 'we_task6endpoint',
     webhookUrl: `${environment.deployment.origin}/api/stripe/webhook`, livemode: false, readOnly: true };
   const supabaseReader = createSupabaseReader({ expectedEnvironment: environment, source: {
@@ -159,12 +158,11 @@ test('missing or mismatched readonly identities refuse readiness before provider
   const createReaders = needExport(observations, 'createIndependentBillingReaders');
   const createSupabaseReader = needExport(supabaseRuntime, 'createSupabaseBillingReader');
   const createStripeReader = needExport(stripeRuntime, 'createStripeBillingReader');
-  const validSupabase = { projectRef: environment.database.projectRef,
-    branchId: environment.database.branchId, readOnly: true };
+  const validSupabase = { projectRef: environment.database.projectRef, readOnly: true };
   const validStripe = { accountId: environment.stripe.accountId, webhookEndpointId: 'we_task6endpoint',
     webhookUrl: `${environment.deployment.origin}/api/stripe/webhook`, livemode: false, readOnly: true };
   for (const mismatch of [
-    { provider: 'supabase', identity: { ...validSupabase, branchId: 'wrong-validation-branch' } },
+    { provider: 'supabase', identity: { ...validSupabase, projectRef: 'mnopqrstabcdefghijkl' } },
     { provider: 'stripe', identity: { ...validStripe, accountId: 'acct_wrong' } },
     { provider: 'stripe', identity: { ...validStripe, webhookEndpointId: 'we_wrong' } },
     { provider: 'stripe', identity: { ...validStripe, livemode: true } },
@@ -252,10 +250,9 @@ test('Stripe readonly reader projects only billing fields and never returns raw 
     { code: 'stripe_reader_response_invalid' });
 });
 
-test('Supabase fixture and webhook readers enforce the exact branch and attempt binding', async () => {
+test('Supabase fixture and webhook readers enforce the exact project and attempt binding', async () => {
   const createSupabaseReader = needExport(supabaseRuntime, 'createSupabaseBillingReader');
-  const identity = { projectRef: environment.database.projectRef,
-    branchId: environment.database.branchId, readOnly: true };
+  const identity = { projectRef: environment.database.projectRef, readOnly: true };
   let fixtureReads = 0;
   let webhookReads = 0;
   const reader = createSupabaseReader({ expectedEnvironment: environment, source: {
@@ -278,7 +275,7 @@ test('Supabase fixture and webhook readers enforce the exact branch and attempt 
   { code: 'supabase_fixture_response_invalid' });
   await assert.rejects(reader.readWebhookInbox('evt_task4'), { code: 'supabase_reader_input_invalid' });
   await assert.rejects(reader.readWebhookInbox({ attemptId: 'attempt-task4', caseId: 'payment.approved',
-    branchId: 'branch_wrong', eventId: 'evt_task4', objectId: 'in_task4' }),
+    projectRef: 'mnopqrstabcdefghijkl', eventId: 'evt_task4', objectId: 'in_task4' }),
   { code: 'supabase_reader_input_invalid' });
   assert.equal(fixtureReads, 1);
   assert.equal(webhookReads, 0);
@@ -305,10 +302,7 @@ test('installed SQL and concurrency observations accept only complete versioned 
     version: 1,
     readerId: 'sql-reader-a',
     projectRef: 'abcdefghijklmnopqrst',
-    parentProjectRef: 'zyxwvutsrqponmlkjihg',
-    branchId: 'validation-child-123',
-    branchName: 'billing-validation-child',
-    isDefaultBranch: false,
+    isStandaloneProject: true,
     schemaFingerprintSha256: 'a'.repeat(64),
     migrationHistorySha256: 'b'.repeat(64),
     triggerDigestSha256: 'c'.repeat(64),
@@ -333,9 +327,7 @@ test('installed SQL and concurrency observations accept only complete versioned 
     version: 1,
     readerId: 'sql-reader-a',
     projectRef: schema.projectRef,
-    parentProjectRef: schema.parentProjectRef,
-    branchId: schema.branchId,
-    branchName: schema.branchName,
+    isStandaloneProject: true,
     barrierId: 'billing-sql-barrier-a',
     assertionDigests,
     races,

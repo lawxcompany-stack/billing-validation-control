@@ -61,7 +61,7 @@ function freezeTree(value) {
 }
 
 export function createSnapshot(row, artifactId) {
-  if (!keysOnly(row, ROW_KEYS) || !keysOnly(row?.key, ['branchId', 'suite', 'fixtureKey']) ||
+  if (!keysOnly(row, ROW_KEYS) || !keysOnly(row?.key, ['projectRef', 'suite', 'fixtureKey']) ||
       Object.keys(row.key).length !== 3 || !validWorkflow(row.workflow) ||
       !isValidExpectedEnvironment(row.environment) ||
       !/^[a-f0-9]{40}$/.test(row.candidateSha ?? '') ||

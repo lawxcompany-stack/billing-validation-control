@@ -6,9 +6,6 @@ const sqlGates = await importIfMissing(() => import('../../src/billing/sql-gates
 
 const target = Object.freeze({
   projectRef: 'abcdefghijklmnopqrst',
-  parentProjectRef: 'zyxwvutsrqponmlkjihg',
-  branchId: 'validation-child-123',
-  branchName: 'billing-validation-child',
 });
 
 const assertionIds = [
@@ -48,7 +45,7 @@ function installedSchema(readerId, changes = {}) {
     version: 1,
     readerId,
     ...target,
-    isDefaultBranch: false,
+    isStandaloneProject: true,
     schemaFingerprintSha256: expectedInvariants.schema.schemaFingerprintSha256,
     migrationHistorySha256: expectedInvariants.schema.migrationHistorySha256,
     triggerDigestSha256: expectedInvariants.schema.triggerDigestSha256,
@@ -63,6 +60,7 @@ function concurrencyProof(readerId, barrierId, changes = {}) {
     version: 1,
     readerId,
     ...target,
+    isStandaloneProject: true,
     barrierId,
     assertionDigests: { ...expectedInvariants.assertionDigests },
     races: Object.fromEntries(raceIds.map((id, index) => [id, {
@@ -80,7 +78,7 @@ function fakeReader(readerId, { schemaChanges = {}, proofChanges = {} } = {}) {
     calls,
     reader: {
       trustedReaderId: readerId,
-      identity: { projectRef: target.projectRef, branchId: target.branchId, readOnly: true },
+      identity: { projectRef: target.projectRef, readOnly: true },
       async readInstalledSchemaState(input) {
         calls.push({ method: 'schema', input });
         return installedSchema(readerId, schemaChanges);
@@ -110,11 +108,11 @@ function validGateInput(overrides = {}) {
   };
 }
 
-test('refuses a caller-chosen fixture target unless the protected validation policy binds it', async () => {
+test('synthetic test target cannot bypass the unconfigured protected standalone policy', async () => {
   const verify = needExport(sqlGates, 'verifyTrustedBillingSqlGates');
   const fixture = validGateInput();
 
-  await assert.rejects(verify(fixture.input), { code: 'sql_gate_protected_target_mismatch' });
+  await assert.rejects(verify(fixture.input), { code: 'sql_gate_protected_policy_unconfigured' });
 
   assert.equal(fixture.schema.calls.length, 0);
   assert.equal(fixture.barrierA.calls.length, 0);
@@ -127,21 +125,9 @@ test('refuses a caller-chosen fixture target unless the protected validation pol
   assert.equal(alternate.barrierB.calls.length, 0);
 });
 
-test('fails closed because the protected child-policy pins are incomplete', async () => {
+test('fails closed because the protected standalone-policy pins are incomplete', async () => {
   const verify = needExport(sqlGates, 'verifyTrustedBillingSqlGates');
   const fixture = validGateInput();
-  const protectedPolicy = JSON.parse(await (await import('node:fs/promises')).readFile(
-    new URL('../../policy/environment-policy.json', import.meta.url), 'utf8'));
-  fixture.input.expectedInvariants = {
-    ...expectedInvariants,
-    schema: {
-      ...expectedInvariants.schema,
-      projectRef: protectedPolicy.database.projectRef,
-      branchId: protectedPolicy.database.branchId,
-      branchName: protectedPolicy.database.branchName,
-    },
-  };
-
   await assert.rejects(verify(fixture.input), { code: 'sql_gate_protected_policy_unconfigured' });
 
   assert.equal(fixture.schema.calls.length, 0);
@@ -161,29 +147,24 @@ test('refuses missing migration or fingerprint pins before reading the installed
   }
 });
 
-test('refuses parent/child branch mismatch, disallowed main, and installed trigger, ACL, or privilege drift', async () => {
+test('refuses project identity mismatch, branch-shaped evidence, and installed digest drift', async () => {
   const verify = needExport(sqlGates, 'verifyInstalledSchemaEvidence');
-  for (const changes of [
-    { parentProjectRef: target.projectRef },
-    { branchId: 'wrong-validation-branch' },
-    { branchName: 'other-validation-branch' },
-    { branchId: 'main' },
-    { branchName: 'production' },
-    { isDefaultBranch: true },
-    { triggerDigestSha256: 'f'.repeat(64) },
-    { aclDigestSha256: 'f'.repeat(64) },
-    { privilegeDigestSha256: 'f'.repeat(64) },
-    { migrationHistorySha256: undefined },
-    { schemaFingerprintSha256: undefined },
+  for (const { changes, code } of [
+    { changes: { projectRef: 'zyxwvutsrqponmlkjihg' }, code: 'sql_gate_schema_mismatch' },
+    { changes: { branchId: 'legacy-branch' }, code: 'sql_gate_schema_proof_invalid' },
+    { changes: { parentProjectRef: 'zyxwvutsrqponmlkjihg' }, code: 'sql_gate_schema_proof_invalid' },
+    { changes: { isStandaloneProject: false }, code: 'sql_gate_schema_proof_invalid' },
+    { changes: { triggerDigestSha256: 'f'.repeat(64) }, code: 'sql_gate_schema_mismatch' },
+    { changes: { aclDigestSha256: 'f'.repeat(64) }, code: 'sql_gate_schema_mismatch' },
+    { changes: { privilegeDigestSha256: 'f'.repeat(64) }, code: 'sql_gate_schema_mismatch' },
+    { changes: { migrationHistorySha256: undefined }, code: 'sql_gate_schema_proof_invalid' },
+    { changes: { schemaFingerprintSha256: undefined }, code: 'sql_gate_schema_proof_invalid' },
   ]) {
     const fixture = validGateInput();
     fixture.schema.reader.readInstalledSchemaState = async (input) => {
       fixture.schema.calls.push({ method: 'schema', input });
       return installedSchema('schema-reader-1', changes);
     };
-    const code = ['migrationHistorySha256', 'schemaFingerprintSha256'].some((key) =>
-      Object.hasOwn(changes, key) && changes[key] === undefined)
-      ? 'sql_gate_schema_proof_invalid' : 'sql_gate_schema_mismatch';
     await assert.rejects(verify(expectedInvariants, fixture.schema.reader), { code });
     assert.equal(fixture.schema.calls.length, 1);
   }

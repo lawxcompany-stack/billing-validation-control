@@ -9,7 +9,6 @@ const SQL_RACE_IDS = Object.freeze(['coupon_capacity', 'checkout_payment_context
 const SQL_BARRIER_IDS = new Set(['billing-sql-barrier-a', 'billing-sql-barrier-b']);
 const SQL_DIGEST = /^[0-9a-f]{64}$/u;
 const SQL_PROJECT_REF = /^[a-z0-9]{20}$/u;
-const SQL_BRANCH = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const ROW_KEYS = Object.freeze({
   attempts: ['id', 'quoteId', 'status'],
   contexts: ['sessionId', 'attemptId', 'status'],
@@ -66,7 +65,6 @@ export function createIndependentBillingReaders({ expectedEnvironment, expectedW
       supabaseMethods.some((method) => typeof supabase?.[method] !== 'function') ||
       stripeMethods.some((method) => typeof stripe?.[method] !== 'function') ||
       supabase.identity?.projectRef !== expectedEnvironment.database.projectRef ||
-      supabase.identity?.branchId !== expectedEnvironment.database.branchId ||
       supabase.identity?.readOnly !== true || stripe.identity?.accountId !== expectedEnvironment.stripe.accountId ||
       stripe.identity?.webhookEndpointId !== expectedWebhookEndpointId ||
       stripe.identity?.webhookUrl !== `${expectedEnvironment.deployment.origin}/api/stripe/webhook` ||
@@ -81,7 +79,7 @@ export function createIndependentBillingReaders({ expectedEnvironment, expectedW
       const database = await supabase.readIdentity();
       const provider = await stripe.readIdentity();
       if (database?.projectRef !== expectedEnvironment.database.projectRef ||
-          database?.branchId !== expectedEnvironment.database.branchId || database?.readOnly !== true ||
+          database?.readOnly !== true ||
           provider?.accountId !== expectedEnvironment.stripe.accountId ||
           provider?.webhookEndpointId !== expectedWebhookEndpointId ||
           provider?.webhookUrl !== `${expectedEnvironment.deployment.origin}/api/stripe/webhook` ||
@@ -134,7 +132,7 @@ export function createIndependentBillingReaders({ expectedEnvironment, expectedW
     let receipts;
     try {
       const query = Object.freeze({ attemptId: input.attemptId, caseId: input.caseId,
-        branchId: expectedEnvironment.database.branchId, eventId: input.eventId, objectId: input.objectId });
+        projectRef: expectedEnvironment.database.projectRef, eventId: input.eventId, objectId: input.objectId });
       [inbox, receipts] = await Promise.all([
         supabase.readWebhookInbox(query), supabase.readWebhookReceipts(query),
       ]);
@@ -143,7 +141,7 @@ export function createIndependentBillingReaders({ expectedEnvironment, expectedW
       refuse('observation_read_failed');
     }
     const inboxMatches = isObject(inbox) && inbox.attemptId === input.attemptId &&
-      inbox.caseId === input.caseId && inbox.branchId === expectedEnvironment.database.branchId &&
+      inbox.caseId === input.caseId && inbox.projectRef === expectedEnvironment.database.projectRef &&
       inbox.eventId === input.eventId && inbox.objectId === input.objectId && inbox.status === 'processed' &&
       inbox.accountId === expectedEnvironment.stripe.accountId && inbox.livemode === false;
     const receivedAt = dateMs(inbox?.receivedAt);
@@ -152,7 +150,7 @@ export function createIndependentBillingReaders({ expectedEnvironment, expectedW
       startedAt <= receivedAt && receivedAt <= processedAt && processedAt <= cutoffAt;
     const receiptCount = Array.isArray(receipts) ? receipts.filter((receipt) => isObject(receipt) &&
       receipt.attemptId === input.attemptId && receipt.caseId === input.caseId &&
-      receipt.branchId === expectedEnvironment.database.branchId && receipt.eventId === input.eventId &&
+      receipt.projectRef === expectedEnvironment.database.projectRef && receipt.eventId === input.eventId &&
       receipt.objectId === input.objectId && receipt.status === 'processed' &&
       receipt.accountId === expectedEnvironment.stripe.accountId && receipt.livemode === false &&
       dateMs(receipt.receivedAt) !== null && dateMs(receipt.receivedAt) >= startedAt &&
@@ -200,14 +198,12 @@ export function sanitizeDatabaseSnapshot(snapshot) {
 
 /** Project an independently read installed-schema receipt into a closed, digest-only form. */
 export function sanitizeInstalledSchemaState(value) {
-  const keys = ['version', 'readerId', 'projectRef', 'parentProjectRef', 'branchId', 'branchName', 'isDefaultBranch',
+  const keys = ['version', 'readerId', 'projectRef', 'isStandaloneProject',
     'schemaFingerprintSha256', 'migrationHistorySha256', 'triggerDigestSha256', 'aclDigestSha256',
     'privilegeDigestSha256'];
   const state = dataRecord(value, keys);
   if (!state || state.version !== 1 || !safeToken(state.readerId) ||
-      !SQL_PROJECT_REF.test(state.projectRef) || !SQL_PROJECT_REF.test(state.parentProjectRef) ||
-      !SQL_BRANCH.test(state.branchId) || !SQL_BRANCH.test(state.branchName) ||
-      typeof state.isDefaultBranch !== 'boolean' ||
+      !SQL_PROJECT_REF.test(state.projectRef) || state.isStandaloneProject !== true ||
       ['schemaFingerprintSha256', 'migrationHistorySha256', 'triggerDigestSha256', 'aclDigestSha256',
         'privilegeDigestSha256'].some((key) => !SQL_DIGEST.test(state[key] ?? ''))) {
     refuse('sql_schema_observation_invalid');
@@ -217,14 +213,13 @@ export function sanitizeInstalledSchemaState(value) {
 
 /** Validate the fixed Task 7 assertion and race receipt shape without retaining raw database rows. */
 export function sanitizeSqlConcurrencyProof(value) {
-  const keys = ['version', 'readerId', 'projectRef', 'parentProjectRef', 'branchId', 'branchName', 'barrierId',
+  const keys = ['version', 'readerId', 'projectRef', 'isStandaloneProject', 'barrierId',
     'assertionDigests', 'races'];
   const proof = dataRecord(value, keys);
   const assertionDigests = proof && dataRecord(proof.assertionDigests, SQL_ASSERTION_IDS);
   const observedRaces = proof && dataRecord(proof.races, SQL_RACE_IDS);
   if (!proof || proof.version !== 1 || !safeToken(proof.readerId) ||
-      !SQL_PROJECT_REF.test(proof.projectRef) || !SQL_PROJECT_REF.test(proof.parentProjectRef) ||
-      !SQL_BRANCH.test(proof.branchId) || !SQL_BRANCH.test(proof.branchName) ||
+      !SQL_PROJECT_REF.test(proof.projectRef) || proof.isStandaloneProject !== true ||
       !SQL_BARRIER_IDS.has(proof.barrierId) || !assertionDigests ||
       SQL_ASSERTION_IDS.some((id) => !SQL_DIGEST.test(assertionDigests[id] ?? '')) || !observedRaces) {
     refuse('sql_concurrency_observation_invalid');
@@ -244,9 +239,7 @@ export function sanitizeSqlConcurrencyProof(value) {
     version: 1,
     readerId: proof.readerId,
     projectRef: proof.projectRef,
-    parentProjectRef: proof.parentProjectRef,
-    branchId: proof.branchId,
-    branchName: proof.branchName,
+    isStandaloneProject: true,
     barrierId: proof.barrierId,
     assertionDigests: Object.freeze(assertionDigests),
     races: Object.freeze(races),

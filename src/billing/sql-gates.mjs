@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { sanitizeInstalledSchemaState, sanitizeSqlConcurrencyProof } from './observations.mjs';
+import { isValidStandaloneProjectRef } from './contracts.mjs';
 
 const require = createRequire(import.meta.url);
 const PROTECTED_POLICY = require('../../policy/environment-policy.json');
@@ -11,9 +12,7 @@ const RACE_IDS = Object.freeze(['coupon_capacity', 'checkout_payment_context_ide
 const BARRIER_IDS = Object.freeze(['billing-sql-barrier-a', 'billing-sql-barrier-b']);
 const DIGEST = /^[0-9a-f]{64}$/u;
 const REF = /^[a-z0-9]{20}$/u;
-const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 const READER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/u;
-const PRODUCTION_BRANCH_PART = /(?:^|[-_.])(?:main|master|prod|production|primary|default)(?:$|[-_.])/u;
 
 export class SqlGateRefusal extends Error {
   constructor(code) { super(code); this.name = 'SqlGateRefusal'; this.code = code; }
@@ -64,33 +63,28 @@ function canonical(value) {
 }
 
 function digest(value) { return createHash('sha256').update(canonical(value), 'utf8').digest('hex'); }
-function productionBranch(value) { return PRODUCTION_BRANCH_PART.test(value.toLowerCase()); }
 
 function bindProtectedPolicy(expectedInvariants) {
   const policyKeys = ['schema_version', 'environment', 'vercel', 'database', 'stripe', 'attestation'];
   const policy = dataRecord(PROTECTED_POLICY, policyKeys) ??
     dataRecord(PROTECTED_POLICY, [...policyKeys, 'billingSqlGate']);
-  const database = dataRecord(policy?.database, ['projectRef', 'parentProjectRef', 'branchId', 'branchName',
+  const database = dataRecord(policy?.database, ['kind', 'projectRef', 'organizationId', 'organizationSlug',
+    'region', 'databaseVersion', 'postgresEngine', 'releaseChannel', 'connection',
     'schemaFingerprintSha256', 'migrationHistorySha256']);
-  if (!policy || policy.schema_version !== 2 || policy.environment !== 'billing-validation' || !database ||
-      expectedInvariants.schema.projectRef !== database.projectRef ||
-      expectedInvariants.schema.branchId !== database.branchId ||
-      expectedInvariants.schema.branchName !== database.branchName) {
-    refuse('sql_gate_protected_target_mismatch');
+  if (!policy || policy.schema_version !== 3 || policy.environment !== 'billing-validation' || !database) {
+    refuse('sql_gate_protected_policy_unconfigured');
   }
 
   const pin = dataRecord(dataProperty(policy, 'billingSqlGate'), ['version', 'expectedInvariantsSha256']);
-  if (!REF.test(database.projectRef ?? '') || !REF.test(database.parentProjectRef ?? '') ||
-      database.projectRef === database.parentProjectRef || !BRANCH.test(database.branchId ?? '') ||
-      !BRANCH.test(database.branchName ?? '') || productionBranch(database.branchId) ||
-      productionBranch(database.branchName) || !DIGEST.test(database.schemaFingerprintSha256 ?? '') ||
+  if (database.kind !== 'standalone' || !REF.test(database.projectRef ?? '') ||
+      !isValidStandaloneProjectRef(database.projectRef) || !DIGEST.test(database.schemaFingerprintSha256 ?? '') ||
       !DIGEST.test(database.migrationHistorySha256 ?? '') || !pin || pin.version !== VERSION ||
       !DIGEST.test(pin.expectedInvariantsSha256 ?? '')) {
     refuse('sql_gate_protected_policy_unconfigured');
   }
 
   const schema = expectedInvariants.schema;
-  if (schema.parentProjectRef !== database.parentProjectRef ||
+  if (schema.projectRef !== database.projectRef ||
       schema.schemaFingerprintSha256 !== database.schemaFingerprintSha256 ||
       schema.migrationHistorySha256 !== database.migrationHistorySha256) {
     refuse('sql_gate_protected_target_mismatch');
@@ -103,15 +97,12 @@ function bindProtectedPolicy(expectedInvariants) {
 function validateExpectedInvariants(value) {
   const invariants = dataRecord(value, ['version', 'schema', 'assertionDigests', 'raceLoserStateDigests']);
   if (!invariants || invariants.version !== VERSION) refuse('sql_gate_expected_invariants_invalid');
-  const schemaKeys = ['projectRef', 'parentProjectRef', 'branchId', 'branchName', 'schemaFingerprintSha256',
-    'migrationHistorySha256', 'triggerDigestSha256', 'aclDigestSha256', 'privilegeDigestSha256'];
+  const schemaKeys = ['projectRef', 'schemaFingerprintSha256', 'migrationHistorySha256',
+    'triggerDigestSha256', 'aclDigestSha256', 'privilegeDigestSha256'];
   const schema = dataRecord(invariants.schema, schemaKeys);
   const assertionDigests = dataRecord(invariants.assertionDigests, ASSERTION_IDS);
   const raceLoserStateDigests = dataRecord(invariants.raceLoserStateDigests, RACE_IDS);
-  if (!schema || !REF.test(schema.projectRef ?? '') ||
-      !REF.test(schema.parentProjectRef ?? '') || schema.projectRef === schema.parentProjectRef ||
-      !BRANCH.test(schema.branchId ?? '') || !BRANCH.test(schema.branchName ?? '') ||
-      productionBranch(schema.branchId) || productionBranch(schema.branchName) ||
+  if (!schema || !REF.test(schema.projectRef ?? '') || !isValidStandaloneProjectRef(schema.projectRef) ||
       ['schemaFingerprintSha256', 'migrationHistorySha256', 'triggerDigestSha256', 'aclDigestSha256',
         'privilegeDigestSha256'].some((key) => !DIGEST.test(schema[key] ?? '')) ||
       !assertionDigests || ASSERTION_IDS.some((id) => !DIGEST.test(assertionDigests[id] ?? '')) ||
@@ -128,7 +119,8 @@ function validateReader(reader, expected, method) {
   const identity = dataProperty(reader, 'identity');
   if (!object(reader) || typeof read !== 'function' || !READER_ID.test(readerId ?? '') ||
       dataProperty(identity, 'projectRef') !== expected.projectRef ||
-      dataProperty(identity, 'branchId') !== expected.branchId || dataProperty(identity, 'readOnly') !== true) {
+      dataProperty(identity, 'readOnly') !== true || Object.hasOwn(identity ?? {}, 'branchId') ||
+      Object.hasOwn(identity ?? {}, 'parentProjectRef')) {
     refuse('sql_gate_reader_unavailable');
   }
   return Object.freeze({ reader, readerId, read });
@@ -145,9 +137,8 @@ function validateConcurrencyReaders(value, expected) {
 }
 
 function matchesSchema(actual, expected) {
-  return actual.projectRef === expected.projectRef && actual.parentProjectRef === expected.parentProjectRef &&
-    actual.branchId === expected.branchId && actual.branchName === expected.branchName &&
-    actual.isDefaultBranch === false && actual.schemaFingerprintSha256 === expected.schemaFingerprintSha256 &&
+  return actual.projectRef === expected.projectRef && actual.isStandaloneProject === true &&
+    actual.schemaFingerprintSha256 === expected.schemaFingerprintSha256 &&
     actual.migrationHistorySha256 === expected.migrationHistorySha256 &&
     actual.triggerDigestSha256 === expected.triggerDigestSha256 && actual.aclDigestSha256 === expected.aclDigestSha256 &&
     actual.privilegeDigestSha256 === expected.privilegeDigestSha256;
@@ -161,8 +152,7 @@ export async function verifyInstalledSchemaEvidence(expectedValue, readerValue) 
   const expectedInvariants = validateExpectedInvariants(expectedValue);
   const target = expectedInvariants.schema;
   const schemaReader = validateReader(readerValue, target, 'readInstalledSchemaState');
-  const targetBinding = Object.freeze({ projectRef: target.projectRef, parentProjectRef: target.parentProjectRef,
-    branchId: target.branchId, branchName: target.branchName });
+  const targetBinding = Object.freeze({ projectRef: target.projectRef });
   let schemaRaw;
   try { schemaRaw = await schemaReader.read.call(schemaReader.reader, targetBinding); }
   catch { refuse('sql_gate_schema_read_failed'); }
@@ -177,8 +167,7 @@ export async function verifyInstalledSchemaEvidence(expectedValue, readerValue) 
 
 function matchesConcurrencyProof(proof, expected, reader, barrierId) {
   if (proof.readerId !== reader.trustedReaderId || proof.projectRef !== expected.schema.projectRef ||
-      proof.parentProjectRef !== expected.schema.parentProjectRef || proof.branchId !== expected.schema.branchId ||
-      proof.branchName !== expected.schema.branchName || proof.barrierId !== barrierId) {
+      proof.isStandaloneProject !== true || proof.barrierId !== barrierId) {
     refuse('sql_gate_concurrency_identity_mismatch');
   }
   for (const id of ASSERTION_IDS) {
@@ -202,8 +191,7 @@ export async function verifyConcurrencyEvidence(expectedValue, readerValues) {
   const expectedInvariants = validateExpectedInvariants(expectedValue);
   const target = expectedInvariants.schema;
   const concurrencyReaders = validateConcurrencyReaders(readerValues, expectedInvariants);
-  const targetBinding = Object.freeze({ projectRef: target.projectRef, parentProjectRef: target.parentProjectRef,
-    branchId: target.branchId, branchName: target.branchName });
+  const targetBinding = Object.freeze({ projectRef: target.projectRef });
   let rawProofs;
   try {
     rawProofs = await Promise.all(concurrencyReaders.map((reader, index) =>

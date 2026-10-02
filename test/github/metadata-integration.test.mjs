@@ -2,17 +2,15 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import * as ciEvidence from '../../src/github/ci-evidence.mjs';
+import { findLatestPreviewRun } from './metadata-target.mjs';
 
 const repository = 'lawxcompany-stack/Plataforma-LawX';
-const candidateSha = 'afd8955bf0b1332aa1c6c220a8267e2a7e6c0f13';
-const runId = '35810119625';
 const workflowId = 290018021;
 const workflowPath = '.github/workflows/ci.yml';
-const attempt = 1;
-const expectedArtifactName = `acceptance-final-${runId}-${attempt}`;
-const auth = spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' });
-const ghAuthAvailable = !auth.error && auth.status === 0;
+const fixtureRunId = 123456789;
 const MAX_ARTIFACT_PAGES = 5;
+const MAX_RUN_PAGES = 5;
+const RUN_INTEGRATION = process.env.RUN_GITHUB_METADATA_INTEGRATION === '1';
 
 test('artifact metadata reader follows full pages and stops at the first short page', async () => {
   assert.equal(typeof ciEvidence.listArtifacts, 'function', 'CI artifact reader must be reusable for metadata-only validation');
@@ -24,11 +22,11 @@ test('artifact metadata reader follows full pages and stops at the first short p
       return { artifacts: page === 1 ? Array.from({ length: 100 }, (_, id) => ({ id })) : [{ id: 101 }] };
     },
   };
-  const artifacts = await ciEvidence.listArtifacts(api, { repository }, { id: Number(runId) });
+  const artifacts = await ciEvidence.listArtifacts(api, { repository }, { id: fixtureRunId });
 
   assert.equal(artifacts.length, 101);
   assert.deepEqual(calls, [1, 2].map((page) =>
-    `/repos/${repository}/actions/runs/${runId}/artifacts?per_page=100&page=${page}`));
+    `/repos/${repository}/actions/runs/${fixtureRunId}/artifacts?per_page=100&page=${page}`));
 });
 
 test('artifact metadata reader fails closed when the final allowed page is still full', async () => {
@@ -41,7 +39,7 @@ test('artifact metadata reader fails closed when the final allowed page is still
     },
   };
 
-  await assert.rejects(ciEvidence.listArtifacts(api, { repository }, { id: Number(runId) }), {
+  await assert.rejects(ciEvidence.listArtifacts(api, { repository }, { id: fixtureRunId }), {
     code: 'artifact_list_too_large',
   });
   assert.equal(calls.length, MAX_ARTIFACT_PAGES);
@@ -64,23 +62,49 @@ function getJson(path) {
   }
 }
 
-test('read-only GitHub metadata binds exact non-production CI run, attempt and final artifact', { skip: !ghAuthAvailable }, async () => {
+test('read-only GitHub metadata binds the latest successful Preview CI run, attempt and final artifact', {
+  skip: RUN_INTEGRATION ? false : 'set RUN_GITHUB_METADATA_INTEGRATION=1 to run the live GitHub metadata proof',
+}, async () => {
+  const auth = spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' });
+  assert.equal(auth.error, undefined, 'GitHub CLI is unavailable for the explicitly requested metadata proof');
+  assert.equal(auth.status, 0, 'GitHub CLI must be authenticated for the explicitly requested metadata proof');
+
+  const runs = [];
+  for (let page = 1; page <= MAX_RUN_PAGES; page += 1) {
+    const response = getJson(`/repos/${repository}/actions/workflows/${workflowId}/runs` +
+      `?event=pull_request&status=completed&per_page=100&page=${page}`);
+    assert.ok(Array.isArray(response.workflow_runs), 'GitHub workflow run list must be an array');
+    runs.push(...response.workflow_runs);
+    if (response.workflow_runs.length < 100) break;
+    assert.notEqual(page, MAX_RUN_PAGES, 'GitHub workflow run history exceeded the bounded scan');
+  }
+
+  const selected = await findLatestPreviewRun({
+    runs,
+    repository,
+    workflowId,
+    workflowPath,
+    async listPulls(sha) {
+      return getJson(`/repos/${repository}/commits/${sha}/pulls?per_page=100&page=1`);
+    },
+  });
+  assert.ok(selected, 'a successful same-repository CI run for a Preview pull request must exist');
+  const { id: runId, head_sha: candidateSha, run_attempt: attempt } = selected.run;
+  const expectedArtifactName = `acceptance-final-${runId}-${attempt}`;
+
   const run = getJson(`/repos/${repository}/actions/runs/${runId}`);
-  assert.equal(run.id, Number(runId));
+  assert.equal(run.id, selected.run.id);
   assert.equal(run.workflow_id, workflowId);
   assert.equal(run.path, workflowPath);
   assert.equal(run.event, 'pull_request');
-  assert.equal(run.head_sha, candidateSha);
+  assert.equal(run.head_sha, selected.run.head_sha);
   assert.equal(run.run_attempt, attempt);
   assert.equal(run.status, 'completed');
   assert.equal(run.conclusion, 'success');
   assert.equal(run.repository?.full_name, repository);
 
-  const associatedPulls = getJson(`/repos/${repository}/commits/${candidateSha}/pulls?per_page=100&page=1`);
-  assert.ok(Array.isArray(associatedPulls));
-  const exactPreviewPulls = associatedPulls.filter((pull) => pull.head?.sha === candidateSha &&
-    pull.head?.repo?.full_name === repository && pull.base?.ref === 'preview' && pull.base?.repo?.full_name === repository);
-  assert.equal(exactPreviewPulls.length, 1, 'candidate SHA must resolve to exactly one Preview PR association');
+  assert.equal(selected.pull.head.sha, candidateSha);
+  assert.equal(selected.pull.base.ref, 'preview');
 
   const attemptResponse = getJson(`/repos/${repository}/actions/runs/${runId}/attempts/${attempt}`);
   const exactAttempt = attemptResponse.workflow_run ?? attemptResponse;

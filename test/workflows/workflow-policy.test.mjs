@@ -42,12 +42,24 @@ test('workflow token defaults are limited to contents read', () => {
     const workflow = readWorkflow(path);
     assert.deepEqual(workflow.permissions, { contents: 'read' }, `${path} must use least-privilege defaults`);
     for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
-      if (path === workflowPaths[0] && jobId === 'attest-activation') {
+      if (path === workflowPaths[0] && jobId === 'authorize') {
+        assert.deepEqual(job.permissions, { contents: 'read', actions: 'read' });
+        continue;
+      }
+      if (path === workflowPaths[0] && ['attest-activation', 'attest-result'].includes(jobId)) {
         assert.deepEqual(job.permissions, {
           contents: 'read',
           'id-token': 'write',
           attestations: 'write',
         });
+        continue;
+      }
+      if (path === workflowPaths[0] && jobId === 'publisher') {
+        assert.deepEqual(job.permissions, { contents: 'read' });
+        continue;
+      }
+      if (path === workflowPaths[0] && jobId === 'verify-result') {
+        assert.deepEqual(job.permissions, { contents: 'read', attestations: 'read' });
         continue;
       }
       assert.ok(!job.permissions || JSON.stringify(job.permissions) === JSON.stringify({ contents: 'read' }),
@@ -72,33 +84,93 @@ test('every job has an explicit timeout and only the intended job environments',
   }
 
   assert.equal(workflow.jobs.reader.environment, 'billing-validation-reader');
+  assert.equal(workflow.jobs['control-store']?.environment, 'billing-validation-control');
   assert.equal(workflow.jobs.test.environment, 'billing-validation-tests');
+  assert.equal(workflow.jobs['validate-result-input'].environment, undefined);
+  assert.equal(workflow.jobs['attest-result'].environment, 'billing-validation-attestation');
+  assert.equal(workflow.jobs['verify-result'].environment, undefined);
   assert.equal(workflow.jobs.publisher.environment, 'billing-validation-publisher');
   assert.equal(workflow.jobs.authorize.environment, undefined);
 });
 
 test('dispatch authorization runs hosted without an environment before all privileged jobs', () => {
   const workflow = readWorkflow(workflowPaths[0]);
-  const { authorize, reader, test: testJob, publisher } = workflow.jobs;
+  const { authorize, reader, test: testJob, 'control-store': controlStore,
+    'validate-result-input': validateResultInput, 'attest-result': resultAttest,
+    'verify-result': verifyResult, publisher } = workflow.jobs;
 
   assert.ok(isHostedRunner(authorize['runs-on']));
   assert.equal(authorize.environment, undefined);
   assert.equal(authorize['timeout-minutes'] <= 10, true);
   assert.equal(reader.needs, 'authorize');
-  assert.deepEqual(testJob.needs, ['authorize', 'reader', 'attest-activation']);
-  assert.deepEqual(publisher.needs, ['authorize', 'reader', 'test']);
-  for (const job of [reader, testJob, publisher]) {
+  assert.ok(controlStore, 'a protected control-store verification job must exist');
+  assert.equal(controlStore.needs, 'authorize');
+  assert.deepEqual(testJob.needs, ['authorize', 'reader', 'attest-activation', 'control-store']);
+  assert.match(testJob.if, /needs\.control-store\.result\s*==\s*'success'/);
+  assert.match(testJob.if, /needs\.control-store\.result\s*==\s*'skipped'/);
+  assert.deepEqual(validateResultInput.needs, ['authorize', 'reader', 'test']);
+  assert.match(validateResultInput.if, /needs\.test\.result\s*==\s*'success'/);
+  assert.deepEqual(validateResultInput.permissions, { contents: 'read' });
+  assert.deepEqual(resultAttest.needs, ['authorize', 'reader', 'test', 'validate-result-input']);
+  assert.match(resultAttest.if, /needs\.validate-result-input\.result\s*==\s*'success'/);
+  assert.deepEqual(publisher.needs, ['authorize', 'reader', 'attest-activation', 'test', 'attest-result', 'verify-result']);
+  assert.deepEqual(verifyResult.needs, ['authorize', 'reader', 'test', 'attest-result']);
+  assert.match(verifyResult.if, /needs\.attest-result\.result\s*==\s*'success'/);
+  assert.match(publisher.if, /needs\.verify-result\.result\s*==\s*'success'/);
+  assert.ok(resultAttest.needs.includes('test'));
+  assert.match(resultAttest.if, /needs\.test\.result\s*==\s*'success'/);
+  for (const job of [reader, testJob, validateResultInput, resultAttest, verifyResult, publisher]) {
     assert.match(job.if, /needs\.authorize\.result\s*==\s*'success'/);
   }
 });
 
+test('collect-only control verification uses the fixed trusted workflow checkout and read-only verifier', () => {
+  const workflow = readWorkflow(workflowPaths[0]);
+  const job = workflow.jobs['control-store'];
+  const expression = (value) => '${{ ' + value + ' }}';
+
+  assert.ok(job, 'a protected control-store verification job must exist');
+  assert.equal(job.environment, 'billing-validation-control');
+  assert.equal(job.needs, 'authorize');
+  assert.match(job.if, /github\.event_name\s*==\s*'workflow_dispatch'/);
+  assert.match(job.if, /github\.repository_id\s*==\s*'1384018279'/);
+  assert.match(job.if, /github\.ref\s*==\s*'refs\/heads\/main'/);
+  assert.match(job.if, /github\.event\.repository\.default_branch\s*==\s*'main'/);
+  assert.match(job.if, /github\.ref_protected/);
+  assert.match(job.if, /needs\.authorize\.outputs\.operation\s*==\s*'collect'/);
+  assert.deepEqual(job.permissions, { contents: 'read' });
+  assert.equal(job['timeout-minutes'], 10);
+  assert.equal(job.outputs, undefined);
+  assert.deepEqual(job.steps, [
+    { name: 'Checkout exact triggering workflow SHA', uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      with: { ref: expression('github.sha'), 'persist-credentials': false } },
+    { name: 'Set up Node.js 22', uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      with: { 'node-version': '22', 'package-manager-cache': false } },
+    { name: 'Install locked dependencies without lifecycle scripts',
+      run: 'npx --yes pnpm@11.5.1 --ignore-workspace install --frozen-lockfile --ignore-scripts' },
+    { name: 'Verify the billing control store read-only',
+      env: { BILLING_CONTROL_VERIFIER_DATABASE_URL: expression('secrets.BILLING_CONTROL_VERIFIER_DATABASE_URL') },
+      run: 'node runner/verify-control-store.mjs' },
+  ]);
+
+  const preflight = workflow.jobs.authorize.steps.find((step) => step.id === 'environments');
+  assert.equal(preflight.env?.CONTROL_DISPATCH_OPERATION, expression('steps.authorize.outputs.operation'));
+  assert.match(preflight.run, /CONTROL_DISPATCH_OPERATION\s*===\s*'collect'/);
+  assert.match(preflight.run, /billing-validation-control/);
+  assert.match(preflight.run, /approval\.reviewers\.length\s*>\s*0/);
+});
+
 test('authorize and attestation checkouts pin the exact triggering workflow SHA', () => {
-  const { authorize, 'attest-activation': attest } = readWorkflow(workflowPaths[0]).jobs;
+  const { authorize, 'attest-activation': attest, 'validate-result-input': validateResultInput,
+    'attest-result': resultAttest, 'verify-result': verifyResult } = readWorkflow(workflowPaths[0]).jobs;
   const checkoutRef = '${{ github.sha }}';
   const checkoutFor = (job) => job.steps.find((step) => step.uses?.startsWith('actions/checkout@'))?.with?.ref;
 
   assert.equal(checkoutFor(authorize), checkoutRef);
   assert.equal(checkoutFor(attest), checkoutRef);
+  assert.equal(checkoutFor(validateResultInput), checkoutRef);
+  assert.equal(checkoutFor(resultAttest), checkoutRef);
+  assert.equal(checkoutFor(verifyResult), checkoutRef);
 });
 
 test('attestation consumes only the validated commitment output from authorization', () => {
@@ -116,9 +188,10 @@ test('attestation consumes only the validated commitment output from authorizati
   assert.ok(!JSON.stringify(attest).includes('${{ inputs.supervisor_activation }}'));
 });
 
-test('only hosted collect attestation has signing permissions and runs after authorization', () => {
+test('trusted hosted attestation emitters have signing permissions only for distinct subjects', () => {
   const workflow = readWorkflow(workflowPaths[0]);
   const attest = workflow.jobs['attest-activation'];
+  const resultAttest = workflow.jobs['attest-result'];
   assert.ok(attest, 'A hosted attestation job must bind the workstation activation');
   assert.ok(isHostedRunner(attest['runs-on']));
   assert.equal(attest.environment, 'billing-validation-attestation');
@@ -136,11 +209,29 @@ test('only hosted collect attestation has signing permissions and runs after aut
   assert.ok(attest.steps.some((step) =>
     step.uses === 'actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d'));
 
+  assert.ok(isHostedRunner(resultAttest['runs-on']));
+  assert.equal(resultAttest.environment, 'billing-validation-attestation');
+  assert.deepEqual(resultAttest.needs, ['authorize', 'reader', 'test', 'validate-result-input']);
+  assert.match(resultAttest.if, /needs\.validate-result-input\.result\s*==\s*'success'/);
+  assert.deepEqual(resultAttest.permissions, {
+    contents: 'read',
+    'id-token': 'write',
+    attestations: 'write',
+  });
+  assert.match(resultAttest.if, /needs\.test\.result\s*==\s*'success'/);
+  assert.match(resultAttest.if, /needs\.authorize\.outputs\.operation\s*==\s*'collect'/);
+  assert.equal(resultAttest.steps.find((step) => step.name === 'Compose canonical financial result subject')
+    .env.VERCEL_READ_ONLY_TOKEN, '${{ secrets.BILLING_VALIDATION_VERCEL_READ_ONLY_TOKEN }}');
+  assert.equal(workflow.jobs['validate-result-input'].steps.some((step) =>
+    JSON.stringify(step).includes('secrets.')), false);
+  assert.ok(resultAttest.steps.some((step) =>
+    step.uses === 'actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d' &&
+      step.with['subject-path'] === '${{ runner.temp }}/billing-result-manifest.json'));
+
   for (const [jobId, job] of Object.entries(workflow.jobs)) {
-    if (jobId !== 'attest-activation') {
-      assert.ok(!JSON.stringify(job.permissions ?? {}).includes('id-token') &&
-        !JSON.stringify(job.permissions ?? {}).includes('attestations'),
-      `${jobId} must not receive signing permissions`);
+    if (jobId !== 'attest-activation' && jobId !== 'attest-result') {
+      assert.notEqual(job.permissions?.['id-token'], 'write', `${jobId} must not mint an OIDC token`);
+      assert.notEqual(job.permissions?.attestations, 'write', `${jobId} must not sign attestations`);
     }
   }
   const policy = workflow.jobs.policy;

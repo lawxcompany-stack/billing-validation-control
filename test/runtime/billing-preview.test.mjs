@@ -11,7 +11,7 @@ const deploymentAttestation = await verifyDeploymentAttestation({ deployment, ca
   fetchImpl: fetchFixture(signedAttestation({ overrides: { origin, deploymentId: deployment.id } })).fetchImpl });
 
 function fakeChromium({ urlOverride, method = 'GET', redirected = false, contentLength = '128',
-  bodySize = 128, headers = { accept: 'text/html', 'accept-encoding': 'gzip, deflate, br',
+  bodySize = 128, responseBody, headers = { accept: 'text/html', 'accept-encoding': 'gzip, deflate, br',
     'accept-language': 'en-US', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate',
     'sec-fetch-site': 'none', 'upgrade-insecure-requests': '1', 'user-agent': 'offline-test',
     referer: `${origin}/` },
@@ -53,7 +53,10 @@ function fakeChromium({ urlOverride, method = 'GET', redirected = false, content
                 headers: () => ({ ...(contentLength === null ? {} : { 'content-length': contentLength }),
                   ...(transferEncoding ? { 'transfer-encoding': transferEncoding } : {}),
                   'content-type': 'text/html; charset=utf-8' }),
-                async body() { calls.responseBodyReads += 1; return Buffer.alloc(bodySize, 97); },
+                async body() {
+                  calls.responseBodyReads += 1;
+                  return responseBody === undefined ? Buffer.alloc(bodySize, 97) : Buffer.from(responseBody);
+                },
                 async finished() { return null; },
                 request: () => request,
               };
@@ -91,7 +94,7 @@ function fakeChromium({ urlOverride, method = 'GET', redirected = false, content
 }
 
 const previewOwner = { attemptId: 'attempt-preview', fence: 'fence-preview',
-  candidateSha: candidate.candidateSha, environment: { deployment } };
+  candidateSha: candidate.candidateSha, environment: { deployment, database: { projectRef: policy.database.projectRef } } };
 const previewAttempts = { async assertFence({ attemptId, fence }) {
   if (attemptId !== previewOwner.attemptId || fence !== previewOwner.fence) {
     throw Object.assign(new Error('lease_fence_lost'), { code: 'lease_fence_lost' });
@@ -103,6 +106,18 @@ function previewInput(chromium, overrides = {}) {
   return { deployment, candidate, deploymentAttestation, attempts: previewAttempts,
     owner: previewOwner, chromium, ...overrides };
 }
+
+test('Preview refuses missing, shared, and attestation-divergent database refs before launching', async () => {
+  for (const database of [undefined, { projectRef: 'zjvqjdntasprusoqfsgw' },
+    { projectRef: 'zyxwvutsrqponmlkjihg' }]) {
+    const fake = fakeChromium();
+    const owner = { ...previewOwner, environment: { deployment, database } };
+    await assert.rejects(previewModule.createBillingPreviewBrowser(previewInput(fake.chromium,
+      { owner, attempts: { async assertFence() { return owner; } } })),
+    { code: 'preview_deployment_unverified' });
+    assert.equal(fake.calls.launch, 0);
+  }
+});
 
 test('Preview transport opens only a pinned immutable HTTPS deployment in a disposable browser context', async () => {
   const create = needExport(previewModule, 'createBillingPreviewBrowser');
@@ -225,7 +240,7 @@ test('Preview creation requires the verifier capability to match the admitted at
   const create = needExport(previewModule, 'createBillingPreviewBrowser');
   const fake = fakeChromium();
   const owner = { attemptId: 'attempt-preview', fence: 'fence-preview',
-    candidateSha: candidate.candidateSha, environment: { deployment } };
+    candidateSha: candidate.candidateSha, environment: { deployment, database: { projectRef: policy.database.projectRef } } };
   const attempts = { async assertFence({ attemptId, fence }) {
     assert.equal(attemptId, owner.attemptId);
     assert.equal(fence, owner.fence);
@@ -333,4 +348,21 @@ test('missing, chunked, false-length, oversized and non-document responses fail 
     assert.equal(fake.calls.responseBodyReads, 0);
     await transport.close();
   }
+});
+
+test('synthetic privileged response content is not copied into browser transport output', async () => {
+  const create = needExport(previewModule, 'createBillingPreviewBrowser');
+  const sentinel = 'sk_test_synthetic_privileged_key_sentinel';
+  const bytes = Buffer.from(`<html>${sentinel}</html>`, 'utf8');
+  const fake = fakeChromium({ contentLength: String(bytes.byteLength), bodySize: bytes.byteLength,
+    responseBody: bytes });
+  const transport = await create(previewInput(fake.chromium));
+  const pageHandle = await transport.openRoute('home');
+
+  assert.doesNotMatch(JSON.stringify({ transport: Object.keys(transport),
+    pageHandle: Object.keys(pageHandle), ui: Object.keys(pageHandle.ui), interactions: fake.calls.interactions }),
+  /sk_test_synthetic_privileged_key_sentinel/u);
+  assert.equal(fake.calls.responseBodyReads, 0);
+  assert.equal(Object.hasOwn(pageHandle, 'responseBody'), false);
+  await transport.close();
 });

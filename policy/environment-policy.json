@@ -1,15 +1,20 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "environment": "billing-validation",
   "vercel": {
     "projectId": "prj_NEAKAPvyPzh76wfoHqYF6mRSfBs0",
     "teamId": "team_Legw262JzvhZUhIZtv5pFE4T"
   },
   "database": {
-    "projectRef": "zjvqjdntasprusoqfsgw",
-    "parentProjectRef": null,
-    "branchId": "e2f26c0b-8a79-4cd5-ad80-faaf91fb51a2",
-    "branchName": "lawx-billing-validation-20260912",
+    "kind": "standalone",
+    "projectRef": null,
+    "organizationId": null,
+    "organizationSlug": null,
+    "region": null,
+    "databaseVersion": null,
+    "postgresEngine": null,
+    "releaseChannel": null,
+    "connection": null,
     "schemaFingerprintSha256": null,
     "migrationHistorySha256": null
   },

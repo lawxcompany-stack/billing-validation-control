@@ -129,7 +129,6 @@ function assertCurrentStripeOwner(current, owner) {
   const workflowMatches = ['repository', 'ref', 'runId', 'runAttempt', 'runnerLabel']
     .every((key) => current?.workflow?.[key] === owner.workflow?.[key]);
   const environmentMatches = current?.environment?.database?.projectRef === owner.environment?.database?.projectRef &&
-    current?.environment?.database?.branchId === owner.environment?.database?.branchId &&
     current?.environment?.deployment?.id === owner.environment?.deployment?.id &&
     current?.environment?.deployment?.origin === owner.environment?.deployment?.origin &&
     current?.environment?.stripe?.accountId === owner.environment?.stripe?.accountId;
@@ -584,7 +583,6 @@ export async function runStripeMutation({ attempts, owner, action, operation, in
       !object(input) || typeof adapter?.mutate !== 'function' ||
       !isValidExpectedEnvironment(readers?.expectedEnvironment) ||
       readers.expectedEnvironment.database.projectRef !== owner.environment.database?.projectRef ||
-      readers.expectedEnvironment.database.branchId !== owner.environment.database?.branchId ||
       readers.expectedEnvironment.deployment.id !== owner.environment.deployment?.id ||
       readers.expectedEnvironment.deployment.origin !== owner.environment.deployment?.origin ||
       readers.expectedEnvironment.stripe.accountId !== owner.environment.stripe.accountId ||

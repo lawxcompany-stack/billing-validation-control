@@ -96,7 +96,7 @@ export const ACCEPTANCE_CATEGORIES = Object.freeze([
 
 export const FINAL_ACCEPTANCE_TREE_HASH = 'b'.repeat(40);
 export const FINAL_ACCEPTANCE_ENVIRONMENT = Object.freeze({
-  database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst', branchId: 'billing-validation-2026' }),
+  database: Object.freeze({ projectRef: 'abcdefghijklmnopqrst' }),
   deployment: Object.freeze({ id: 'dpl_candidate123', origin: 'https://billing-candidate.vercel.app' }),
   stripe: Object.freeze({ accountId: 'acct_testlawx123' }),
 });
@@ -148,7 +148,6 @@ export function finalAcceptanceDocument(overrides = {}) {
     candidate: { sha: candidateSha, treeHash: FINAL_ACCEPTANCE_TREE_HASH },
     database: {
       projectRef: 'abcdefghijklmnopqrst',
-      branchId: 'billing-validation-2026',
       migrationDigest: createHash('sha256').update(canonicalJson(migrationArtifacts), 'utf8').digest('hex'),
       migrationDigestScope: 'reviewed-assets',
       migrationArtifacts,
