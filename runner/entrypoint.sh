@@ -26,13 +26,13 @@ control_candidate_sha=${CONTROL_CANDIDATE_SHA:-}
 control_activation_commitment=${CONTROL_ACTIVATION_COMMITMENT:-}
 control_runner_label=${CONTROL_RUNNER_LABEL:-}
 control_runner_group=${CONTROL_RUNNER_GROUP:-}
-if [[ "$control_repository" != lawxcompany-stack/billing-validation-control ||
-      ! "$control_repository_id" =~ ^[1-9][0-9]{0,19}$ ||
+if [[ "$control_repository" != lawx-ai/billing-validation-control ||
+      "$control_repository_id" != 1384018279 ||
       "$control_event" != workflow_dispatch ||
       "$control_default_branch" != main ||
       "$control_ref" != refs/heads/main ||
       "$control_workflow_path" != .github/workflows/validate-billing.yml ||
-      "$control_workflow_ref" != lawxcompany-stack/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main ||
+      "$control_workflow_ref" != lawx-ai/billing-validation-control/.github/workflows/validate-billing.yml@refs/heads/main ||
       ! "$control_run_id" =~ ^[1-9][0-9]{0,15}$ ||
       ! "$control_run_attempt" =~ ^[1-9][0-9]{0,7}$ ||
       ! "$control_workflow_sha" =~ ^[a-f0-9]{40}$ ||
@@ -72,7 +72,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 
 if ! "$runner_home/config.sh" --unattended --ephemeral --disableupdate --no-default-labels \
-    --url https://github.com/lawxcompany-stack/billing-validation-control \
+    --url https://github.com/lawx-ai \
     --token "$RUNNER_REGISTRATION_TOKEN" --name "$runner_name" --labels "$RUNNER_LABEL" \
     --runnergroup "$control_runner_group" \
     --work _work >/dev/null 2>&1; then

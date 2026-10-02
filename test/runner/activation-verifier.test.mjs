@@ -20,8 +20,8 @@ function requireVerifier() {
   return { verifyActivationAttestation: internalVerifier.verifyActivationAttestationWithBoundary };
 }
 
-const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
-const CONTROL_REPOSITORY_ID = '12345678';
+const CONTROL_REPOSITORY = 'lawx-ai/billing-validation-control';
+const CONTROL_REPOSITORY_ID = '1384018279';
 const CONTROL_WORKFLOW_PATH = '.github/workflows/validate-billing.yml';
 const CONTROL_REF = 'refs/heads/main';
 const WORKFLOW_URI = `https://github.com/${CONTROL_REPOSITORY}/${CONTROL_WORKFLOW_PATH}`;
@@ -32,7 +32,7 @@ const CANDIDATE_SHA = 'a'.repeat(40);
 const RUNNER_LABEL = `billing-validation-${'b'.repeat(32)}`;
 const COMMITMENT = 'c'.repeat(64);
 const RUN_INVOCATION_URI = `https://github.com/${CONTROL_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}`;
-const CANONICAL_MANIFEST_BYTES = '{"activationCommitment":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","candidateRepository":"lawxcompany-stack/Plataforma-LawX","candidateSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","runnerLabel":"billing-validation-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","controlRepository":"lawxcompany-stack/billing-validation-control","controlRepositoryId":"12345678","controlRef":"refs/heads/main","controlWorkflowPath":".github/workflows/validate-billing.yml","runId":"123456789","runAttempt":"2","controlWorkflowSha":"dddddddddddddddddddddddddddddddddddddddd","eventName":"workflow_dispatch"}\n';
+const CANONICAL_MANIFEST_BYTES = '{"activationCommitment":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","candidateRepository":"lawxcompany-stack/Plataforma-LawX","candidateSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","runnerLabel":"billing-validation-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","controlRepository":"lawx-ai/billing-validation-control","controlRepositoryId":"1384018279","controlRef":"refs/heads/main","controlWorkflowPath":".github/workflows/validate-billing.yml","runId":"123456789","runAttempt":"2","controlWorkflowSha":"dddddddddddddddddddddddddddddddddddddddd","eventName":"workflow_dispatch"}\n';
 const MANIFEST = Object.freeze({
   activationCommitment: COMMITMENT,
   candidateRepository: 'lawxcompany-stack/Plataforma-LawX',
@@ -107,6 +107,29 @@ function processBoundary(output = verifiedOutput()) {
 
 const TRUST_POLICY = Object.freeze({ reviewedControlRepositoryId: CONTROL_REPOSITORY_ID });
 
+test('activation verifier refuses old owner or wrong immutable ID before gh', async () => {
+  for (const override of [
+    { controlRepository: 'lawxcompany-stack/billing-validation-control' },
+    { controlRepositoryId: '12345678' },
+    { controlRepositoryId: '1384018280' },
+  ]) {
+    const boundary = processBoundary();
+    await assert.rejects(requireVerifier().verifyActivationAttestation({
+      manifest: { ...MANIFEST, ...override }, processBoundary: boundary, ...TRUST_POLICY,
+    }), { code: 'activation_attestation_invalid' });
+    assert.equal(boundary.calls.length, 0);
+  }
+});
+
+test('activation verifier refuses a consistently substituted unreviewed ID before gh', async () => {
+  const boundary = processBoundary();
+  await assert.rejects(requireVerifier().verifyActivationAttestation({
+    manifest: { ...MANIFEST, controlRepositoryId: '1384018280' },
+    reviewedControlRepositoryId: '1384018280', processBoundary: boundary,
+  }), { code: 'activation_attestation_invalid' });
+  assert.equal(boundary.calls.length, 0);
+});
+
 test('the certificate DER fixture is a structurally parseable X.509 certificate', () => {
   const certificate = new X509Certificate(Buffer.from(certificateFixture(), 'base64'));
   assert.match(certificate.subject, /Billing validation fixture/u);
@@ -154,6 +177,10 @@ test('production verifier refuses caller-selected repository identity and fake G
 });
 
 for (const [claim, mutation] of [
+  ...['subjectAlternativeName', 'buildSignerURI', 'sourceRepositoryURI', 'runInvocationURI'].map((field) => [
+    `old owner in ${field} with correct repository ID`,
+    (certificate) => ({ ...certificate, [field]: certificate[field].replace('lawx-ai/', 'lawxcompany-stack/') }),
+  ]),
   ['OIDC issuer', (certificate) => ({ ...certificate, issuer: 'https://evil.invalid' })],
   ['signer workflow identity', (certificate) => ({ ...certificate, subjectAlternativeName: 'https://github.com/evil/repo/.github/workflows/validate-billing.yml@refs/heads/main' })],
   ['signer workflow path', (certificate) => ({ ...certificate, buildSignerURI: 'https://github.com/evil/repo/.github/workflows/validate-billing.yml' })],

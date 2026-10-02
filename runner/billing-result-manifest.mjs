@@ -3,8 +3,7 @@ import { isValidStandaloneDatabasePolicy } from '../src/billing/contracts.mjs';
 import { BILLING_43_IDS } from '../src/contracts/billing-43.mjs';
 import { immutableVercelOrigin } from '../src/github/deployments.mjs';
 
-const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
-const CONTROL_REPOSITORY_ID = '1384018279';
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID } from '../src/contracts/control-identity.mjs';
 const CONTROL_REF = 'refs/heads/main';
 const CONTROL_WORKFLOW_PATH = '.github/workflows/validate-billing.yml';
 const CONTROL_EVENT_NAME = 'workflow_dispatch';

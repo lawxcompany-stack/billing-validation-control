@@ -1,4 +1,4 @@
-const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID } from '../src/contracts/control-identity.mjs';
 const CANDIDATE_REPOSITORY = 'lawxcompany-stack/Plataforma-LawX';
 const CONTROL_REF = 'refs/heads/main';
 const CONTROL_WORKFLOW_PATH = '.github/workflows/validate-billing.yml';
@@ -51,7 +51,7 @@ export function createActivationManifest(input) {
       input.candidateRepository !== CANDIDATE_REPOSITORY ||
       typeof input.candidateSha !== 'string' || !/^[a-f0-9]{40}$/u.test(input.candidateSha) ||
       typeof input.runnerLabel !== 'string' || !/^billing-validation-[a-f0-9]{32}$/u.test(input.runnerLabel) ||
-      input.controlRepository !== CONTROL_REPOSITORY || !decimalId(input.controlRepositoryId, 20) ||
+      input.controlRepository !== CONTROL_REPOSITORY || input.controlRepositoryId !== CONTROL_REPOSITORY_ID ||
       input.controlRef !== CONTROL_REF || input.controlWorkflowPath !== CONTROL_WORKFLOW_PATH ||
       !decimalId(input.runId, 20) || !decimalId(input.runAttempt, 8) ||
       typeof input.controlWorkflowSha !== 'string' || !/^[a-f0-9]{40}$/u.test(input.controlWorkflowSha) ||

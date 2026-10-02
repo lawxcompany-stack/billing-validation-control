@@ -9,7 +9,7 @@ import {
   BILLING_RESULT_OIDC_ISSUER,
 } from './billing-result-manifest.mjs';
 
-const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID } from '../src/contracts/control-identity.mjs';
 const CONTROL_WORKFLOW_PATH = '.github/workflows/validate-billing.yml';
 const CONTROL_REF = 'refs/heads/main';
 const SLSA_PROVENANCE_TYPE = 'https://slsa.dev/provenance/v1';
@@ -106,8 +106,7 @@ export async function verifyBillingResultAttestationWithBoundary({ manifestBytes
   try {
     if (!(manifestBytes instanceof Uint8Array) || manifestBytes.byteLength === 0 ||
         !processBoundary || typeof processBoundary.run !== 'function' ||
-        typeof reviewedControlRepositoryId !== 'string' ||
-        !/^[1-9][0-9]{0,19}$/u.test(reviewedControlRepositoryId) ||
+        reviewedControlRepositoryId !== CONTROL_REPOSITORY_ID ||
         signal?.aborted === true || (signal !== undefined && (!signal ||
           typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function'))) refuse();
 

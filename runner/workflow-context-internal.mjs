@@ -1,4 +1,5 @@
-export const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
+import { CONTROL_REPOSITORY, CONTROL_REPOSITORY_ID, matchesControlRepository } from '../src/contracts/control-identity.mjs';
+export { CONTROL_REPOSITORY };
 export const CONTROL_WORKFLOW_PATH = '.github/workflows/validate-billing.yml';
 export const CONTROL_DEFAULT_BRANCH = 'main';
 export const ISOLATED_RUNNER_GROUP = 'billing-validation-isolated';
@@ -60,7 +61,7 @@ async function readBoundedJson(response) {
 function matchesRunAttempt(payload, { runId, runAttempt, reviewedControlRepositoryId }) {
   const repositoryIdMatches = (repository) => repository && typeof repository === 'object' &&
     !Array.isArray(repository) && Number.isSafeInteger(repository.id) && repository.id > 0 &&
-    String(repository.id) === reviewedControlRepositoryId && repository.full_name === CONTROL_REPOSITORY;
+    String(repository.id) === reviewedControlRepositoryId && matchesControlRepository(repository.full_name, repository.id);
   const workflowPathAtMain = `${CONTROL_WORKFLOW_PATH}@${CONTROL_DEFAULT_BRANCH}`;
   return payload && typeof payload === 'object' && !Array.isArray(payload) &&
     Number.isSafeInteger(payload.id) && String(payload.id) === runId &&
@@ -77,7 +78,7 @@ function matchesRunAttempt(payload, { runId, runAttempt, reviewedControlReposito
 export async function readSelectedRunAttemptWithRepositoryId({ runId, runAttempt,
   reviewedControlRepositoryId, signal } = {}) {
   if (!validDecimal(runId, 16) || !validDecimal(runAttempt, 8) ||
-      !validDecimal(reviewedControlRepositoryId, 20) ||
+      reviewedControlRepositoryId !== CONTROL_REPOSITORY_ID ||
       (signal !== undefined && (!signal || typeof signal.aborted !== 'boolean' ||
         typeof signal.addEventListener !== 'function'))) refuse();
 

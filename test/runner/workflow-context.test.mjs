@@ -5,8 +5,8 @@ const moduleUrl = new URL('../../runner/workflow-context.mjs', import.meta.url);
 const workflowContext = await import(moduleUrl.href).catch(() => null);
 const internalModuleUrl = new URL('../../runner/workflow-context-internal.mjs', import.meta.url);
 const internalContext = await import(internalModuleUrl.href).catch(() => null);
-const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
-const CONTROL_REPOSITORY_ID = '12345678';
+const CONTROL_REPOSITORY = 'lawx-ai/billing-validation-control';
+const CONTROL_REPOSITORY_ID = '1384018279';
 const CONTROL_WORKFLOW_PATH = '.github/workflows/validate-billing.yml';
 const RUN_ID = '123456789';
 const RUN_ATTEMPT = '2';
@@ -127,6 +127,8 @@ for (const [field, mutation] of [
   ['selected run ID', (run) => ({ ...run, id: 123456788 })],
   ['selected attempt', (run) => ({ ...run, run_attempt: 1 })],
   ['repository slug', (run) => ({ ...run, repository: { ...run.repository, full_name: 'attacker/repository' } })],
+  ['old control owner with correct ID', (run) => ({ ...run, repository: { ...run.repository, full_name: 'lawxcompany-stack/billing-validation-control' } })],
+  ['old head owner with correct ID', (run) => ({ ...run, head_repository: { ...run.head_repository, full_name: 'lawxcompany-stack/billing-validation-control' } })],
   ['immutable repository ID', (run) => ({ ...run, repository: { ...run.repository, id: 87654321 } })],
   ['head repository identity', (run) => ({ ...run, head_repository: { id: 87654321, full_name: 'attacker/repository' } })],
   ['workflow path', (run) => ({ ...run, path: '.github/workflows/other.yml@main' })],
@@ -161,25 +163,31 @@ test('selected run-attempt lookup rejects malformed, oversized, redirected and n
   }
 });
 
-test('a well-formed but unreviewed repository ID fails against the API identity claim', async () => {
+test('a well-formed but unreviewed repository ID refuses before HTTP even when API claims match', async () => {
   let requests = 0;
   await withFetch(async () => {
     requests += 1;
-    return githubResponse(validRun());
+    return githubResponse(validRun({
+      repository: { full_name: CONTROL_REPOSITORY, id: 87654321 },
+      head_repository: { full_name: CONTROL_REPOSITORY, id: 87654321 },
+    }));
   }, async () => {
     await assert.rejects(read(SELECTORS, '87654321'), { code: 'runner_workflow_context_invalid' });
   });
-  assert.equal(requests, 1);
+  assert.equal(requests, 0);
 });
 
-test('production run selector API rejects caller-supplied repository ID instead of overriding the reviewed identity', async () => {
+test('production run selector ignores a caller-supplied ID and refuses an API response matching that unreviewed ID', async () => {
   let requests = 0;
   await withFetch(async () => {
     requests += 1;
-    return githubResponse(validRun());
+    return githubResponse(validRun({
+      repository: { full_name: CONTROL_REPOSITORY, id: 87654321 },
+      head_repository: { full_name: CONTROL_REPOSITORY, id: 87654321 },
+    }));
   }, async () => {
     await assert.rejects(workflowContext.readSelectedRunAttempt({ ...SELECTORS,
-      reviewedControlRepositoryId: CONTROL_REPOSITORY_ID }),
+      reviewedControlRepositoryId: '87654321' }),
     { code: 'runner_workflow_context_invalid' });
   });
   assert.equal(requests, 1);

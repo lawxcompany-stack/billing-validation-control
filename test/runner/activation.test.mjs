@@ -41,8 +41,8 @@ const manifestFields = Object.freeze({
   candidateRepository: 'lawxcompany-stack/Plataforma-LawX',
   candidateSha: 'a'.repeat(40),
   runnerLabel: `billing-validation-${'b'.repeat(32)}`,
-  controlRepository: 'lawxcompany-stack/billing-validation-control',
-  controlRepositoryId: '12345678',
+  controlRepository: 'lawx-ai/billing-validation-control',
+  controlRepositoryId: '1384018279',
   controlRef: 'refs/heads/main',
   controlWorkflowPath: '.github/workflows/validate-billing.yml',
   runId: '123456789',
@@ -50,7 +50,7 @@ const manifestFields = Object.freeze({
   controlWorkflowSha: 'd'.repeat(40),
   eventName: 'workflow_dispatch',
 });
-const CANONICAL_MANIFEST_BYTES = '{"activationCommitment":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","candidateRepository":"lawxcompany-stack/Plataforma-LawX","candidateSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","runnerLabel":"billing-validation-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","controlRepository":"lawxcompany-stack/billing-validation-control","controlRepositoryId":"12345678","controlRef":"refs/heads/main","controlWorkflowPath":".github/workflows/validate-billing.yml","runId":"123456789","runAttempt":"2","controlWorkflowSha":"dddddddddddddddddddddddddddddddddddddddd","eventName":"workflow_dispatch"}\n';
+const CANONICAL_MANIFEST_BYTES = '{"activationCommitment":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","candidateRepository":"lawxcompany-stack/Plataforma-LawX","candidateSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","runnerLabel":"billing-validation-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","controlRepository":"lawx-ai/billing-validation-control","controlRepositoryId":"1384018279","controlRef":"refs/heads/main","controlWorkflowPath":".github/workflows/validate-billing.yml","runId":"123456789","runAttempt":"2","controlWorkflowSha":"dddddddddddddddddddddddddddddddddddddddd","eventName":"workflow_dispatch"}\n';
 
 test('activation commitment is domain-separated SHA-256 over exactly 32 nonce bytes', () => {
   const { activationCommitment } = requireActivation();
@@ -159,7 +159,7 @@ test('hosted workflow writer refuses a mismatched workflow context before writin
     CONTROL_REPOSITORY: manifestFields.controlRepository,
     CONTROL_REPOSITORY_ID: manifestFields.controlRepositoryId,
     CONTROL_REF: manifestFields.controlRef,
-    CONTROL_WORKFLOW_REF: 'lawxcompany-stack/billing-validation-control/.github/workflows/other.yml@refs/heads/main',
+    CONTROL_WORKFLOW_REF: 'lawx-ai/billing-validation-control/.github/workflows/other.yml@refs/heads/main',
     CONTROL_RUN_ID: manifestFields.runId,
     CONTROL_RUN_ATTEMPT: manifestFields.runAttempt,
     CONTROL_WORKFLOW_SHA: manifestFields.controlWorkflowSha,
@@ -190,6 +190,9 @@ test('activation manifest rejects foreign identity, malformed digest and nondeci
   const { createActivationManifest } = requireManifest();
   for (const fields of [
     { ...manifestFields, controlRepository: 'other/control' },
+    { ...manifestFields, controlRepository: 'lawxcompany-stack/billing-validation-control' },
+    { ...manifestFields, controlRepositoryId: '12345678' },
+    { ...manifestFields, controlRepositoryId: '1384018280' },
     { ...manifestFields, activationCommitment: undefined },
     { ...manifestFields, controlRepositoryId: '12x' },
     { ...manifestFields, candidateSha: 'short' },
