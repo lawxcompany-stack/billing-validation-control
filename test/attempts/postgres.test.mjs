@@ -142,7 +142,7 @@ function withGetter(source, key, getter) {
   return copy;
 }
 
-test('schema installer refuses bootstrap without explicit migration approval before opening SQL', async () => {
+test('schema installer refuses outside the protected Environment before opening SQL', async () => {
   const client = recordingClient();
   await assert.rejects(installAttemptSchema({ client, preflight, target }), {
     code: 'migration_approval_required',

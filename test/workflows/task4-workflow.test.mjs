@@ -110,6 +110,9 @@ test('a result-schema failure blocks the credentialed emitter and publisher befo
 
 test('Environment readback must explicitly succeed before any Environment job', () => {
   assert.equal(workflow.jobs.authorize.outputs.environments_verified, '${{ steps.environments.outputs.verified }}');
+  assert.equal(workflow.jobs.test.environment, 'billing-validation-tests');
+  assert.equal(workflow.jobs.test.env.BILLING_VALIDATION_APPROVAL_ENVIRONMENT,
+    workflow.jobs.test.environment);
   for (const value of ['', 'false', undefined]) {
     const dependencies = structuredClone(needs);
     dependencies.authorize.outputs.environments_verified = value;

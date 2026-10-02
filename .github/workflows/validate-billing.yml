@@ -326,6 +326,8 @@ jobs:
     needs: [authorize, reader, attest-activation]
     runs-on: ${{ needs.authorize.outputs.runner_label != '' && fromJSON(format('["{0}"]', needs.authorize.outputs.runner_label)) || 'ubuntu-latest' }}
     environment: billing-validation-tests
+    env:
+      BILLING_VALIDATION_APPROVAL_ENVIRONMENT: billing-validation-tests
     timeout-minutes: 45
     permissions:
       contents: read

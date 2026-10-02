@@ -612,6 +612,6 @@ export function createPostgresAttemptStore({ client, preflight, target, verifyRe
     verifyProviderObservation, verified.preflight.expectedEnvironment));
 }
 
-export async function installAttemptSchema({ client, policy, targetReadback, approval, migrationDirectory } = {}) {
-  return applyAttemptMigrations({ client, policy, targetReadback, approval, migrationDirectory });
+export async function installAttemptSchema({ client, migrationDirectory } = {}) {
+  return applyAttemptMigrations({ client, migrationDirectory });
 }
