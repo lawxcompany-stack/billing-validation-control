@@ -298,6 +298,7 @@ test('disposable PostgreSQL 17 proves atomic bootstrap, verifier boundary and pe
     await clusterAdmin.query('CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN; CREATE ROLE service_role NOLOGIN;');
     const postgresPassword = randomBytes(32).toString('base64url');
     await clusterAdmin.query(`CREATE ROLE postgres WITH LOGIN SUPERUSER PASSWORD '${postgresPassword}'`);
+    await clusterAdmin.query('GRANT CONNECT ON DATABASE postgres TO postgres');
     client = new Client({ ...connection, user: 'postgres', password: postgresPassword,
       connectionTimeoutMillis: 5_000, query_timeout: 15_000 });
     await client.connect();
