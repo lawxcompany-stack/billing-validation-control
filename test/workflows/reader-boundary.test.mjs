@@ -42,3 +42,20 @@ test('candidate policy job and financial placeholder still cannot receive secret
     assert.throws(() => assertWorkflowSecretBoundary(value, path));
   }
 });
+
+for (const [name, mutate] of [
+  ['a local credential file', (value) => { value.jobs.test.steps[1].run = 'node --env-file=.env.local runner/collect.mjs'; }],
+  ['a Production variable ref', (value) => {
+    value.jobs.test.env = { SUPABASE_PROJECT_REF: '${{ vars.PRODUCTION_SUPABASE_PROJECT_REF }}' };
+  }],
+  ['a Production database URL', (value) => {
+    value.jobs.test.env = { DATABASE_URL: 'postgresql://synthetic:synthetic@db.production.supabase.co:5432/postgres' };
+  }],
+  ['a Live Stripe key', (value) => { value.jobs.test.env = { STRIPE_SECRET_KEY: 'sk_live_synthetic12345678' }; }],
+]) {
+  test(`workflow credential boundary rejects ${name}`, () => {
+    const value = workflow();
+    mutate(value);
+    assert.throws(() => assertWorkflowSecretBoundary(value, path));
+  });
+}

@@ -253,6 +253,12 @@ function assertLocalAuthorizationBoundary(workflow) {
 }
 
 export function assertWorkflowSecretBoundary(workflow, path) {
+  // A workflow may not import local credentials or select a Production/Live
+  // source through an env value, expression, ref, URL, or literal key.
+  const serializedWorkflow = JSON.stringify(workflow);
+  assert.ok(!/\.env\.local\b/iu.test(serializedWorkflow), `${path} must not load local credentials`);
+  assert.ok(!/(?:^|[^a-z0-9])(?:production|prod|live)(?:$|[^a-z0-9])/iu.test(serializedWorkflow),
+    `${path} must not select Production or Live credentials or destinations`);
   if (path === workflowPaths[2]) return assertLocalAuthorizationBoundary(workflow);
   assert.deepEqual(workflow.permissions, { contents: 'read' }, `${path} must keep token permissions read-only`);
 
