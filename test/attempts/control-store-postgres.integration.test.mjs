@@ -26,7 +26,8 @@ async function readVerifierGateDiagnostics(client) {
         EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members AS membership
           WHERE (membership.member = verifier.oid OR membership.roleid = verifier.oid)
             AND NOT (
-              membership.roleid = verifier.oid AND membership.member = bootstrap_operator.oid
+              bootstrap_operator.oid IS NOT NULL
+              AND membership.roleid = verifier.oid AND membership.member = bootstrap_operator.oid
               AND membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option
               AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS grantor
                 WHERE grantor.oid = membership.grantor AND grantor.rolsuper)
@@ -35,7 +36,8 @@ async function readVerifierGateDiagnostics(client) {
         EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members AS membership
           WHERE (membership.member = owner.oid OR membership.roleid = owner.oid)
             AND NOT (
-              membership.roleid = owner.oid AND membership.member = bootstrap_operator.oid
+              bootstrap_operator.oid IS NOT NULL
+              AND membership.roleid = owner.oid AND membership.member = bootstrap_operator.oid
               AND membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option
               AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS grantor
                 WHERE grantor.oid = membership.grantor AND grantor.rolsuper)
@@ -96,7 +98,7 @@ async function readVerifierGateDiagnostics(client) {
       CROSS JOIN pg_catalog.pg_roles AS anon
       CROSS JOIN pg_catalog.pg_roles AS authenticated
       CROSS JOIN pg_catalog.pg_roles AS service_role
-      JOIN pg_catalog.pg_roles AS bootstrap_operator ON bootstrap_operator.rolname = 'postgres'
+      LEFT JOIN pg_catalog.pg_roles AS bootstrap_operator ON bootstrap_operator.rolname = 'postgres'
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.nspname = $4
       JOIN pg_catalog.pg_proc AS verifier_function ON verifier_function.pronamespace = namespace.oid
         AND verifier_function.proname = 'verify_attempt_control_store' AND verifier_function.pronargs = 0
