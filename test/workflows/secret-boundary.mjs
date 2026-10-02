@@ -180,6 +180,58 @@ function assertResultVerificationBoundary(job) {
   ]);
 }
 
+function assertControlStoreRuntimeBoundary(workflow) {
+  const expression = (value) => '${{ ' + value + ' }}';
+  const guard = "github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.authorize.outputs.operation == 'collect'";
+  const job = workflow.jobs['control-store'];
+
+  assert.deepEqual(Object.keys(job).sort(), ['if', 'needs', 'runs-on', 'environment', 'timeout-minutes', 'permissions', 'steps'].sort());
+  assert.equal(job.if, expression(guard));
+  assert.equal(job.needs, 'authorize');
+  assert.equal(job['runs-on'], 'ubuntu-latest');
+  assert.equal(job.environment, 'billing-validation-control');
+  assert.equal(job['timeout-minutes'], 10);
+  assert.deepEqual(job.permissions, { contents: 'read' });
+  assert.equal(job.outputs, undefined);
+  assert.equal(job.env, undefined);
+  assert.equal(JSON.stringify(workflow).includes('BILLING_CONTROL_DATABASE_URL'), false,
+    'the former shared control/runtime URL must not appear in the protected workflow');
+  assert.deepEqual(job.steps, [
+    { name: 'Checkout exact triggering workflow SHA', uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      with: { ref: expression('github.sha'), 'persist-credentials': false } },
+    { name: 'Set up Node.js 22', uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      with: { 'node-version': '22', 'package-manager-cache': false } },
+    { name: 'Install locked dependencies without lifecycle scripts',
+      run: 'npx --yes pnpm@11.5.1 --ignore-workspace install --frozen-lockfile --ignore-scripts' },
+    { name: 'Verify the billing control store read-only',
+      env: { BILLING_CONTROL_VERIFIER_DATABASE_URL: expression('secrets.BILLING_CONTROL_VERIFIER_DATABASE_URL') },
+      run: 'node runner/verify-control-store.mjs' },
+  ]);
+
+  const preflight = workflow.jobs.authorize.steps.find((step) => step.id === 'environments');
+  assert.equal(preflight.env.CONTROL_DISPATCH_OPERATION, expression('steps.authorize.outputs.operation'));
+  assert.match(preflight.run, /process\.env\.CONTROL_DISPATCH_OPERATION\s*===\s*'collect'/u);
+  assert.match(preflight.run, /process\.env\.CONTROL_DISPATCH_OPERATION\s*===\s*'recheck'/u);
+  assert.match(preflight.run, /requiredEnvironments\.push\('billing-validation-control'\)/u);
+  assert.match(preflight.run, /approval\.reviewers\.length\s*>\s*0/u);
+
+  const testJob = workflow.jobs.test;
+  assert.ok(testJob.needs.includes('control-store'));
+  assert.match(testJob.if, /needs\.control-store\.result\s*==\s*'success'/u);
+  assert.match(testJob.if, /needs\.control-store\.result\s*==\s*'skipped'/u);
+
+  for (const [jobId, otherJob] of Object.entries(workflow.jobs)) {
+    const serialized = JSON.stringify(otherJob);
+    const references = serialized.match(/\$\{\{\s*secrets\.BILLING_CONTROL_VERIFIER_DATABASE_URL\s*\}\}/gu) ?? [];
+    assert.equal(references.length, jobId === 'control-store' ? 1 : 0,
+      `${jobId} must not receive or forward the control database URL`);
+    if (jobId !== 'control-store') {
+      assert.equal(serialized.includes('BILLING_CONTROL_VERIFIER_DATABASE_URL'), false,
+        `${jobId} must not name the verifier database URL`);
+    }
+  }
+}
+
 // Closed structural contract independent of the YAML being checked. Exact keys,
 // commands and expressions also cover bracket/toJSON credential exfiltration and
 // job/step defaults, containers, paths, shell or conditional execution bypasses.
@@ -279,6 +331,7 @@ const allowedProviderContextReferences = new Set([
   ['.github/workflows/authorize-local-collector.yml', 'jobs.reader.steps[2].with.private-key', 'secrets', 'BILLING_READER_APP_PRIVATE_KEY'],
   ['.github/workflows/validate-billing.yml', 'jobs.reader.steps[2].with.app-id', 'vars', 'BILLING_READER_APP_ID'],
   ['.github/workflows/validate-billing.yml', 'jobs.reader.steps[2].with.private-key', 'secrets', 'BILLING_READER_APP_PRIVATE_KEY'],
+  ['.github/workflows/validate-billing.yml', 'jobs.control-store.steps[3].env.BILLING_CONTROL_VERIFIER_DATABASE_URL', 'secrets', 'BILLING_CONTROL_VERIFIER_DATABASE_URL'],
   ['.github/workflows/validate-billing.yml', 'jobs.attest-result.steps[3].env.VERCEL_READ_ONLY_TOKEN', 'secrets', 'BILLING_VALIDATION_VERCEL_READ_ONLY_TOKEN'],
 ].map((tuple) => JSON.stringify(tuple)));
 
@@ -415,10 +468,15 @@ export function assertWorkflowSecretBoundary(workflow, path) {
   assertNoProviderRuntimeEnvironment(workflow, path);
   if (path === workflowPaths[2]) return assertLocalAuthorizationBoundary(workflow);
   assert.deepEqual(workflow.permissions, { contents: 'read' }, `${path} must keep token permissions read-only`);
+  if (path === workflowPaths[0]) assertControlStoreRuntimeBoundary(workflow);
 
   for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
     const serializedJob = JSON.stringify(job);
-    if (path === workflowPaths[0] && jobId === 'reader') assertReaderBoundary(job);
+    if (path === workflowPaths[0] && jobId === 'control-store') {
+      assert.deepEqual(serializedJob.match(/\$\{\{[^}]*\bsecrets\b[^}]*\}\}/gu),
+        ['${{ secrets.BILLING_CONTROL_VERIFIER_DATABASE_URL }}'],
+        `${path}:${jobId} may consume only the protected read-only control URL`);
+    } else if (path === workflowPaths[0] && jobId === 'reader') assertReaderBoundary(job);
     else if (path === workflowPaths[0] && jobId === 'attest-result') {
       assert.deepEqual(serializedJob.match(/\$\{\{[^}]*\bsecrets\b[^}]*\}\}/gu),
         ['${{ secrets.BILLING_VALIDATION_VERCEL_READ_ONLY_TOKEN }}'],

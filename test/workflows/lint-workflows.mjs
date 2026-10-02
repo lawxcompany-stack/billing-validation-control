@@ -29,7 +29,7 @@ for (const path of paths) {
 }
 
 const validate = YAML.parse(readFileSync(paths[0], 'utf8'));
-for (const id of ['reader', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
+for (const id of ['reader', 'test', 'control-store', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
   assert.match(validate.jobs[id].if, /needs\.authorize\.result\s*==\s*'success'/,
     `${id} must be blocked unless the dispatch gate succeeds`);
 }

@@ -8,6 +8,8 @@
   "packageManager": "pnpm@11.5.1",
   "scripts": {
     "test": "node --test \"test/**/*.test.mjs\"",
+    "test:control-store": "node --test test/attempts/control-store-runtime.test.mjs test/workflows/control-store-boundary.test.mjs test/workflows/workflow-policy.test.mjs test/workflows/reader-boundary.test.mjs",
+    "test:billing-control-store:db": "node scripts/test-billing-control-store-postgres.mjs",
     "test:task7": "node --test test/attempts/attempts.test.mjs test/attempts/concurrency.test.mjs test/attempts/contracts.test.mjs test/attempts/postgres.test.mjs test/attempts/migrations.test.mjs test/contracts/evidence.test.mjs test/github/ci-evidence.test.mjs test/billing/sql-gates.test.mjs test/billing/observations.test.mjs test/billing/fixture-run.test.mjs test/runtime/supabase.test.mjs test/runtime/supabase-webhook-observer.test.mjs test/runtime/stripe.test.mjs test/runtime/standalone.test.mjs test/runtime/standalone-identity-contract.test.mjs",
     "test:task6": "node --test test/billing/scenarios/subscription.test.mjs test/billing/scenarios/finance.test.mjs test/billing/scenarios/access.test.mjs test/billing/scenarios/webhook.test.mjs test/billing/fixtures.test.mjs test/billing/financial.test.mjs test/runtime/supabase-webhook-observer.test.mjs",
     "test:task5": "node --test test/billing/scenarios/blocked.test.mjs test/billing/scenarios/signup.test.mjs test/billing/scenarios/pricing.test.mjs test/billing/scenarios/payment.test.mjs test/billing/scenarios/zero.test.mjs test/billing/fixtures.test.mjs test/billing/fixture-run.test.mjs test/billing/financial.test.mjs test/contracts/evidence.test.mjs",

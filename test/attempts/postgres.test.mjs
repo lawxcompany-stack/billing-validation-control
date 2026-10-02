@@ -1,9 +1,41 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { createPostgresAttemptStore, installAttemptSchema } from '../../src/attempts/postgres-store.mjs';
+import * as postgresApi from '../../src/attempts/postgres-store.mjs';
+import { CONTROL_STORE_POLICY, parseControlStoreRuntimeDatabaseUrl } from '../../src/attempts/control-store-policy.mjs';
 import { providerIdempotencyKey } from '../../src/attempts/prepare.mjs';
 import { runStripeMutation } from '../../src/runtime/stripe.mjs';
+const CONTROL_DATABASE_URL = 'postgresql://billing_validation_runtime:synthetic-control-password@db.ceindkuafycqdcplfrgs.supabase.co:5432/postgres?sslmode=require';
+const CONTROL_TARGET = parseControlStoreRuntimeDatabaseUrl(CONTROL_DATABASE_URL);
+const CONTROL_CONNECTION_PARAMETERS = Object.freeze({ host: CONTROL_TARGET.host,
+  port: CONTROL_TARGET.port, database: CONTROL_TARGET.database, user: CONTROL_TARGET.username,
+  ssl: Object.freeze({ rejectUnauthorized: true, servername: CONTROL_TARGET.host }) });
+const CONTROL_RUNTIME_SESSION = Object.freeze({ database_name: 'postgres', session_user: CONTROL_STORE_POLICY.roles.runtime,
+  current_user: CONTROL_STORE_POLICY.roles.runtime, role_setting: 'none', server_version_num: '170011' });
+
+function createPostgresAttemptStore({ client, runtimeSession = CONTROL_RUNTIME_SESSION, runtimeSessionError,
+  controlDatabaseUrl = CONTROL_DATABASE_URL, ...options }) {
+  const wrappedClient = {
+    connectionParameters: client.connectionParameters ?? CONTROL_CONNECTION_PARAMETERS,
+    transaction(operation) {
+      return client.transaction((queryClient) => operation({
+        connectionParameters: queryClient.connectionParameters ?? wrappedClient.connectionParameters,
+        async query(query, values) {
+          const sql = typeof query === 'string' ? query : query?.text;
+          if (typeof sql === 'string' && sql.includes('current_database()')) {
+            const call = { sql, values, query_timeout: typeof query === 'object' ? query.query_timeout : undefined };
+            if (Array.isArray(client.calls)) client.calls.push(call);
+            if (Array.isArray(client.transactions?.at(-1))) client.transactions.at(-1).push(call);
+            if (runtimeSessionError) throw runtimeSessionError;
+            return { rows: runtimeSession === null ? [] : [runtimeSession] };
+          }
+          return queryClient.query(query, values);
+        },
+      }));
+    },
+  };
+  return postgresApi.createPostgresAttemptStore({ ...options, client: wrappedClient, controlDatabaseUrl });
+}
 
 const database = { projectRef: 'abcdefghijklmnopqrst' };
 const preflight = { expectedEnvironment: {
@@ -46,10 +78,12 @@ function recordingClient() {
   return client;
 }
 
-function fixtureMutationClient({ mode = 'valid' } = {}) {
+function fixtureMutationClient({ mode = 'valid', currentFixtureRows = 0 } = {}) {
   const calls = [];
   const fixtureCaseClaims = new Map();
   const fixtureResourceClaims = new Set();
+  const fixtureClaimEvents = [];
+  let fixtureRowsUsed = currentFixtureRows;
   const fence = '11111111-1111-4111-8111-111111111111';
   const workflow = { repository: 'lawxcompany-stack/billing-validation-control',
     ref: 'refs/heads/main', runId: '100', runAttempt: 1,
@@ -91,6 +125,20 @@ function fixtureMutationClient({ mode = 'valid' } = {}) {
         owner_ref: workflow.ref, owner_run_id: workflow.runId, owner_run_attempt: workflow.runAttempt,
         recovery_only: mode === 'recovery-only',
       }] };
+      if (sql.includes('AS current_rows') && sql.includes('fixture_reservation_claim_events')) {
+        return { rows: [{ attempt_id: 'attempt-fixture', current_rows: String(fixtureRowsUsed) }] };
+      }
+      if (sql.startsWith('INSERT INTO billing_validation_control.fixture_reservation_claim_events')) {
+        const [eventId, reservationId, attemptId, previousRows, currentRows] = values;
+        if (fixtureRowsUsed !== previousRows || currentRows <= previousRows ||
+            fixtureClaimEvents.some((event) => event.event_id === eventId)) {
+          throw Object.assign(new Error('stale fixture event'), { code: '40001' });
+        }
+        fixtureRowsUsed = currentRows;
+        fixtureClaimEvents.push({ event_id: eventId, reservation_id: reservationId, attempt_id: attemptId,
+          previous_rows: previousRows, current_rows: currentRows });
+        return { rows: [{ current_rows: currentRows }], rowCount: 1 };
+      }
       if (sql.includes('FROM billing_validation_control.retention_reservations')) {
         return { rows: mode === 'missing' ? [] : [reservation] };
       }
@@ -127,7 +175,7 @@ function fixtureMutationClient({ mode = 'valid' } = {}) {
       return { rows: [], rowCount: 1 };
     } });
   } };
-  return { client, fence, reservation, fixtureCaseClaims, fixtureResourceClaims };
+  return { client, fence, reservation, fixtureCaseClaims, fixtureResourceClaims, fixtureClaimEvents };
 }
 
 function postgresFixtureRequest(fence, { caseId = 'payment.approved', namespaceId =
@@ -142,13 +190,77 @@ function withGetter(source, key, getter) {
   return copy;
 }
 
-test('schema installer refuses outside the protected Environment before opening SQL', async () => {
+test('runtime PostgreSQL API has no schema installer', () => {
+  assert.equal('installAttemptSchema' in postgresApi, false);
+});
+
+test('wrong control URL and a control DB equal to the financial target refuse before transactions', () => {
+  const wrongUrls = [
+    CONTROL_DATABASE_URL.replace(CONTROL_TARGET.host, 'db.otherproject.invalid'),
+    CONTROL_DATABASE_URL.replace('/postgres?', '/other_database?'),
+    CONTROL_DATABASE_URL.replace('billing_validation_runtime:', 'billing_validation_verifier:'),
+    CONTROL_DATABASE_URL.replace('billing_validation_runtime:', 'postgres:'),
+  ];
+  for (const controlDatabaseUrl of wrongUrls) {
+    const client = recordingClient();
+    assert.throws(() => createPostgresAttemptStore({ client, preflight, target, controlDatabaseUrl }),
+      { code: 'control_store_target_invalid' });
+    assert.equal(client.transactions.length, 0);
+  }
+
+  const controlProject = CONTROL_STORE_POLICY.projectRef;
+  const sameProjectSupabase = { ...preflight.providerVerification.supabase, projectRef: controlProject };
+  const sameProjectPreflight = { ...preflight,
+    expectedEnvironment: { ...preflight.expectedEnvironment, database: { projectRef: controlProject } },
+    providerVerification: { ...preflight.providerVerification, supabase: sameProjectSupabase },
+  };
+  const sameProjectTarget = { ...target, projectRef: controlProject };
   const client = recordingClient();
-  await assert.rejects(installAttemptSchema({ client, preflight, target }), {
-    code: 'migration_approval_required',
-  });
-  assert.equal(client.calls.length, 0);
+  assert.throws(() => createPostgresAttemptStore({ client,
+    preflight: sameProjectPreflight, target: sameProjectTarget }),
+  { code: 'control_store_target_invalid' });
   assert.equal(client.transactions.length, 0);
+});
+
+test('control client requires TLS certificate verification and the policy-pinned SNI host', () => {
+  const insecureTls = [false, true, { rejectUnauthorized: false, servername: CONTROL_TARGET.host },
+    { rejectUnauthorized: true }, { rejectUnauthorized: true, servername: 'db.attacker.invalid' },
+    { rejectUnauthorized: true, servername: CONTROL_TARGET.host, checkServerIdentity: () => undefined },
+    { rejectUnauthorized: true, servername: CONTROL_TARGET.host, secureOptions: 0 }];
+
+  for (const ssl of insecureTls) {
+    const client = { ...recordingClient(), connectionParameters: { ...CONTROL_CONNECTION_PARAMETERS, ssl } };
+    assert.throws(() => createPostgresAttemptStore({ client, preflight, target }),
+      { code: 'control_store_target_invalid' });
+    assert.equal(client.transactions.length, 0);
+  }
+
+  const secureClient = { ...recordingClient(), connectionParameters: CONTROL_CONNECTION_PARAMETERS };
+  assert.doesNotThrow(() => createPostgresAttemptStore({ client: secureClient, preflight, target }));
+  assert.equal(secureClient.transactions.length, 0);
+});
+
+test('runtime session identity refusal precedes store writes and fixture provider callbacks', async () => {
+  const { client, fence } = fixtureMutationClient();
+  const store = createPostgresAttemptStore({ client, preflight, target,
+    runtimeSession: { ...CONTROL_RUNTIME_SESSION, session_user: 'service_role' } });
+  let providerCalls = 0;
+  let error;
+  await assert.rejects(store.fixtureMutationWithReservation({ attemptId: 'attempt-fixture', fence,
+    reservationId: 'reservation-fixture', rows: { databaseRows: 1 }, caseId: 'payment.approved',
+    namespaceId: '00000000-0000-4000-8000-000000000001',
+    fixtureId: '00000000-0000-4000-8000-000000000101', kind: 'catalog',
+  }, async () => { providerCalls += 1; }), (actual) => {
+    error = actual;
+    return actual.code === 'control_store_identity_invalid';
+  });
+
+  assert.equal(providerCalls, 0);
+  assert.equal(client.calls.length, 1);
+  assert.match(client.calls[0].sql, /current_database\(\)/u);
+  assert.equal(client.calls.some(({ sql }) => /\b(?:INSERT|UPDATE|DELETE)\b/iu.test(sql)), false);
+  assert.equal(JSON.stringify(error).includes('synthetic-control-password'), false);
+  assert.equal(error.message.includes(CONTROL_DATABASE_URL), false);
 });
 
 test('non-standalone, mismatched, or unhealthy readback refuses before any SQL', () => {
@@ -346,7 +458,7 @@ test('store remains pinned to a detached environment snapshot after source objec
   assert.equal(insert.values[13], stableEnvironment.stripe.accountId);
 });
 
-test('every PostgreSQL store transaction starts at READ COMMITTED before its first read or lock', async () => {
+test('every store transaction verifies its exact runtime session before any store query', async () => {
   const client = recordingClient();
   const store = createPostgresAttemptStore({ client, preflight, target });
   await store.prepare({ attemptId: 'attempt-a',
@@ -359,7 +471,34 @@ test('every PostgreSQL store transaction starts at READ COMMITTED before its fir
 
   assert.equal(client.transactions.length, 2);
   for (const transaction of client.transactions) {
-    assert.equal(transaction[0].sql, 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+    assert.match(transaction[0].sql, /current_database\(\)/u);
+    assert.equal(transaction[0].query_timeout, 5000);
+    assert.equal(transaction[1].sql, 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+  }
+});
+
+test('runtime session identity refusal matrix blocks all store and provider work', async () => {
+  const variants = [
+    ['wrong database', { ...CONTROL_RUNTIME_SESSION, database_name: 'other_database' }],
+    ['wrong session user', { ...CONTROL_RUNTIME_SESSION, session_user: 'service_role' }],
+    ['changed current role', { ...CONTROL_RUNTIME_SESSION, current_user: 'billing_validation_owner' }],
+    ['SET ROLE in effect', { ...CONTROL_RUNTIME_SESSION, role_setting: 'billing_validation_runtime' }],
+    ['wrong server version', { ...CONTROL_RUNTIME_SESSION, server_version_num: '160000' }],
+    ['missing row', null],
+  ];
+
+  for (const [name, runtimeSession] of variants) {
+    const { client, fence } = fixtureMutationClient();
+    const store = createPostgresAttemptStore({ client, preflight, target, runtimeSession });
+    let providerCalls = 0;
+    await assert.rejects(store.fixtureMutationWithReservation({ attemptId: 'attempt-fixture', fence,
+      reservationId: 'reservation-fixture', rows: { databaseRows: 1 }, caseId: 'payment.approved',
+      namespaceId: '00000000-0000-4000-8000-000000000001',
+      fixtureId: '00000000-0000-4000-8000-000000000101', kind: 'catalog',
+    }, async () => { providerCalls += 1; }), (error) => error.code === 'control_store_identity_invalid', name);
+    assert.equal(client.calls.length, 1, `${name}: no SQL after identity refusal`);
+    assert.doesNotMatch(client.calls[0].sql, /verify_attempt_control_store/u, name);
+    assert.equal(providerCalls, 0, name);
   }
 });
 
@@ -614,11 +753,18 @@ test('PostgreSQL fixture reservation claim locks the exact owner and reservation
     values?.[0]?.startsWith('["resource"'));
   const scopeLock = client.calls.findIndex(({ sql, values }) => sql.includes('pg_advisory_xact_lock') &&
     values?.[0]?.startsWith('["retention"'));
-  const reservationRead = index(/FROM billing_validation_control\.retention_reservations[\s\S]*FOR UPDATE/u);
+  const reservationRead = index(/FROM billing_validation_control\.retention_reservations/u);
   const receiptRead = index(/FROM billing_validation_control\.retention_receipts/u);
-  const claimWrite = index(/INSERT INTO billing_validation_control\.fixture_reservation_claims/u);
+  const fixtureClaimLock = client.calls.findIndex(({ sql, values }) =>
+    /pg_advisory_xact_lock/u.test(sql) && values?.[0] === 'fixture-reservation-claim:reservation-fixture');
+  const claimStateRead = index(/SELECT reservation\.attempt_id[\s\S]*fixture_reservation_claim_events[\s\S]*AS current_rows/u);
+  const claimWrite = index(/INSERT INTO billing_validation_control\.fixture_reservation_claim_events/u);
   assert.ok(attemptLock >= 0 && attemptLock < resourceLock && resourceLock < scopeLock &&
     scopeLock < reservationRead && reservationRead < receiptRead && receiptRead < claimWrite);
+  assert.ok(fixtureClaimLock >= 0 && fixtureClaimLock < claimStateRead && claimStateRead < claimWrite);
+  assert.equal(client.calls.some(({ sql }) => /(?:INSERT INTO|UPDATE) billing_validation_control\.fixture_reservation_claims/u.test(sql)), false);
+  assert.deepEqual(client.calls[claimWrite].values, ['usage:reservation-fixture:1', 'reservation-fixture',
+    'attempt-fixture', 0, 1]);
   const caseClaimWrite = index(/INSERT INTO billing_validation_control\.fixture_case_claims/u);
   assert.deepEqual(client.calls[caseClaimWrite].values, ['attempt-fixture', 'payment.approved',
     'reservation-fixture', fence, 'a'.repeat(40), '00000000-0000-4000-8000-000000000001',
@@ -626,6 +772,29 @@ test('PostgreSQL fixture reservation claim locks the exact owner and reservation
     preflight.expectedEnvironment.deployment.origin, preflight.expectedEnvironment.stripe.accountId]);
   assert.equal(client.calls.filter(({ sql }) => /SET TRANSACTION ISOLATION LEVEL READ COMMITTED/u.test(sql)).length, 1);
   assert.deepEqual(events, ['writer']);
+});
+
+test('reservation reconciliation peeks, locks attempt before reservation, then rereads under READ COMMITTED', async () => {
+  const { client } = fixtureMutationClient();
+  const store = createPostgresAttemptStore({ client, preflight, target,
+    verifyRetentionReceipt: async () => true });
+
+  const receipt = await store.reconcileReservation({ reservationId: 'reservation-fixture', outcome: 'cancelled',
+    retained: { attempts: 1, databaseRows: 0, authUsers: 0, stripeObjects: 0 } });
+
+  assert.equal(receipt.outcome, 'cancelled');
+  assert.equal(client.calls.filter(({ sql }) => /SET TRANSACTION ISOLATION LEVEL READ COMMITTED/u.test(sql)).length, 1);
+  const index = (predicate) => client.calls.findIndex(predicate);
+  const referenceRead = index(({ sql }) => /SELECT attempt_id\s+FROM billing_validation_control\.retention_reservations/u.test(sql));
+  const attemptLock = index(({ sql, values }) => /pg_advisory_xact_lock/u.test(sql) &&
+    values?.[0] === '["attempt","attempt-fixture"]');
+  const reservationLock = index(({ sql, values }) => /pg_advisory_xact_lock/u.test(sql) &&
+    values?.[0] === '["retention-reservation","reservation-fixture"]');
+  const lockedReservationRead = index(({ sql }) => /^SELECT reservation_id, attempt_id, project_ref, branch_id,/u.test(sql));
+  assert.ok(referenceRead >= 0 && referenceRead < attemptLock && attemptLock < reservationLock &&
+    reservationLock < lockedReservationRead,
+  `reservation lock sequence ${referenceRead}/${attemptLock}/${reservationLock}/${lockedReservationRead}: ` +
+    JSON.stringify(client.calls.map(({ sql }) => sql.slice(0, 90))));
 });
 
 test('PostgreSQL fixture case claims survive store recreation and reject a second namespace before writer dispatch', async () => {
@@ -666,7 +835,22 @@ test('PostgreSQL reservation, settlement, scope, capacity, expiry, and recovery 
     { code }, mode);
     assert.equal(writerCalls, 0, mode);
     assert.equal(client.calls.some(({ sql }) => /(?:INSERT INTO|UPDATE) billing_validation_control\.fixture_reservation_claims/u.test(sql)), false, mode);
+    assert.equal(client.calls.some(({ sql }) => /INSERT INTO billing_validation_control\.fixture_reservation_claim_events/u.test(sql)), false, mode);
   }
+});
+
+test('PostgreSQL rejects stale fixture-row usage before writing an event or invoking the writer', async () => {
+  const { client, fence, fixtureClaimEvents } = fixtureMutationClient({ currentFixtureRows: 2 });
+  const store = createPostgresAttemptStore({ client, preflight, target });
+  let writerCalls = 0;
+  await assert.rejects(store.fixtureMutationWithReservation(postgresFixtureRequest(fence, {
+    caseId: 'payment.declined',
+    namespaceId: '00000000-0000-4000-8000-000000000002',
+    fixtureId: '00000000-0000-4000-8000-000000000102',
+  }), async () => { writerCalls++; }), { code: 'fixture_reservation_insufficient' });
+  assert.equal(writerCalls, 0);
+  assert.deepEqual(fixtureClaimEvents, []);
+  assert.equal(client.calls.some(({ sql }) => /INSERT INTO billing_validation_control\.fixture_reservation_claim_events/u.test(sql)), false);
 });
 
 test('PostgreSQL persists Stripe intents, blocks replay, and appends one independent reconciliation receipt', async () => {
@@ -843,7 +1027,10 @@ test('PostgreSQL pending intent query is authorized by the current attempt fence
   const pendingQuery = calls.find(({ sql }) => sql.includes('FROM billing_validation_control.stripe_intents'));
   assert.ok(pendingQuery.sql.includes('NOT EXISTS'));
   assert.ok(pendingQuery.sql.includes('billing_validation_control.stripe_receipts'));
-  assert.ok(pendingQuery.sql.includes('FOR UPDATE'));
+  assert.doesNotMatch(pendingQuery.sql, /FOR\s+(?:NO\s+KEY\s+)?UPDATE/iu);
+  assert.ok(calls.some(({ sql, values }, index) => sql.includes('pg_advisory_xact_lock') &&
+    values?.[0] === '["stripe-intent-attempt","attempt-pending"]' &&
+    calls.indexOf(pendingQuery) > index));
   assert.deepEqual(pendingQuery.values, ['attempt-pending']);
   assert.ok(calls.some(({ sql }) => sql.includes('standalone_fixture_leases') && sql.includes('FOR UPDATE')));
   assert.ok(calls.some(({ sql, values }) => sql.includes('pg_advisory_xact_lock') &&
@@ -1269,7 +1456,7 @@ test('PostgreSQL recovery handoff rotates fences and keeps fixture mutation and 
   assert.ok(resourceWrites.slice(4).every(({ values }) => values[13] === secondRecovery.fence));
   const pendingQuery = calls.find(({ sql }) => sql.includes('FROM billing_validation_control.stripe_intents AS intent'));
   assert.ok(pendingQuery.sql.includes('NOT EXISTS'));
-  assert.ok(pendingQuery.sql.includes('FOR UPDATE OF intent'));
+  assert.doesNotMatch(pendingQuery.sql, /FOR\s+UPDATE\s+OF\s+intent/iu);
 
   await assert.rejects(store.listPendingStripeIntents({ attemptId, fence: oldFence }),
     { code: 'lease_fence_lost' });

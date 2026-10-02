@@ -1,7 +1,7 @@
 import { isValidExpectedEnvironment } from '../contracts/evidence.mjs';
 import { isValidStandaloneProjectRef } from '../billing/contracts.mjs';
 import { createAttemptStore, refuse } from './store.mjs';
-import { applyAttemptMigrations } from './migrations.mjs';
+import { CONTROL_STORE_POLICY, parseControlStoreRuntimeDatabaseUrl } from './control-store-policy.mjs';
 import { RETENTION_QUOTA_KEYS } from './prepare.mjs';
 
 const PROJECT_REF = /^[a-z0-9]{20}$/;
@@ -106,7 +106,60 @@ function assertWiring({ client, preflight, target }) {
   return { preflight: preflightSnapshot, target: targetSnapshot };
 }
 
+function assertControlClientTarget(client, target) {
+  try {
+    const parameters = client?.connectionParameters;
+    const host = parameters?.host;
+    const port = Number(parameters?.port);
+    const ssl = snapshotDataRecord(parameters?.ssl, ['rejectUnauthorized', 'servername']);
+    if (!parameters || typeof host !== 'string' || host.toLowerCase() !== target.host ||
+        port !== target.port || parameters.database !== target.database || parameters.user !== target.username ||
+        parameters.hostaddr !== undefined || parameters.hostAddr !== undefined ||
+        !ssl || ssl.rejectUnauthorized !== true || ssl.servername !== target.host) {
+      refuse('control_store_target_invalid');
+    }
+  } catch (error) {
+    if (error?.code === 'control_store_target_invalid') throw error;
+    refuse('control_store_target_invalid');
+  }
+}
+
+function refuseControlIdentity() {
+  const error = new Error('Control store identity verification failed.');
+  error.code = 'control_store_identity_invalid';
+  throw error;
+}
+
+async function verifyRuntimeControlStoreSession(queryClient, target) {
+  let result;
+  try {
+    result = await queryClient.query({
+      text: `SELECT current_database()::text AS database_name,
+        session_user::text AS session_user,
+        current_user::text AS current_user,
+        current_setting('role')::text AS role_setting,
+        current_setting('server_version_num')::text AS server_version_num`,
+      query_timeout: 5000,
+    });
+  } catch {
+    refuseControlIdentity();
+  }
+
+  const row = result?.rows?.length === 1
+    ? snapshotDataRecord(result.rows[0], ['database_name', 'session_user', 'current_user',
+      'role_setting', 'server_version_num'])
+    : null;
+  const [major, minor] = CONTROL_STORE_POLICY.databaseVersion.split('.').map(Number);
+  const expectedServerVersion = String(major * 10_000 + minor);
+  if (!row || row.database_name !== target.database ||
+      row.session_user !== CONTROL_STORE_POLICY.roles.runtime ||
+      row.current_user !== CONTROL_STORE_POLICY.roles.runtime || row.role_setting !== 'none' ||
+      row.server_version_num !== expectedServerVersion) refuseControlIdentity();
+}
+
 function keyValues(key) { return [key.projectRef, key.suite, key.fixtureKey]; }
+function businessKey(name, ...parts) { return JSON.stringify([name, ...parts]); }
+function fixtureReservationClaimLockKey(reservationId) { return `fixture-reservation-claim:${reservationId}`; }
 function rowFromDb(db) {
   if (!db) return null;
   if (db.branch_id !== db.database_project_ref.trim()) refuse('attempt_identity_invalid');
@@ -215,10 +268,14 @@ function resourceKeys(environment) {
 }
 
 function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetentionReceipt,
-  verifyProviderObservation, expectedEnvironment) {
+  verifyProviderObservation, expectedEnvironment, controlDatabaseUrl, controlTarget) {
   return { verifyRecovery, verifyCleanup, verifyRetentionReceipt, verifyProviderObservation, expectedEnvironment,
     transaction: (fn) => client.transaction(async (queryClient) => {
     if (typeof queryClient?.query !== 'function') refuse('store_client_invalid');
+    const checkedOutTarget = parseControlStoreRuntimeDatabaseUrl(controlDatabaseUrl);
+    if (checkedOutTarget.projectRef !== controlTarget.projectRef) refuse('control_store_target_invalid');
+    assertControlClientTarget(queryClient, checkedOutTarget);
+    await verifyRuntimeControlStoreSession(queryClient, checkedOutTarget);
     await queryClient.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
     const tx = {
       async nextFence() {
@@ -231,6 +288,10 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
       async lockAttempt(attemptId) {
         await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
           [JSON.stringify(['attempt', attemptId])]);
+      },
+      async lockBusinessKey(key) {
+        if (typeof key !== 'string' || key.length < 1 || key.length > 2048) refuse('store_client_invalid');
+        await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [key]);
       },
       async lockRetention(scope) {
         await queryClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
@@ -379,37 +440,75 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
           policyLimits: policies.rows?.[0] ? jsonValue(policies.rows[0].quota_limits) : null };
       },
       async getRetentionReservationByAttempt(attemptId) {
+        await tx.lockBusinessKey(businessKey('retention-reservation-attempt', attemptId));
         const result = await queryClient.query(`SELECT reservation_id, attempt_id, project_ref, branch_id,
           stripe_account_id, policy_version, quota_limits, projection, capacity_snapshot,
-          COALESCE((SELECT claim.database_rows_used FROM billing_validation_control.fixture_reservation_claims AS claim
-            WHERE claim.reservation_id = reservation.reservation_id), 0) AS fixture_rows_used,
+          COALESCE((SELECT event.current_rows FROM billing_validation_control.fixture_reservation_claim_events AS event
+              WHERE event.reservation_id = reservation.reservation_id
+              ORDER BY event.current_rows DESC, event.event_id DESC LIMIT 1),
+            (SELECT claim.database_rows_used FROM billing_validation_control.fixture_reservation_claims AS claim
+              WHERE claim.reservation_id = reservation.reservation_id), 0) AS fixture_rows_used,
           extract(epoch FROM created_at) AS created_at_epoch
           FROM billing_validation_control.retention_reservations AS reservation WHERE attempt_id = $1`, [attemptId]);
         return retentionReservationFromDb(result.rows[0]);
       },
       async getRetentionReservation(reservationId) {
+        const reference = await queryClient.query(`SELECT attempt_id
+          FROM billing_validation_control.retention_reservations
+          WHERE reservation_id = $1`, [reservationId]);
+        const attemptId = reference.rows?.[0]?.attempt_id;
+        if (!attemptId) return null;
+
+        // Reconciliation and fixture writes must acquire these shared locks in the same order.
+        // The first read supplies only the immutable lock key; reread mutable ledger projections
+        // after both locks are held so READ COMMITTED cannot return a pre-lock snapshot.
+        await tx.lockAttempt(attemptId);
+        await tx.lockBusinessKey(businessKey('retention-reservation', reservationId));
         const result = await queryClient.query(`SELECT reservation_id, attempt_id, project_ref, branch_id,
           stripe_account_id, policy_version, quota_limits, projection, capacity_snapshot,
-          COALESCE((SELECT claim.database_rows_used FROM billing_validation_control.fixture_reservation_claims AS claim
-            WHERE claim.reservation_id = reservation.reservation_id), 0) AS fixture_rows_used,
+          COALESCE((SELECT event.current_rows FROM billing_validation_control.fixture_reservation_claim_events AS event
+              WHERE event.reservation_id = reservation.reservation_id
+              ORDER BY event.current_rows DESC, event.event_id DESC LIMIT 1),
+            (SELECT claim.database_rows_used FROM billing_validation_control.fixture_reservation_claims AS claim
+              WHERE claim.reservation_id = reservation.reservation_id), 0) AS fixture_rows_used,
           extract(epoch FROM created_at) AS created_at_epoch
           FROM billing_validation_control.retention_reservations AS reservation
-          WHERE reservation_id = $1 FOR UPDATE OF reservation`, [reservationId]);
-        return retentionReservationFromDb(result.rows[0]);
+          WHERE reservation_id = $1`, [reservationId]);
+        const row = result.rows?.[0];
+        if (!row || row.attempt_id !== attemptId) refuse('retention_ledger_invalid');
+        return retentionReservationFromDb(row);
       },
       async setRetentionFixtureRowsUsed({ reservationId, attemptId, expectedRows, usedRows }) {
-        const result = await queryClient.query(`INSERT INTO billing_validation_control.fixture_reservation_claims
-          (reservation_id, attempt_id, database_rows_used)
-          VALUES ($1,$2,$4)
-          ON CONFLICT (reservation_id) DO UPDATE SET database_rows_used = EXCLUDED.database_rows_used
-          WHERE billing_validation_control.fixture_reservation_claims.attempt_id = $2
-            AND billing_validation_control.fixture_reservation_claims.database_rows_used = $3
-          RETURNING database_rows_used`, [reservationId, attemptId, expectedRows, usedRows]);
-        if (result.rowCount !== 1 || Number(result.rows?.[0]?.database_rows_used ?? usedRows) !== usedRows) {
+        if (!Number.isSafeInteger(expectedRows) || expectedRows < 0 ||
+            !Number.isSafeInteger(usedRows) || usedRows <= expectedRows) refuse('fixture_reservation_insufficient');
+        await tx.lockBusinessKey(fixtureReservationClaimLockKey(reservationId));
+        const state = await queryClient.query(`SELECT reservation.attempt_id,
+          COALESCE((SELECT event.current_rows FROM billing_validation_control.fixture_reservation_claim_events AS event
+              WHERE event.reservation_id = reservation.reservation_id
+              ORDER BY event.current_rows DESC, event.event_id DESC LIMIT 1),
+            (SELECT claim.database_rows_used FROM billing_validation_control.fixture_reservation_claims AS claim
+              WHERE claim.reservation_id = reservation.reservation_id), 0)::text AS current_rows
+          FROM billing_validation_control.retention_reservations AS reservation
+          WHERE reservation.reservation_id = $1`, [reservationId]);
+        const prior = state.rows?.[0];
+        const currentRows = Number(prior?.current_rows);
+        if (!prior || prior.attempt_id !== attemptId || !Number.isSafeInteger(currentRows) ||
+            currentRows !== expectedRows) refuse('fixture_reservation_insufficient');
+        const eventId = `usage:${reservationId}:${usedRows}`;
+        const result = await queryClient.query(`INSERT INTO billing_validation_control.fixture_reservation_claim_events
+          (event_id, reservation_id, attempt_id, previous_rows, current_rows)
+          VALUES ($1,$2,$3,$4,$5) RETURNING current_rows`,
+        [eventId, reservationId, attemptId, expectedRows, usedRows]);
+        if (result.rowCount !== 1 || Number(result.rows?.[0]?.current_rows) !== usedRows) {
           refuse('fixture_reservation_insufficient');
         }
       },
       async claimFixtureCase(claim) {
+        const claimLockKeys = [
+          businessKey('fixture-case-claim', claim.attemptId, claim.caseId),
+          businessKey('fixture-resource-claim', claim.fixtureId),
+        ].sort();
+        for (const key of claimLockKeys) await tx.lockBusinessKey(key);
         const values = [claim.attemptId, claim.caseId, claim.reservationId, claim.fence,
           claim.candidateSha, claim.namespaceId, claim.environment.database.projectRef,
           claim.environment.database.projectRef, claim.environment.deployment.id,
@@ -422,7 +521,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
         const result = await queryClient.query(`SELECT reservation_id, owner_fence, candidate_sha,
           namespace_id, project_ref, branch_id, deployment_id, deployment_origin, stripe_account_id
           FROM billing_validation_control.fixture_case_claims
-          WHERE attempt_id = $1 AND case_id = $2 FOR UPDATE`, [claim.attemptId, claim.caseId]);
+          WHERE attempt_id = $1 AND case_id = $2`, [claim.attemptId, claim.caseId]);
         const prior = result.rows?.[0];
         if (!prior || prior.reservation_id !== claim.reservationId || prior.owner_fence !== claim.fence ||
             prior.candidate_sha.trim() !== claim.candidateSha || prior.namespace_id !== claim.namespaceId ||
@@ -440,6 +539,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
         if (fixture.rowCount !== 1) refuse('fixture_case_duplicate');
       },
       async getRetentionReceipt(reservationId) {
+        await tx.lockBusinessKey(businessKey('retention-receipt', reservationId));
         const result = await queryClient.query(`SELECT receipt_id, reservation_id, attempt_id, project_ref,
           branch_id, stripe_account_id, outcome, retained_usage, owner_fence,
           extract(epoch FROM created_at) AS created_at_epoch
@@ -447,13 +547,15 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
         return retentionReceiptFromDb(result.rows[0]);
       },
       async getCleanupReceipt(attemptId) {
+        await tx.lockBusinessKey(businessKey('cleanup-receipt', attemptId));
         const result = await queryClient.query(`SELECT receipt_id, reservation_id, attempt_id, project_ref,
           branch_id, deployment_id, deployment_origin, stripe_account_id, owner_fence, cleanup_digest,
           verified_projection, extract(epoch FROM created_at) AS created_at_epoch
-          FROM billing_validation_control.cleanup_receipts WHERE attempt_id = $1 FOR UPDATE`, [attemptId]);
+          FROM billing_validation_control.cleanup_receipts WHERE attempt_id = $1`, [attemptId]);
         return cleanupReceiptFromDb(result.rows[0]);
       },
       async putCleanupReceipt(receipt) {
+        await tx.lockBusinessKey(businessKey('cleanup-receipt', receipt.attemptId));
         const result = await queryClient.query(`INSERT INTO billing_validation_control.cleanup_receipts
           (receipt_id, reservation_id, attempt_id, project_ref, branch_id, deployment_id,
            deployment_origin, stripe_account_id, owner_fence, cleanup_digest, verified_projection, created_at)
@@ -466,6 +568,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
         if (result.rowCount !== 1) refuse('cleanup_receipt_conflict');
       },
       async putRetentionReservation(reservation) {
+        await tx.lockBusinessKey(businessKey('retention-reservation-attempt', reservation.attemptId));
         const result = await queryClient.query(`INSERT INTO billing_validation_control.retention_reservations
           (reservation_id, attempt_id, project_ref, branch_id, stripe_account_id, policy_version,
            quota_limits, projection, capacity_snapshot, created_at)
@@ -477,6 +580,7 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
         if (result.rowCount !== 1) refuse('retention_reservation_conflict');
       },
       async putRetentionReceipt(receipt) {
+        await tx.lockBusinessKey(businessKey('retention-receipt', receipt.reservationId));
         const result = await queryClient.query(`INSERT INTO billing_validation_control.retention_receipts
           (receipt_id, reservation_id, attempt_id, project_ref, branch_id, stripe_account_id,
            outcome, retained_usage, owner_fence, created_at)
@@ -487,17 +591,20 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
         if (result.rowCount !== 1) refuse('retention_receipt_conflict');
       },
       async getStripeIntentByOperation(attemptId, operation) {
+        await tx.lockBusinessKey(businessKey('stripe-intent-operation', attemptId, operation));
         const result = await queryClient.query(`SELECT *, extract(epoch FROM created_at) AS created_at_epoch
           FROM billing_validation_control.stripe_intents
-          WHERE attempt_id = $1 AND operation = $2 FOR UPDATE`, [attemptId, operation]);
+          WHERE attempt_id = $1 AND operation = $2`, [attemptId, operation]);
         return stripeIntentFromDb(result.rows?.[0]);
       },
       async getStripeIntent(intentId) {
+        await tx.lockBusinessKey(businessKey('stripe-intent', intentId));
         const result = await queryClient.query(`SELECT *, extract(epoch FROM created_at) AS created_at_epoch
-          FROM billing_validation_control.stripe_intents WHERE intent_id = $1 FOR UPDATE`, [intentId]);
+          FROM billing_validation_control.stripe_intents WHERE intent_id = $1`, [intentId]);
         return stripeIntentFromDb(result.rows?.[0]);
       },
       async listPendingStripeIntents(attemptId) {
+        await tx.lockBusinessKey(businessKey('stripe-intent-attempt', attemptId));
         const result = await queryClient.query(`SELECT intent.*,
           extract(epoch FROM intent.created_at) AS created_at_epoch
           FROM billing_validation_control.stripe_intents AS intent
@@ -505,10 +612,13 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
             SELECT 1 FROM billing_validation_control.stripe_receipts AS receipt
             WHERE receipt.intent_id = intent.intent_id
           )
-          ORDER BY intent.created_at, intent.intent_id FOR UPDATE OF intent`, [attemptId]);
+          ORDER BY intent.created_at, intent.intent_id`, [attemptId]);
         return (result.rows ?? []).map(stripeIntentFromDb);
       },
       async insertStripeIntent(intent) {
+        await tx.lockBusinessKey(businessKey('stripe-intent-operation', intent.attemptId, intent.operation));
+        await tx.lockBusinessKey(businessKey('stripe-intent-attempt', intent.attemptId));
+        await tx.lockBusinessKey(businessKey('stripe-intent-idempotency', intent.accountId, intent.idempotencyKey));
         const result = await queryClient.query(`INSERT INTO billing_validation_control.stripe_intents
           (intent_id, attempt_id, owner_fence, account_id, candidate_sha, workflow_repository,
            workflow_ref, workflow_run_id, workflow_run_attempt, runner_label, environment_identity, action,
@@ -522,11 +632,13 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
         if (result.rowCount !== 1) refuse('stripe_intent_conflict');
       },
       async getStripeReceipt(intentId) {
+        await tx.lockBusinessKey(businessKey('stripe-receipt', intentId));
         const result = await queryClient.query(`SELECT *, extract(epoch FROM observed_at) AS observed_at_epoch
-          FROM billing_validation_control.stripe_receipts WHERE intent_id = $1 FOR UPDATE`, [intentId]);
+          FROM billing_validation_control.stripe_receipts WHERE intent_id = $1`, [intentId]);
         return stripeReceiptFromDb(result.rows?.[0]);
       },
       async putStripeReceipt(receipt) {
+        await tx.lockBusinessKey(businessKey('stripe-receipt', receipt.intentId));
         const result = await queryClient.query(`INSERT INTO billing_validation_control.stripe_receipts
           (receipt_id, intent_id, attempt_id, owner_fence, account_id, operation, request_digest,
            idempotency_key, observation_digest, resource_ids, observed_at)
@@ -605,13 +717,12 @@ function transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetenti
   }) };
 }
 
-export function createPostgresAttemptStore({ client, preflight, target, verifyRecovery, verifyCleanup,
-  verifyRetentionReceipt, verifyProviderObservation } = {}) {
+export function createPostgresAttemptStore({ client, preflight, target, controlDatabaseUrl,
+  verifyRecovery, verifyCleanup, verifyRetentionReceipt, verifyProviderObservation } = {}) {
   const verified = assertWiring({ client, preflight, target });
+  const controlTarget = parseControlStoreRuntimeDatabaseUrl(controlDatabaseUrl);
+  if (controlTarget.projectRef === verified.target.projectRef) refuse('control_store_target_invalid');
+  assertControlClientTarget(client, controlTarget);
   return createAttemptStore(transactionAdapter(client, verifyRecovery, verifyCleanup, verifyRetentionReceipt,
-    verifyProviderObservation, verified.preflight.expectedEnvironment));
-}
-
-export async function installAttemptSchema({ client, migrationDirectory } = {}) {
-  return applyAttemptMigrations({ client, migrationDirectory });
+    verifyProviderObservation, verified.preflight.expectedEnvironment, controlDatabaseUrl, controlTarget));
 }

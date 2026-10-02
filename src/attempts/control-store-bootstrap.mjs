@@ -6,12 +6,14 @@ import { CONTROL_STORE_POLICY } from './control-store-policy.mjs';
 import { CONTROL_STORE_BOOTSTRAP_PINS } from './control-store-bootstrap-pins.mjs';
 
 const DEFAULT_BASELINE_PATH = new URL('./schema.sql', import.meta.url);
-const DEFAULT_MIGRATION_DIRECTORY = new URL('./migrations/', import.meta.url);
+const DEFAULT_MIGRATION_DIRECTORY = new URL('./control-store-migrations/', import.meta.url);
 const PLAN_KEYS = Object.freeze([
   'projectRef', 'baselineSha256', 'baselineSql', 'migrations', 'runtimeLogin',
 ]);
 const MIGRATION_KEYS = Object.freeze(['version', 'name', 'file', 'sha256', 'sql']);
 const OPTION_KEYS = Object.freeze(['policy', 'baselinePath', 'migrationDirectory']);
+const BUNDLE_OPTION_KEYS = Object.freeze(['policy', 'baselineSha256', 'migrations', 'applied']);
+const APPLIED_KEYS = Object.freeze(['version', 'name', 'sha256']);
 
 function refuse() {
   const error = new Error('Control store bootstrap input is invalid.');
@@ -154,6 +156,35 @@ function keepExactSql(sql) {
   return sql.endsWith('\n') ? sql : `${sql}\n`;
 }
 
+function assertControlPolicy(policy) {
+  if (!matchesExactShape(policy, CONTROL_STORE_POLICY)) refuse();
+}
+
+function assertMigrationBundleInputs(options) {
+  if (!exactDataRecord(options, BUNDLE_OPTION_KEYS)) refuse();
+  assertControlPolicy(options.policy);
+  validatePinRegistry();
+  if (options.baselineSha256 !== CONTROL_STORE_BOOTSTRAP_PINS.baselineSha256 ||
+      !exactArray(options.migrations, CONTROL_STORE_BOOTSTRAP_PINS.migrations.length) ||
+      !Array.isArray(options.applied) || options.applied.length > CONTROL_STORE_BOOTSTRAP_PINS.migrations.length ||
+      !exactArray(options.applied, options.applied.length)) refuse();
+
+  for (let index = 0; index < options.migrations.length; index += 1) {
+    const migration = options.migrations[index];
+    const pin = CONTROL_STORE_BOOTSTRAP_PINS.migrations[index];
+    if (!exactDataRecord(migration, MIGRATION_KEYS) || migration.version !== pin.version ||
+        migration.name !== pin.name || migration.file !== pin.file || migration.sha256 !== pin.sha256 ||
+        typeof migration.sql !== 'string' || sha256(Buffer.from(migration.sql, 'utf8')) !== pin.sha256) refuse();
+  }
+
+  for (let index = 0; index < options.applied.length; index += 1) {
+    const row = options.applied[index];
+    const pin = CONTROL_STORE_BOOTSTRAP_PINS.migrations[index];
+    if (!exactDataRecord(row, APPLIED_KEYS) || row.version !== pin.version ||
+        row.name !== pin.name || row.sha256 !== pin.sha256) refuse();
+  }
+}
+
 export async function loadControlStoreBootstrapPlan(options = {}) {
   try {
     const { policy, baselinePath, migrationDirectory } = readPlanOptions(options);
@@ -220,7 +251,7 @@ export function renderControlStoreBootstrap(plan) {
       `  IF EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = '${policy.schema}') THEN`,
       "    RAISE EXCEPTION 'billing_control_bootstrap_schema_already_exists' USING ERRCODE = '55000';",
       '  END IF;',
-      `  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname IN ('${policy.roles.owner}', '${policy.roles.runtime}')) THEN`,
+      `  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname IN ('${policy.roles.owner}', '${policy.roles.runtime}', '${policy.roles.verifier}')) THEN`,
       "    RAISE EXCEPTION 'billing_control_bootstrap_role_already_exists' USING ERRCODE = '55000';",
       '  END IF;',
       `  IF pg_catalog.to_regclass('${policy.schema}.control_store_install_receipts') IS NOT NULL OR`,
@@ -231,6 +262,7 @@ export function renderControlStoreBootstrap(plan) {
       '$control_store_preflight$;',
       `CREATE ROLE ${policy.roles.owner} NOLOGIN;`,
       `CREATE ROLE ${policy.roles.runtime} NOLOGIN;`,
+      `CREATE ROLE ${policy.roles.verifier} NOLOGIN;`,
       `CREATE SCHEMA ${policy.schema} AUTHORIZATION ${policy.roles.owner};`,
       `SET LOCAL ROLE ${policy.roles.owner};`,
       keepExactSql(plan.baselineSql),
@@ -242,6 +274,30 @@ export function renderControlStoreBootstrap(plan) {
       `INSERT INTO ${policy.schema}.control_store_install_receipts (project_ref, baseline_sha256)`,
       `VALUES (${sqlLiteral(plan.projectRef)}, ${sqlLiteral(plan.baselineSha256)});`,
       migrationBlocks.trimEnd(),
+      'COMMIT;',
+      '',
+    ].join('\n');
+  } catch {
+    refuse();
+  }
+}
+
+/** Render the pending pinned control-store suffix for an operator; this function is offline only. */
+export function renderControlStoreMigrationBundle(options) {
+  try {
+    assertMigrationBundleInputs(options);
+    const pending = options.migrations.slice(options.applied.length);
+    if (pending.length === 0) return '';
+    const blocks = pending.flatMap((migration) => [
+      `-- Control-store migration ${migration.version} (${migration.name})`,
+      keepExactSql(migration.sql).trimEnd(),
+      `INSERT INTO ${options.policy.schema}.schema_migrations (version, name, sha256)`,
+      `VALUES (${sqlLiteral(migration.version)}, ${sqlLiteral(migration.name)}, ${sqlLiteral(migration.sha256)});`,
+    ]);
+    return [
+      'BEGIN;',
+      `SET LOCAL ROLE ${options.policy.roles.owner};`,
+      ...blocks,
       'COMMIT;',
       '',
     ].join('\n');

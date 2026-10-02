@@ -84,6 +84,7 @@ test('every job has an explicit timeout and only the intended job environments',
   }
 
   assert.equal(workflow.jobs.reader.environment, 'billing-validation-reader');
+  assert.equal(workflow.jobs['control-store']?.environment, 'billing-validation-control');
   assert.equal(workflow.jobs.test.environment, 'billing-validation-tests');
   assert.equal(workflow.jobs['validate-result-input'].environment, undefined);
   assert.equal(workflow.jobs['attest-result'].environment, 'billing-validation-attestation');
@@ -94,14 +95,19 @@ test('every job has an explicit timeout and only the intended job environments',
 
 test('dispatch authorization runs hosted without an environment before all privileged jobs', () => {
   const workflow = readWorkflow(workflowPaths[0]);
-  const { authorize, reader, test: testJob, 'validate-result-input': validateResultInput, 'attest-result': resultAttest,
+  const { authorize, reader, test: testJob, 'control-store': controlStore,
+    'validate-result-input': validateResultInput, 'attest-result': resultAttest,
     'verify-result': verifyResult, publisher } = workflow.jobs;
 
   assert.ok(isHostedRunner(authorize['runs-on']));
   assert.equal(authorize.environment, undefined);
   assert.equal(authorize['timeout-minutes'] <= 10, true);
   assert.equal(reader.needs, 'authorize');
-  assert.deepEqual(testJob.needs, ['authorize', 'reader', 'attest-activation']);
+  assert.ok(controlStore, 'a protected control-store verification job must exist');
+  assert.equal(controlStore.needs, 'authorize');
+  assert.deepEqual(testJob.needs, ['authorize', 'reader', 'attest-activation', 'control-store']);
+  assert.match(testJob.if, /needs\.control-store\.result\s*==\s*'success'/);
+  assert.match(testJob.if, /needs\.control-store\.result\s*==\s*'skipped'/);
   assert.deepEqual(validateResultInput.needs, ['authorize', 'reader', 'test']);
   assert.match(validateResultInput.if, /needs\.test\.result\s*==\s*'success'/);
   assert.deepEqual(validateResultInput.permissions, { contents: 'read' });
@@ -116,6 +122,42 @@ test('dispatch authorization runs hosted without an environment before all privi
   for (const job of [reader, testJob, validateResultInput, resultAttest, verifyResult, publisher]) {
     assert.match(job.if, /needs\.authorize\.result\s*==\s*'success'/);
   }
+});
+
+test('collect-only control verification uses the fixed trusted workflow checkout and read-only verifier', () => {
+  const workflow = readWorkflow(workflowPaths[0]);
+  const job = workflow.jobs['control-store'];
+  const expression = (value) => '${{ ' + value + ' }}';
+
+  assert.ok(job, 'a protected control-store verification job must exist');
+  assert.equal(job.environment, 'billing-validation-control');
+  assert.equal(job.needs, 'authorize');
+  assert.match(job.if, /github\.event_name\s*==\s*'workflow_dispatch'/);
+  assert.match(job.if, /github\.repository_id\s*==\s*'1384018279'/);
+  assert.match(job.if, /github\.ref\s*==\s*'refs\/heads\/main'/);
+  assert.match(job.if, /github\.event\.repository\.default_branch\s*==\s*'main'/);
+  assert.match(job.if, /github\.ref_protected/);
+  assert.match(job.if, /needs\.authorize\.outputs\.operation\s*==\s*'collect'/);
+  assert.deepEqual(job.permissions, { contents: 'read' });
+  assert.equal(job['timeout-minutes'], 10);
+  assert.equal(job.outputs, undefined);
+  assert.deepEqual(job.steps, [
+    { name: 'Checkout exact triggering workflow SHA', uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      with: { ref: expression('github.sha'), 'persist-credentials': false } },
+    { name: 'Set up Node.js 22', uses: 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      with: { 'node-version': '22', 'package-manager-cache': false } },
+    { name: 'Install locked dependencies without lifecycle scripts',
+      run: 'npx --yes pnpm@11.5.1 --ignore-workspace install --frozen-lockfile --ignore-scripts' },
+    { name: 'Verify the billing control store read-only',
+      env: { BILLING_CONTROL_VERIFIER_DATABASE_URL: expression('secrets.BILLING_CONTROL_VERIFIER_DATABASE_URL') },
+      run: 'node runner/verify-control-store.mjs' },
+  ]);
+
+  const preflight = workflow.jobs.authorize.steps.find((step) => step.id === 'environments');
+  assert.equal(preflight.env?.CONTROL_DISPATCH_OPERATION, expression('steps.authorize.outputs.operation'));
+  assert.match(preflight.run, /CONTROL_DISPATCH_OPERATION\s*===\s*'collect'/);
+  assert.match(preflight.run, /billing-validation-control/);
+  assert.match(preflight.run, /approval\.reviewers\.length\s*>\s*0/);
 });
 
 test('authorize and attestation checkouts pin the exact triggering workflow SHA', () => {

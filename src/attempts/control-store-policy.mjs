@@ -14,6 +14,7 @@ const APPROVED_POLICY = Object.freeze({
   roles: Object.freeze({
     owner: 'billing_validation_owner',
     runtime: 'billing_validation_runtime',
+    verifier: 'billing_validation_verifier',
   }),
   connection: Object.freeze({
     protocol: 'postgresql',
@@ -22,7 +23,7 @@ const APPROVED_POLICY = Object.freeze({
     database: 'postgres',
     sslMode: 'require',
   }),
-  urlEnvironment: 'BILLING_CONTROL_DATABASE_URL',
+  urlEnvironment: 'BILLING_CONTROL_VERIFIER_DATABASE_URL',
 });
 
 const DEFAULT_POLICY_PATH = new URL('../../policy/control-store-policy.json', import.meta.url);
@@ -103,7 +104,7 @@ export async function loadControlStorePolicy(options = {}) {
   }
 }
 
-export function parseControlStoreDatabaseUrl(value, policy = CONTROL_STORE_POLICY) {
+function parseControlStoreDatabaseUrlForRole(value, role, policy) {
   assertApprovedPolicy(policy);
 
   try {
@@ -119,20 +120,28 @@ export function parseControlStoreDatabaseUrl(value, policy = CONTROL_STORE_POLIC
     if (url.port !== String(APPROVED_POLICY.connection.port)) refuseTarget();
     if (url.pathname !== `/${APPROVED_POLICY.connection.database}`) refuseTarget();
     if (url.hash !== '' || url.search !== '?sslmode=require') refuseTarget();
-    if (username !== APPROVED_POLICY.roles.runtime || password.length === 0) refuseTarget();
+    if (username !== role || password.length === 0) refuseTarget();
 
     return Object.freeze({
       projectRef: APPROVED_POLICY.projectRef,
       host: APPROVED_POLICY.connection.host,
       port: APPROVED_POLICY.connection.port,
       database: APPROVED_POLICY.connection.database,
-      username: APPROVED_POLICY.roles.runtime,
+      username: role,
       sslMode: APPROVED_POLICY.connection.sslMode,
     });
   } catch (error) {
     if (error instanceof ControlStoreRefusal && error.code === 'control_store_policy_invalid') throw error;
     refuseTarget();
   }
+}
+
+export function parseControlStoreVerifierDatabaseUrl(value, policy = CONTROL_STORE_POLICY) {
+  return parseControlStoreDatabaseUrlForRole(value, APPROVED_POLICY.roles.verifier, policy);
+}
+
+export function parseControlStoreRuntimeDatabaseUrl(value, policy = CONTROL_STORE_POLICY) {
+  return parseControlStoreDatabaseUrlForRole(value, APPROVED_POLICY.roles.runtime, policy);
 }
 
 export const CONTROL_STORE_POLICY = await loadControlStorePolicy();

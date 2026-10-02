@@ -11,17 +11,20 @@ const workflow = YAML.parse(readFileSync('.github/workflows/validate-billing.yml
 const repository = 'lawxcompany-stack/billing-validation-control';
 const candidateRepository = 'lawxcompany-stack/Plataforma-LawX';
 const environments = ['billing-validation-reader', 'billing-validation-attestation',
-  'billing-validation-tests', 'billing-validation-publisher'];
+  'billing-validation-tests', 'billing-validation-publisher', 'billing-validation-control'];
+const recheckEnvironments = environments.filter(name => name !== 'billing-validation-control');
 const github = { event_name: 'workflow_dispatch', repository, repository_id: '1384018279',
   ref: 'refs/heads/main', ref_protected: true, event: { repository: { default_branch: 'main' } } };
 const needs = { authorize: { result: 'success', outputs: { operation: 'collect', environments_verified: 'true' } },
-  reader: { result: 'success' }, 'attest-activation': { result: 'success' }, test: { result: 'success' },
+  reader: { result: 'success' }, 'attest-activation': { result: 'success' },
+  'control-store': { result: 'success' }, test: { result: 'success' },
   'validate-result-input': { result: 'success' }, 'attest-result': { result: 'success' },
   'verify-result': { result: 'success' } };
 
 function eligible(jobId, context = github, dependencies = needs, cancelled = false) {
   const expression = workflow.jobs[jobId].if.slice(3, -2)
     .replaceAll('needs.attest-activation', 'needs["attest-activation"]')
+    .replaceAll('needs.control-store', 'needs["control-store"]')
     .replaceAll('needs.validate-result-input', 'needs["validate-result-input"]')
     .replaceAll('needs.attest-result', 'needs["attest-result"]')
     .replaceAll('needs.verify-result', 'needs["verify-result"]');
@@ -36,7 +39,7 @@ test('PR policy is hosted, has no Environment/secrets and keeps a read-only toke
   assert.equal(workflow.jobs.policy['runs-on'], 'ubuntu-latest');
   assert.deepEqual(workflow.jobs.policy.permissions ?? workflow.permissions, { contents: 'read' });
   assert.doesNotMatch(JSON.stringify(workflow.jobs.policy), /\bsecrets\b|id-token|attestations|STRIPE|SUPABASE/);
-  for (const id of ['authorize', 'reader', 'attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
+  for (const id of ['authorize', 'reader', 'attest-activation', 'control-store', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
     assert.equal(eligible(id, { ...github, event_name: 'pull_request' }), false, id);
   }
 });
@@ -49,7 +52,7 @@ for (const [name, change] of [
   ['unprotected ref', { ref_protected: false }],
   ['another default branch', { event: { repository: { default_branch: 'preview' } } }],
 ]) test(`all dispatch/protected jobs refuse ${name} before scheduling`, () => {
-  for (const id of ['authorize', 'reader', 'attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
+  for (const id of ['authorize', 'reader', 'attest-activation', 'control-store', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
     assert.equal(eligible(id, { ...github, ...change }), false, id);
   }
 });
@@ -69,7 +72,7 @@ for (const result of ['failure', 'cancelled', 'skipped']) {
   test(`authorization ${result} blocks every Environment job`, () => {
     const dependencies = structuredClone(needs);
     dependencies.authorize.result = result;
-    for (const id of ['reader', 'attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
+    for (const id of ['reader', 'attest-activation', 'control-store', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
       assert.equal(eligible(id, github, dependencies), false, id);
     }
   });
@@ -116,22 +119,34 @@ test('Environment readback must explicitly succeed before any Environment job', 
   for (const value of ['', 'false', undefined]) {
     const dependencies = structuredClone(needs);
     dependencies.authorize.outputs.environments_verified = value;
-    for (const id of ['reader', 'attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
+    for (const id of ['reader', 'attest-activation', 'control-store', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) {
       assert.equal(eligible(id, github, dependencies), false, id);
     }
   }
-  for (const id of ['reader', 'attest-activation', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) assert.equal(eligible(id), true, id);
+  for (const id of ['reader', 'attest-activation', 'control-store', 'test', 'validate-result-input', 'attest-result', 'verify-result', 'publisher']) assert.equal(eligible(id), true, id);
   assert.deepEqual(workflow.jobs.publisher.needs, ['authorize', 'reader', 'attest-activation', 'test', 'attest-result', 'verify-result']);
+});
+
+test('control-store success gates collect while failure or skip blocks it', () => {
+  assert.equal(eligible('control-store'), true);
+  assert.equal(eligible('test'), true);
+  for (const result of ['failure', 'cancelled', 'skipped']) {
+    const dependencies = structuredClone(needs);
+    dependencies['control-store'].result = result;
+    assert.equal(eligible('test', github, dependencies), false, result);
+  }
 });
 
 test('recheck may run its test gate but cannot reach publisher without result attestation', () => {
   const dependencies = structuredClone(needs);
   dependencies.authorize.outputs.operation = 'recheck';
   dependencies['attest-activation'].result = 'skipped';
+  dependencies['control-store'].result = 'skipped';
   dependencies['validate-result-input'].result = 'skipped';
   dependencies['attest-result'].result = 'skipped';
   dependencies['verify-result'].result = 'skipped';
   assert.equal(eligible('attest-activation', github, dependencies), false);
+  assert.equal(eligible('control-store', github, dependencies), false);
   assert.equal(eligible('attest-result', github, dependencies), false);
   assert.equal(eligible('validate-result-input', github, dependencies), false);
   assert.equal(eligible('verify-result', github, dependencies), false);
@@ -225,7 +240,8 @@ function environment(name) {
     ], deployment_branch_policy: { protected_branches: true, custom_branch_policies: false } };
 }
 
-async function runPreflight({ transform = value => value, respond, env = {}, expire = false, clock = performance } = {}) {
+async function runPreflight({ transform = value => value, respond, env = {}, operation = 'collect',
+  expire = false, clock = performance } = {}) {
   const step = workflow.jobs.authorize.steps.find(step => step.id === 'environments');
   assert.ok(step, 'Missing fail-closed Environment preflight');
   assert.equal(step.if, undefined);
@@ -238,7 +254,8 @@ async function runPreflight({ transform = value => value, respond, env = {}, exp
   const calls = [], output = [], errors = [], receipts = [];
   const processFixture = { env: { CONTROL_REPOSITORY: repository, CONTROL_REPOSITORY_ID: github.repository_id,
     CONTROL_REF: github.ref, CONTROL_DEFAULT_BRANCH: 'main', CONTROL_REF_PROTECTED: 'true',
-    CONTROL_EVENT_NAME: 'workflow_dispatch', ENVIRONMENT_READ_TOKEN: 'synthetic-token',
+    CONTROL_EVENT_NAME: 'workflow_dispatch', CONTROL_DISPATCH_OPERATION: operation,
+    ENVIRONMENT_READ_TOKEN: 'synthetic-token',
     GITHUB_OUTPUT: 'synthetic-output', ...env }, exitCode: 0 };
   const fetch = async (url, options) => {
     assert.equal(options.method, 'GET');
@@ -249,7 +266,9 @@ async function runPreflight({ transform = value => value, respond, env = {}, exp
     assert.ok(url.startsWith(base));
     const suffix = url.slice(base.length);
     const name = suffix.split('/')[0];
-    assert.ok(environments.includes(name));
+    const requiredForOperation = processFixture.env.CONTROL_DISPATCH_OPERATION === 'collect'
+      ? environments : recheckEnvironments;
+    assert.ok(requiredForOperation.includes(name));
     assert.ok(suffix === name || suffix === `${name}/deployment-branch-policies?per_page=100&page=1`);
     calls.push(url);
     if (respond) return respond(url, options);
@@ -274,6 +293,18 @@ test('preflight accepts protected-only Environments for exact protected main wit
   assert.deepEqual(result.calls, environments.map(name => `https://api.github.com/repos/${repository}/environments/${name}`));
   assert.deepEqual(result.output, ['Environment protection verified for all required jobs.']);
   assert.deepEqual(result.errors, []);
+});
+
+test('collect preflights the control Environment while recheck does not', async () => {
+  const collect = await runPreflight({ operation: 'collect' });
+  const recheck = await runPreflight({ operation: 'recheck' });
+  assert.equal(collect.code, 0);
+  assert.deepEqual(collect.calls, environments.map(name =>
+    `https://api.github.com/repos/${repository}/environments/${name}`));
+  assert.equal(recheck.code, 0);
+  assert.deepEqual(recheck.calls, recheckEnvironments.map(name =>
+    `https://api.github.com/repos/${repository}/environments/${name}`));
+  assert.equal(recheck.calls.some(url => url.endsWith('/billing-validation-control')), false);
 });
 
 for (const [name, transform] of [
@@ -318,7 +349,7 @@ test('preflight accepts a documented Team reviewer and protected-branch mode', a
     return value;
   } });
   assert.equal(result.code, 0);
-  assert.equal(result.calls.length, 4);
+  assert.equal(result.calls.length, 5);
 });
 
 for (const [name, list] of [
@@ -384,6 +415,7 @@ test('elapsed readback deadline is checked while consuming the body', async () =
 for (const change of [{ CONTROL_REPOSITORY: 'attacker/control' }, { CONTROL_REPOSITORY_ID: '9' },
   { CONTROL_REF: 'refs/heads/feature' }, { CONTROL_REF: 'refs/tags/main' }, { CONTROL_REF_PROTECTED: 'false' },
   { CONTROL_DEFAULT_BRANCH: 'preview' }, { CONTROL_EVENT_NAME: 'pull_request' },
+  { CONTROL_DISPATCH_OPERATION: '' }, { CONTROL_DISPATCH_OPERATION: 'unknown' },
   { ENVIRONMENT_READ_TOKEN: '' }]) test(`preflight refuses invalid ${Object.keys(change)[0]} before API use`, async () => {
   const result = await runPreflight({ env: change });
   assert.equal(result.code, 1);

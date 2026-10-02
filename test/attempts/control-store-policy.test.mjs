@@ -8,19 +8,21 @@ import {
   CONTROL_STORE_POLICY,
   ControlStoreRefusal,
   loadControlStorePolicy,
-  parseControlStoreDatabaseUrl,
+  parseControlStoreRuntimeDatabaseUrl,
+  parseControlStoreVerifierDatabaseUrl,
 } from '../../src/attempts/control-store-policy.mjs';
 
 const FINANCIAL_POLICY_PATH = new URL('../../policy/environment-policy.json', import.meta.url);
 const CONTROL_HOST = 'db.ceindkuafycqdcplfrgs.supabase.co';
 const RUNTIME_ROLE = 'billing_validation_runtime';
+const VERIFIER_ROLE = 'billing_validation_verifier';
 const SENTINEL_PASSWORD = 'sentinel-control-password-never-return-this';
 
 function validUrl({
   host = CONTROL_HOST,
   port = 5432,
   database = 'postgres',
-  username = RUNTIME_ROLE,
+  username = VERIFIER_ROLE,
   password = SENTINEL_PASSWORD,
   query = 'sslmode=require',
 } = {}) {
@@ -28,9 +30,10 @@ function validUrl({
   return `postgresql://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}:${port}/${database}${queryPart}`;
 }
 
-function assertRefusal(value, expectedCode = 'control_store_target_invalid', policy = CONTROL_STORE_POLICY) {
+function assertRefusal(value, expectedCode = 'control_store_target_invalid', policy = CONTROL_STORE_POLICY,
+  parser = parseControlStoreVerifierDatabaseUrl) {
   let error;
-  assert.throws(() => parseControlStoreDatabaseUrl(value, policy), (actual) => {
+  assert.throws(() => parser(value, policy), (actual) => {
     error = actual;
     return actual instanceof ControlStoreRefusal;
   });
@@ -45,12 +48,13 @@ test('control store cannot substitute for the blocked, unconfigured financial ta
   const financial = JSON.parse(await readFile(FINANCIAL_POLICY_PATH, 'utf8'));
 
   assert.equal(control.projectRef, 'ceindkuafycqdcplfrgs');
-  assert.equal(control.urlEnvironment, 'BILLING_CONTROL_DATABASE_URL');
+  assert.equal(control.urlEnvironment, 'BILLING_CONTROL_VERIFIER_DATABASE_URL');
   assert.equal(financial.database.kind, 'standalone');
   assert.equal(financial.database.projectRef, null);
   assert.equal(financial.database.connection, null);
   assert.equal(isValidStandaloneProjectRef('zjvqjdntasprusoqfsgw'), false);
   assert.notEqual(control.urlEnvironment, 'SUPABASE_VALIDATION_DATABASE_URL');
+  assert.notEqual(control.urlEnvironment, 'BILLING_CONTROL_DATABASE_URL');
 });
 
 test('loaded control policy is closed, matches the reviewed direct endpoint, and is recursively frozen', async () => {
@@ -74,6 +78,7 @@ test('loaded control policy is closed, matches the reviewed direct endpoint, and
   assert.deepEqual(policy.roles, {
     owner: 'billing_validation_owner',
     runtime: RUNTIME_ROLE,
+    verifier: VERIFIER_ROLE,
   });
   assert.deepEqual(policy.connection, {
     protocol: 'postgresql',
@@ -82,22 +87,22 @@ test('loaded control policy is closed, matches the reviewed direct endpoint, and
     database: 'postgres',
     sslMode: 'require',
   });
-  assert.equal(policy.urlEnvironment, 'BILLING_CONTROL_DATABASE_URL');
+  assert.equal(policy.urlEnvironment, 'BILLING_CONTROL_VERIFIER_DATABASE_URL');
   assert.equal(Object.isFrozen(policy), true);
   assert.equal(Object.isFrozen(policy.roles), true);
   assert.equal(Object.isFrozen(policy.connection), true);
 });
 
-test('control URL validation returns only the non-secret target descriptor', async () => {
+test('verifier URL validation returns only the non-secret target descriptor', async () => {
   const policy = await loadControlStorePolicy();
-  const descriptor = parseControlStoreDatabaseUrl(validUrl(), policy);
+  const descriptor = parseControlStoreVerifierDatabaseUrl(validUrl(), policy);
 
   assert.deepEqual(descriptor, {
     projectRef: 'ceindkuafycqdcplfrgs',
     host: CONTROL_HOST,
     port: 5432,
     database: 'postgres',
-    username: RUNTIME_ROLE,
+    username: VERIFIER_ROLE,
     sslMode: 'require',
   });
   assert.deepEqual(Object.keys(descriptor).sort(), [
@@ -109,21 +114,33 @@ test('control URL validation returns only the non-secret target descriptor', asy
   assert.equal(JSON.stringify(descriptor).includes('sslmode=require'), false);
 });
 
-test('control URL validation refuses the forbidden historical financial target', () => {
+test('verifier URL validation refuses the forbidden historical financial target', () => {
   const error = assertRefusal(validUrl({ host: 'db.zjvqjdntasprusoqfsgw.supabase.co' }));
   assert.equal(error.code, 'control_store_target_invalid');
 });
 
-test('control URL validation refuses an unreviewed hostname', () => {
+test('verifier URL validation refuses an unreviewed hostname', () => {
   assertRefusal(validUrl({ host: 'db.ceindkuafycqdcplfrgs.supabase.co.attacker.example' }));
 });
 
-test('control URL validation refuses a non-runtime database role', () => {
+test('verifier and runtime URL validators accept only their own distinct role', () => {
+  const verifierUrl = validUrl();
+  const runtimeUrl = validUrl({ username: RUNTIME_ROLE });
+
+  assert.equal(parseControlStoreVerifierDatabaseUrl(verifierUrl).username, VERIFIER_ROLE);
+  assert.equal(parseControlStoreRuntimeDatabaseUrl(runtimeUrl).username, RUNTIME_ROLE);
+  assertRefusal(runtimeUrl);
+  assertRefusal(verifierUrl, 'control_store_target_invalid', CONTROL_STORE_POLICY,
+    parseControlStoreRuntimeDatabaseUrl);
   assertRefusal(validUrl({ username: 'postgres' }));
+  assertRefusal(validUrl({ username: 'postgres' }), 'control_store_target_invalid', CONTROL_STORE_POLICY,
+    parseControlStoreRuntimeDatabaseUrl);
 });
 
-test('control URL validation refuses a database other than postgres', () => {
+test('role-specific control URL validation refuses a database other than postgres', () => {
   assertRefusal(validUrl({ database: 'billing_validation_control' }));
+  assertRefusal(validUrl({ username: RUNTIME_ROLE, database: 'billing_validation_control' }),
+    'control_store_target_invalid', CONTROL_STORE_POLICY, parseControlStoreRuntimeDatabaseUrl);
 });
 
 test('control URL validation refuses a nonstandard port', () => {
@@ -177,6 +194,7 @@ test('policy loading rejects unknown keys and any change to the approved project
     (policy) => { policy.connection.host = 'db.zjvqjdntasprusoqfsgw.supabase.co'; },
     (policy) => { policy.connection.sslMode = 'disable'; },
     (policy) => { policy.roles.runtime = 'postgres'; },
+    (policy) => { policy.roles.verifier = 'postgres'; },
   ];
 
   for (const mutate of mutations) {

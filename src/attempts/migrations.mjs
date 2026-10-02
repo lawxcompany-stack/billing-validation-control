@@ -1,19 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
-import { createRequire } from 'node:module';
-import { isValidStandaloneDatabasePolicy } from '../billing/contracts.mjs';
-import { assertSupabaseRuntimeConfiguration, SupabaseRefusal, verifySupabaseEnvironment } from '../runtime/supabase.mjs';
-import { AttemptRefusal, refuse } from './store.mjs';
+import { refuse } from './store.mjs';
 
-const require = createRequire(import.meta.url);
-function freezeTree(value) {
-  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
-    for (const child of Object.values(value)) freezeTree(child);
-    Object.freeze(value);
-  }
-  return value;
-}
-const CONTROL_POLICY = freezeTree(JSON.parse(JSON.stringify(require('../../policy/environment-policy.json'))));
 const MIGRATION_DIRECTORY = new URL('./migrations/', import.meta.url);
 const DEFINITIONS = Object.freeze([
   Object.freeze({ version: '202610010001', name: 'standalone-lease-fencing',
@@ -39,11 +27,6 @@ const TRIGGER_DEFINITION_SHA256 = Object.freeze({
   billing_validation_fixture_lease_history_immutable: 'e51f215888420c15c47f314a8a832b07cb1b73168b0f1853fc073562f07e8735',
   billing_validation_fixture_lease_history_no_truncate: '2b89b6a1156127e6c8ada686ad9e4bece5d4cf06987d172edd3bf48d0706833e',
 });
-const BASELINE_RELATIONS = Object.freeze([
-  'billing_validation_control.attempts',
-  'billing_validation_control.fixture_leases',
-  'billing_validation_control.retention_receipts',
-]);
 
 function exactRecord(value, keys) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -360,107 +343,6 @@ export function validateAppliedAttemptMigrations(plan, appliedRows) {
     if (row.sha256 !== migration.sha256) refuse('migration_applied_hash_mismatch');
   }
   return Object.freeze(plan.slice(appliedRows.length));
-}
-
-const CONTROL_REPOSITORY = 'lawxcompany-stack/billing-validation-control';
-const CONTROL_REPOSITORY_ID = '1384018279';
-const CONTROL_WORKFLOW_REF = `${CONTROL_REPOSITORY}/.github/workflows/validate-billing.yml@refs/heads/main`;
-const APPROVAL_ENVIRONMENT = 'billing-validation-tests';
-
-function requireApprovedWorkflowEnvironment(environment) {
-  if (!environment || environment.BILLING_VALIDATION_APPROVAL_ENVIRONMENT !== APPROVAL_ENVIRONMENT ||
-      environment.GITHUB_REPOSITORY !== CONTROL_REPOSITORY ||
-      environment.GITHUB_REPOSITORY_ID !== CONTROL_REPOSITORY_ID ||
-      environment.GITHUB_EVENT_NAME !== 'workflow_dispatch' ||
-      environment.GITHUB_REF !== 'refs/heads/main' || environment.GITHUB_REF_PROTECTED !== 'true' ||
-      environment.GITHUB_WORKFLOW_REF !== CONTROL_WORKFLOW_REF ||
-      !/^[1-9][0-9]{0,19}$/u.test(environment.GITHUB_RUN_ID ?? '') ||
-      !/^[1-9][0-9]{0,5}$/u.test(environment.GITHUB_RUN_ATTEMPT ?? '')) {
-    refuse('migration_approval_required');
-  }
-}
-
-function assertClientConnectionTarget(client, database) {
-  const parameters = client?.connectionParameters;
-  const connection = database.connection;
-  if (!parameters || parameters.host !== connection.host || parameters.port !== connection.port ||
-      parameters.database !== connection.database || parameters.user !== connection.role ||
-      parameters.hostaddr !== undefined && parameters.hostaddr !== null ||
-      !exactRecord(parameters.ssl, ['rejectUnauthorized', 'servername']) ||
-      parameters.ssl.rejectUnauthorized !== true || parameters.ssl.servername !== connection.host) {
-    refuse('migration_connection_target_mismatch');
-  }
-}
-
-function assertConnectedDatabaseIdentity(result, database) {
-  const row = result?.rows?.[0];
-  const keys = ['database_name', 'role_name', 'server_version_num'];
-  const [expectedMajor, expectedMinor] = database.databaseVersion.split('.').map(Number);
-  const expectedServerVersion = expectedMajor * 10_000 + expectedMinor;
-  if (result?.rows?.length !== 1 || !exactRecord(row, keys) ||
-      row.database_name !== database.connection.database || row.role_name !== database.connection.role ||
-      !/^\d{5,6}$/u.test(String(row.server_version_num)) ||
-      Number(row.server_version_num) !== expectedServerVersion) {
-    refuse('migration_connection_identity_mismatch');
-  }
-}
-
-/** Apply allowlisted migrations only from the protected, manually approved control Environment. */
-export async function applyAttemptMigrations({ client, migrationDirectory = MIGRATION_DIRECTORY } = {}) {
-  const environment = process.env;
-  requireApprovedWorkflowEnvironment(environment);
-  const policy = CONTROL_POLICY;
-  if (!isValidStandaloneDatabasePolicy(policy?.database, { configured: true })) {
-    refuse('migration_target_unconfigured');
-  }
-  if (typeof client?.transaction !== 'function') refuse('store_client_invalid');
-  const token = environment.SUPABASE_VALIDATION_MANAGEMENT_TOKEN;
-  const trustedConfiguration = {
-    environmentApproved: true,
-    SUPABASE_VALIDATION_PROJECT_REF: environment.SUPABASE_VALIDATION_PROJECT_REF,
-    databaseUrl: environment.SUPABASE_VALIDATION_DATABASE_URL,
-  };
-  const database = assertSupabaseRuntimeConfiguration({ policy, token, trustedConfiguration });
-  assertClientConnectionTarget(client, database);
-  const plan = await loadAttemptMigrationPlan({ directory: migrationDirectory });
-  const readback = await verifySupabaseEnvironment({ policy, token, trustedConfiguration });
-  if (readback.projectRef !== database.projectRef || readback.databaseVersion !== database.databaseVersion ||
-      readback.schemaFingerprintSha256 !== database.schemaFingerprintSha256 ||
-      readback.migrationHistorySha256 !== database.migrationHistorySha256) {
-    refuse('migration_target_readback_mismatch');
-  }
-  try {
-    return await client.transaction(async (queryClient) => {
-      if (typeof queryClient?.query !== 'function') refuse('store_client_invalid');
-      await queryClient.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
-      const identity = await queryClient.query(`SELECT current_database() AS database_name,
-        current_user AS role_name, current_setting('server_version_num') AS server_version_num`);
-      assertConnectedDatabaseIdentity(identity, database);
-      const baseline = await queryClient.query(`SELECT
-        to_regclass($1) IS NOT NULL AND to_regclass($2) IS NOT NULL AND to_regclass($3) IS NOT NULL AS ready,
-        to_regclass($4) IS NOT NULL AS ledger_ready`, [...BASELINE_RELATIONS,
-        'billing_validation_control.schema_migrations']);
-      if (baseline.rows?.[0]?.ready !== true) refuse('migration_bootstrap_required');
-      let applied = [];
-      if (baseline.rows?.[0]?.ledger_ready === true) {
-        const result = await queryClient.query(`SELECT version, name, sha256
-          FROM billing_validation_control.schema_migrations ORDER BY version`);
-        applied = result.rows ?? [];
-      }
-      const pending = validateAppliedAttemptMigrations(plan, applied);
-      for (const migration of pending) {
-        await queryClient.query(migration.sql);
-        const recorded = await queryClient.query(`INSERT INTO billing_validation_control.schema_migrations
-          (version, name, sha256) VALUES ($1, $2, $3)`,
-        [migration.version, migration.name, migration.sha256]);
-        if (recorded.rowCount !== 1) refuse('migration_registry_write_failed');
-      }
-      return Object.freeze({ appliedVersions: Object.freeze(pending.map(({ version }) => version)) });
-    });
-  } catch (error) {
-    if (error instanceof AttemptRefusal || error instanceof SupabaseRefusal) throw error;
-    refuse('migration_database_operation_failed');
-  }
 }
 
 export const ATTEMPT_MIGRATION_ALLOWLIST = Object.freeze(DEFINITIONS.map(({ version, name, file, sha256 }) =>

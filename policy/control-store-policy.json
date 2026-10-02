@@ -6,7 +6,8 @@
   "schema": "billing_validation_control",
   "roles": {
     "owner": "billing_validation_owner",
-    "runtime": "billing_validation_runtime"
+    "runtime": "billing_validation_runtime",
+    "verifier": "billing_validation_verifier"
   },
   "connection": {
     "protocol": "postgresql",
@@ -15,5 +16,5 @@
     "database": "postgres",
     "sslMode": "require"
   },
-  "urlEnvironment": "BILLING_CONTROL_DATABASE_URL"
+  "urlEnvironment": "BILLING_CONTROL_VERIFIER_DATABASE_URL"
 }

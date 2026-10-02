@@ -137,6 +137,7 @@ jobs:
           CONTROL_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           CONTROL_REF_PROTECTED: ${{ github.ref_protected }}
           CONTROL_EVENT_NAME: ${{ github.event_name }}
+          CONTROL_DISPATCH_OPERATION: ${{ steps.authorize.outputs.operation }}
           ENVIRONMENT_READ_TOKEN: ${{ github.token }}
         run: |
           node --input-type=module <<'NODE'
@@ -147,6 +148,9 @@ jobs:
             'billing-validation-reader', 'billing-validation-attestation',
             'billing-validation-tests', 'billing-validation-publisher',
           ];
+          if (process.env.CONTROL_DISPATCH_OPERATION === 'collect') {
+            requiredEnvironments.push('billing-validation-control');
+          }
           const baseUrl = `https://api.github.com/repos/${repository}/environments/`;
           const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
           const positiveId = value => Number.isSafeInteger(value) && value > 0;
@@ -218,6 +222,8 @@ jobs:
             requireCondition(process.env.CONTROL_REPOSITORY === repository && process.env.CONTROL_REPOSITORY_ID === '1384018279' &&
               process.env.CONTROL_REF === 'refs/heads/main' && process.env.CONTROL_DEFAULT_BRANCH === 'main' &&
               process.env.CONTROL_REF_PROTECTED === 'true' && process.env.CONTROL_EVENT_NAME === 'workflow_dispatch');
+            requireCondition(process.env.CONTROL_DISPATCH_OPERATION === 'collect' ||
+              process.env.CONTROL_DISPATCH_OPERATION === 'recheck');
             requireCondition(typeof process.env.ENVIRONMENT_READ_TOKEN === 'string' &&
               /^[\x21-\x7e]+$/u.test(process.env.ENVIRONMENT_READ_TOKEN));
             for (const name of requiredEnvironments) await verify(name);
@@ -228,6 +234,32 @@ jobs:
             process.exitCode = 1;
           }
           NODE
+
+  control-store:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.authorize.outputs.operation == 'collect' }}
+    needs: authorize
+    runs-on: ubuntu-latest
+    environment: billing-validation-control
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact triggering workflow SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Install locked dependencies without lifecycle scripts
+        run: npx --yes pnpm@11.5.1 --ignore-workspace install --frozen-lockfile --ignore-scripts
+      - name: Verify the billing control store read-only
+        env:
+          BILLING_CONTROL_VERIFIER_DATABASE_URL: ${{ secrets.BILLING_CONTROL_VERIFIER_DATABASE_URL }}
+        run: node runner/verify-control-store.mjs
 
   attest-activation:
     if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && needs.authorize.outputs.operation == 'collect' }}
@@ -322,8 +354,8 @@ jobs:
         run: node scripts/read-candidate.mjs
 
   test:
-    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && ((needs.authorize.outputs.operation == 'collect' && needs.attest-activation.result == 'success') || (needs.authorize.outputs.operation == 'recheck' && needs.attest-activation.result == 'skipped')) }}
-    needs: [authorize, reader, attest-activation]
+    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && github.repository == 'lawxcompany-stack/billing-validation-control' && github.repository_id == '1384018279' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.ref_protected && needs.authorize.result == 'success' && needs.authorize.outputs.environments_verified == 'true' && needs.reader.result == 'success' && ((needs.authorize.outputs.operation == 'collect' && needs.attest-activation.result == 'success' && needs.control-store.result == 'success') || (needs.authorize.outputs.operation == 'recheck' && needs.attest-activation.result == 'skipped' && needs.control-store.result == 'skipped')) }}
+    needs: [authorize, reader, attest-activation, control-store]
     runs-on: ${{ needs.authorize.outputs.runner_label != '' && fromJSON(format('["{0}"]', needs.authorize.outputs.runner_label)) || 'ubuntu-latest' }}
     environment: billing-validation-tests
     env:
